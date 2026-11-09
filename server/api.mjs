@@ -394,9 +394,13 @@ export async function makeApi(env, options = {}) {
       }
       if (isPost) {
         const raw = await readBody(req);
-        requireThat(matches('sha256=' + hmac(config.env.WA_APP_SECRET, raw), req.headers['x-hub-signature-256']), 'Firma de WhatsApp inválida.', 403);
+        const signatureValid = matches('sha256=' + hmac(config.env.WA_APP_SECRET, raw), req.headers['x-hub-signature-256']);
+        const body = signatureValid ? parse(raw) : null;
+        console.log('WhatsApp webhook:', new Date().toISOString(), 'signatureValid=' + signatureValid,
+          'entries=' + (body && Array.isArray(body.entry) ? body.entry.length : 'not-parsed'));
+        requireThat(signatureValid, 'Firma de WhatsApp inválida.', 403);
         const queue = [];
-        for (const entry of parse(raw).entry || []) for (const change of entry.changes || []) {
+        for (const entry of body.entry || []) for (const change of entry.changes || []) {
           const value = change.value || {};
           if (String(value.metadata?.phone_number_id) !== config.env.WA_PHONE_NUMBER_ID) continue;
           for (const message of value.messages || []) if (config.allowedPhones.has(message.from) && message.id) {
