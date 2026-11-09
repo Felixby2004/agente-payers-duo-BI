@@ -1,0 +1,107 @@
+{
+  "name": "El Establo PAYERS · WhatsApp y alertas",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "minutes", "minutesInterval": 1 }] } },
+      "id": "5a6fc297-f9d3-49e5-a472-d438f0dfe700",
+      "name": "Cada minuto",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {},
+      "id": "3f3fb163-728f-4715-b1cb-603910711337",
+      "name": "Ejecutar prueba manual",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [0, 192]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "establo-payers-despertar",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "7f376d54-9917-43b2-a960-42a735f44d3d",
+      "name": "Despertar por WhatsApp",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "webhookId": "e23512af-bbb0-441d-bc6d-27e0c99754d7",
+      "position": [0, -192]
+    },
+    {
+      "parameters": {
+        "jsCode": "const apiUrl = 'https://REEMPLAZAR.example';\nif (apiUrl.includes('REEMPLAZAR')) throw new Error('Indica la URL HTTPS del servidor PAYERS en el nodo API del restaurante.');\nreturn [{ json: { apiUrl: apiUrl.replace(/\\/$/, ''), evaluateAlerts: !$input.first().json.webhookUrl } }];"
+      },
+      "id": "8523be6d-4fa6-4aa9-985b-eae3c2933154",
+      "name": "API del restaurante",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [260, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.apiUrl + '/api/internal/agent/inbox' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": { "timeout": 145000 }
+      },
+      "id": "caf65303-36b7-43f0-bebc-4d8b8c66bd63",
+      "name": "Procesar mensajes y adjuntos",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [570, -96],
+      "notes": "El servidor descarga imágenes y audios desde Meta, aplica IA y contesta en WhatsApp. n8n recibe solo conteos."
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().filter(item => item.json.evaluateAlerts);"
+      },
+      "id": "05be3d70-8bfc-4ec7-8a13-4252bd401d96",
+      "name": "Solo horario o prueba manual",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [570, 128]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.apiUrl + '/api/internal/agent/alerts' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": { "timeout": 145000 }
+      },
+      "id": "4d646cf2-1114-43b9-8a01-6d8c3e9691db",
+      "name": "Evaluar alertas configuradas",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [820, 128],
+      "notes": "Lee la configuración vigente de Supabase, revisa la reserva y envía recordatorios o genera incidencias."
+    }
+  ],
+  "connections": {
+    "Cada minuto": { "main": [[{ "node": "API del restaurante", "type": "main", "index": 0 }]] },
+    "Ejecutar prueba manual": { "main": [[{ "node": "API del restaurante", "type": "main", "index": 0 }]] },
+    "Despertar por WhatsApp": { "main": [[{ "node": "API del restaurante", "type": "main", "index": 0 }]] },
+    "API del restaurante": { "main": [[
+      { "node": "Procesar mensajes y adjuntos", "type": "main", "index": 0 },
+      { "node": "Solo horario o prueba manual", "type": "main", "index": 0 }
+    ]] },
+    "Solo horario o prueba manual": { "main": [[{ "node": "Evaluar alertas configuradas", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Lima",
+    "executionTimeout": 240,
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "none",
+    "saveManualExecutions": false
+  },
+  "pinData": {},
+  "tags": []
+}

@@ -1,0 +1,114 @@
+import { createHmac, timingSafeEqual } from 'node:crypto';
+import { requestJson } from './config.mjs';
+import { requireThat } from './domain.mjs';
+import { money, balance, visitText } from '../shared/orders.mjs';
+
+export const hmac = (secret, value) => createHmac('sha256', secret).update(value).digest('hex');
+export function matches(left, right) {
+  const a = Buffer.from(String(left || '')), b = Buffer.from(String(right || ''));
+  return a.length > 0 && a.length === b.length && timingSafeEqual(a, b);
+}
+const post = (body, token, service, extra = {}) => ({
+  method: 'POST', body: JSON.stringify(body), service,
+  headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json', ...extra },
+});
+
+export function providers(config) {
+  const e = config.env;
+  const mp = 'https://api.mercadopago.com';
+  const mpAuth = { service: 'Mercado Pago', headers: { Authorization: 'Bearer ' + e.MP_TEST_ACCESS_TOKEN } };
+  let sellerVerified = false;
+  async function verifySeller() {
+    if (sellerVerified) return;
+    const seller = await requestJson('https://api.mercadolibre.com/users/me', mpAuth);
+    const isTest = seller.tags?.includes('test_user') || seller.user_type === 'test_user';
+    requireThat(isTest && String(seller.id) === e.MP_TEST_SELLER_ID, 'La credencial no corresponde a la cuenta vendedora de prueba configurada.', 502);
+    sellerVerified = true;
+  }
+  return {
+    async downloadMedia(id, limit) {
+      requireThat(config.waMode === 'cloud' && /^\d{1,30}$/.test(String(id)), 'Referencia de adjunto inválida.');
+      const headers = { Authorization: 'Bearer ' + e.WA_ACCESS_TOKEN };
+      const meta = await requestJson('https://graph.facebook.com/' + e.WA_GRAPH_VERSION + '/' + id
+        + '?phone_number_id=' + encodeURIComponent(e.WA_PHONE_NUMBER_ID), { service: 'WhatsApp', headers });
+      const target = new URL(meta.url);
+      requireThat(target.protocol === 'https:' && (['lookaside.fbsbx.com', 'graph.facebook.com'].includes(target.hostname)
+        || target.hostname.endsWith('.fbcdn.net')), 'WhatsApp devolvió una dirección de adjunto inesperada.', 502);
+      requireThat(Number(meta.file_size || 0) <= limit, 'El adjunto supera el tamaño permitido.');
+      const res = await fetch(target, { headers, redirect: 'error', signal: AbortSignal.timeout(15000) });
+      requireThat(res.ok && res.body && Number(res.headers.get('content-length') || 0) <= limit, 'No se pudo descargar el adjunto de WhatsApp.', 502);
+      const parts = [];
+      let size = 0;
+      for await (const chunk of res.body) {
+        size += chunk.byteLength;
+        requireThat(size <= limit, 'El adjunto supera el tamaño permitido.');
+        parts.push(Buffer.from(chunk));
+      }
+      requireThat(size > 0, 'El adjunto está vacío.');
+      return { bytes: Buffer.concat(parts), mime: String(meta.mime_type || res.headers.get('content-type') || '').split(';')[0] };
+    },
+    async checkout(order, intent) {
+      if (config.paymentMode === 'local') return {};
+      await verifySeller();
+      const returnUrl = config.publicUrl + '/pago/' + intent.id;
+      const buyerEmail = e.MP_TEST_BUYER_EMAIL?.trim();
+      const result = await requestJson(mp + '/checkout/preferences', post({
+        items: [{ id: intent.id, title: 'Anticipo de prueba · ' + order.ref, quantity: 1, currency_id: 'PEN', unit_price: intent.amount / 100 }],
+        ...(buyerEmail ? { payer: { email: buyerEmail } } : {}),
+        external_reference: intent.id,
+        notification_url: config.publicUrl + '/api/webhooks/mercado-pago?source_news=webhooks',
+        back_urls: { success: returnUrl, pending: returnUrl, failure: returnUrl },
+        expires: true, expiration_date_to: intent.expiresAt,
+        payment_methods: { installments: 1 },
+      }, e.MP_TEST_ACCESS_TOKEN, 'Mercado Pago'));
+      const checkoutUrl = new URL(result.init_point);
+      requireThat(checkoutUrl.protocol === 'https:' && /^(www\.)?mercadopago\.com(\.[a-z]{2})?$/.test(checkoutUrl.hostname),
+        'Mercado Pago devolvió un enlace inesperado.', 502);
+      return { checkoutUrl: checkoutUrl.href, preferenceId: String(result.id) };
+    },
+    async payment(id) {
+      await verifySeller();
+      const p = await requestJson(mp + '/v1/payments/' + encodeURIComponent(id), mpAuth);
+      requireThat(String(p.collector_id) === e.MP_TEST_SELLER_ID && p.live_mode === false && p.currency_id === 'PEN',
+        'La operación no coincide con el entorno de prueba, la cuenta o la moneda.', 409);
+      return p;
+    },
+    async refund(id, cents, key) {
+      await verifySeller();
+      return requestJson(mp + '/v1/payments/' + encodeURIComponent(id) + '/refunds',
+        post({ amount: cents / 100 }, e.MP_TEST_ACCESS_TOKEN, 'Mercado Pago', { 'X-Idempotency-Key': key }));
+    },
+    verifyMp(req, url) {
+      const fields = Object.fromEntries(String(req.headers['x-signature'] || '').split(',').map(x => x.trim().split('=')));
+      const id = (url.searchParams.get('data.id') || '').toLowerCase();
+      const requestId = req.headers['x-request-id'];
+      if (!id || !requestId || !fields.ts || !fields.v1) return null;
+      const expected = hmac(e.MP_WEBHOOK_SECRET, 'id:' + id + ';request-id:' + requestId + ';ts:' + fields.ts + ';');
+      return matches(expected, fields.v1) ? id : null;
+    },
+    async sendWhatsApp(order, text, { template, intent } = {}) {
+      requireThat(config.waMode === 'cloud', 'Conecta WhatsApp Cloud API para enviar mensajes.', 409);
+      requireThat(order.consent && config.allowedPhones.has(order.phone), 'El pagador debe autorizar el contacto y su número debe estar habilitado para la demostración.', 409);
+      const session = order.chat.some(m => m.direction === 'in' && Date.now() - +new Date(m.at) < 24 * 3600000);
+      let body;
+      if (session) body = { type: 'text', text: { body: text, preview_url: false } };
+      else {
+        const name = { deposit: e.WA_TEMPLATE_DEPOSIT, visit: e.WA_TEMPLATE_VISIT, confirmation: e.WA_TEMPLATE_CONFIRMATION,
+          settlement: e.WA_TEMPLATE_SETTLEMENT }[template];
+        requireThat(name, 'Pide al pagador que escriba al número de WhatsApp o configura una plantilla aprobada.', 409);
+        const values = template === 'deposit' ? [order.payer, order.ref, money(intent.amount)]
+          : template === 'settlement' ? [order.payer, order.ref, money(order.total)]
+            : [order.payer, order.ref, visitText(order.visitAt), money(balance(order))];
+        const components = [{ type: 'body', parameters: values.map(value => ({ type: 'text', text: value })) }];
+        if (template === 'deposit') components.push({ type: 'button', sub_type: 'url', index: '0', parameters: [{ type: 'text', text: intent.id }] });
+        if (template === 'settlement') components.push({ type: 'button', sub_type: 'url', index: '0',
+          parameters: [{ type: 'text', text: order.receipts.find(r => r.purpose === 'settlement').token }] });
+        body = { type: 'template', template: { name, language: { code: e.WA_TEMPLATE_LANGUAGE || 'es_PE' }, components } };
+      }
+      const result = await requestJson('https://graph.facebook.com/' + e.WA_GRAPH_VERSION + '/' + e.WA_PHONE_NUMBER_ID + '/messages',
+        post({ messaging_product: 'whatsapp', recipient_type: 'individual', to: order.phone, ...body }, e.WA_ACCESS_TOKEN, 'WhatsApp'));
+      requireThat(result.messages?.[0]?.id, 'WhatsApp no devolvió una referencia del mensaje.', 502);
+      return result.messages[0].id;
+    },
+  };
+}
