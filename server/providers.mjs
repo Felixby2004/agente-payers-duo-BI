@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { requestJson } from './config.mjs';
 import { requireThat } from './domain.mjs';
+import { clip, limits } from './interactive.mjs';
 import { money, balance, visitText } from '../shared/orders.mjs';
 
 export const hmac = (secret, value) => createHmac('sha256', secret).update(value).digest('hex');
@@ -12,6 +13,36 @@ const post = (body, token, service, extra = {}) => ({
   method: 'POST', body: JSON.stringify(body), service,
   headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json', ...extra },
 });
+const textBody = (value) => ({ type: 'text', text: { body: clip(value, limits.body), preview_url: false } });
+function interactiveBody(message) {
+  const body = clip(message.body, limits.body);
+  if (message.kind === 'cta') {
+    requireThat(message.cta?.url, 'El enlace del mensaje no está disponible.', 409);
+    return { type: 'interactive', interactive: { type: 'cta_url', body: { text: body }, action: { name: 'cta_url',
+      parameters: { display_text: clip(message.cta.displayText, limits.ctaText) || 'Abrir', url: String(message.cta.url) } } } };
+  }
+  if (message.kind === 'list') {
+    const source = message.list?.sections?.length ? message.list.sections
+      : [{ title: message.list?.title || 'Opciones', rows: message.list?.rows || [] }];
+    const sections = [];
+    let remaining = limits.rows;
+    for (const section of source) {
+      if (remaining <= 0) break;
+      const rows = (section.rows || []).slice(0, remaining).map(row => ({ id: String(row.id).slice(0, limits.id),
+        title: clip(row.title, limits.rowTitle), ...(row.description ? { description: clip(row.description, limits.rowDescription) } : {}) }));
+      if (!rows.length) continue;
+      remaining -= rows.length;
+      sections.push({ title: clip(section.title || 'Opciones', limits.rowTitle), rows });
+    }
+    requireThat(sections.length > 0, 'La lista no tiene opciones disponibles.', 409);
+    return { type: 'interactive', interactive: { type: 'list', body: { text: body }, action: {
+      button: clip(message.list?.button || 'Ver opciones', limits.listButton), sections } } };
+  }
+  const buttons = (message.buttons || []).slice(0, limits.buttons).map(item => ({ type: 'reply',
+    reply: { id: String(item.id).slice(0, limits.id), title: clip(item.title, limits.buttonTitle) } }));
+  requireThat(buttons.length > 0, 'El mensaje no tiene botones disponibles.', 409);
+  return { type: 'interactive', interactive: { type: 'button', body: { text: body }, action: { buttons } } };
+}
 
 export function providers(config) {
   const e = config.env;
@@ -86,29 +117,37 @@ export function providers(config) {
       const expected = hmac(e.MP_WEBHOOK_SECRET, 'id:' + id + ';request-id:' + requestId + ';ts:' + fields.ts + ';');
       return matches(expected, fields.v1) ? id : null;
     },
-    async sendWhatsApp(order, text, { template, intent } = {}) {
+    async sendWhatsApp(order, text, { template, intent, session: open } = {}) {
       requireThat(config.waMode === 'cloud', 'Conecta WhatsApp Cloud API para enviar mensajes.', 409);
       requireThat(order.consent && config.allowedPhones.has(order.phone), 'El pagador debe autorizar el contacto y su número debe estar habilitado para la demostración.', 409);
-      const session = order.chat.some(m => m.direction === 'in' && Date.now() - +new Date(m.at) < 24 * 3600000);
-      let body;
-      if (session) body = { type: 'text', text: { body: text, preview_url: false } };
-      else {
-        const name = { deposit: e.WA_TEMPLATE_DEPOSIT, visit: e.WA_TEMPLATE_VISIT, confirmation: e.WA_TEMPLATE_CONFIRMATION,
-          settlement: e.WA_TEMPLATE_SETTLEMENT }[template];
-        requireThat(name, 'Pide al pagador que escriba al número de WhatsApp o configura una plantilla aprobada.', 409);
-        const values = template === 'deposit' ? [order.payer, order.ref, money(intent.amount)]
-          : template === 'settlement' ? [order.payer, order.ref, money(order.total)]
-            : [order.payer, order.ref, visitText(order.visitAt), money(balance(order))];
-        const components = [{ type: 'body', parameters: values.map(value => ({ type: 'text', text: value })) }];
-        if (template === 'deposit') components.push({ type: 'button', sub_type: 'url', index: '0', parameters: [{ type: 'text', text: intent.id }] });
-        if (template === 'settlement') components.push({ type: 'button', sub_type: 'url', index: '0',
-          parameters: [{ type: 'text', text: order.receipts.find(r => r.purpose === 'settlement').token }] });
-        body = { type: 'template', template: { name, language: { code: e.WA_TEMPLATE_LANGUAGE || 'es_PE' }, components } };
+      const session = typeof open === 'boolean' ? open
+        : order.chat.some(m => m.direction === 'in' && Date.now() - +new Date(m.at) < 24 * 3600000);
+      const submit = async (body) => {
+        const result = await requestJson('https://graph.facebook.com/' + e.WA_GRAPH_VERSION + '/' + e.WA_PHONE_NUMBER_ID + '/messages',
+          post({ messaging_product: 'whatsapp', recipient_type: 'individual', to: order.phone, ...body }, e.WA_ACCESS_TOKEN, 'WhatsApp'));
+        requireThat(result.messages?.[0]?.id, 'WhatsApp no devolvió una referencia del mensaje.', 502);
+        return result.messages[0].id;
+      };
+      if (session) {
+        if (typeof text === 'string') return submit(textBody(text));
+        try { return await submit(interactiveBody(text)); }
+        catch (error) {
+          const fallback = text?.fallback || text?.body;
+          if (!fallback) throw error;
+          return submit(textBody(fallback));
+        }
       }
-      const result = await requestJson('https://graph.facebook.com/' + e.WA_GRAPH_VERSION + '/' + e.WA_PHONE_NUMBER_ID + '/messages',
-        post({ messaging_product: 'whatsapp', recipient_type: 'individual', to: order.phone, ...body }, e.WA_ACCESS_TOKEN, 'WhatsApp'));
-      requireThat(result.messages?.[0]?.id, 'WhatsApp no devolvió una referencia del mensaje.', 502);
-      return result.messages[0].id;
+      const name = { deposit: e.WA_TEMPLATE_DEPOSIT, visit: e.WA_TEMPLATE_VISIT, confirmation: e.WA_TEMPLATE_CONFIRMATION,
+        settlement: e.WA_TEMPLATE_SETTLEMENT }[template];
+      requireThat(name, 'Pide al pagador que escriba al número de WhatsApp o configura una plantilla aprobada.', 409);
+      const values = template === 'deposit' ? [order.payer, order.ref, money(intent.amount)]
+        : template === 'settlement' ? [order.payer, order.ref, money(order.total)]
+          : [order.payer, order.ref, visitText(order.visitAt), money(balance(order))];
+      const components = [{ type: 'body', parameters: values.map(value => ({ type: 'text', text: value })) }];
+      if (template === 'deposit') components.push({ type: 'button', sub_type: 'url', index: '0', parameters: [{ type: 'text', text: intent.id }] });
+      if (template === 'settlement') components.push({ type: 'button', sub_type: 'url', index: '0',
+        parameters: [{ type: 'text', text: order.receipts.find(r => r.purpose === 'settlement').token }] });
+      return submit({ type: 'template', template: { name, language: { code: e.WA_TEMPLATE_LANGUAGE || 'es_PE' }, components } });
     },
   };
 }

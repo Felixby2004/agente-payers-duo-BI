@@ -1,5 +1,6 @@
 // Multinomial Naive Bayes, trained on short Spanish examples used in PAYERS.
 const training = {
+  menu: ['hola', 'buenas', 'buenos dias', 'buenas tardes', 'buenas noches', 'menu', 'menu principal', 'inicio', 'hola que tal', 'hola buenas'],
   link: ['quiero pagar mi anticipo', 'mandame el enlace para pagar', 'pasame link de pago', 'como pago la reserva', 'enviame el link del anticipo', 'necesito un enlace de pago', 'quiero abonar', 'puedo pagar ahora'],
   paid: ['ya pague mi anticipo', 'acabo de pagar', 'hice el pago', 'te envie la captura', 'me cobraron', 'ya realice el pago', 'me debitaron el importe', 'hice una transferencia'],
   balance: ['cuanto falta por pagar', 'cual es mi saldo pendiente', 'cuanto queda', 'dime el saldo de mi pedido', 'cuanto pago en caja', 'quiero conocer el importe pendiente', 'cuanto debo pagar al llegar'],
@@ -24,10 +25,13 @@ const models = Object.entries(training).map(([intent, lines]) => {
   return { intent, counts, total };
 });
 export function classify(message) {
+  const plain = String(message || '').normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase()
+    .replace(/\bEST-[a-f0-9]{8}\b/gi, '').replace(/[^a-z]+/g, ' ').trim();
+  if (/^(hola|buenas|buenos dias|buenas tardes|buenas noches|menu|inicio)$/.test(plain)) return 'menu';
   const words = tokens(message);
   if (words.length === 1) {
     const shortcuts = { anticipo: 'link', enlace: 'link', saldo: 'balance', pague: 'paid', comprobante: 'receipt',
-      reprogramar: 'change', cancelar: 'cancel', ayuda: 'human', reserva: 'visit' };
+      reprogramar: 'change', cancelar: 'cancel', ayuda: 'menu', reserva: 'visit' };
     return shortcuts[words[0]] || 'unknown';
   }
   const known = words.filter(word => vocabulary.has(word));

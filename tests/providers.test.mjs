@@ -96,9 +96,13 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     await receive(message);
     assert.equal(sent.length, 0);
     assert.equal((await drain()).processed, 1);
-    assert.equal(sent.length, 1);
+    assert.equal(sent.length, 2);
     assert.equal(sent[0].to, '51999999999');
-    assert.match(sent[0].text.body, /https:\/\/establo\.example\/pago\//);
+    assert.equal(sent[0].type, 'interactive');
+    assert.equal(sent[0].interactive.type, 'cta_url');
+    assert.match(sent[0].interactive.action.parameters.url, /^https:\/\/establo\.example\/pago\//);
+    assert.equal(sent[1].interactive.type, 'button');
+    assert.deepEqual(sent[1].interactive.action.buttons.map(button => button.reply.id.split(':')[0]), ['yape', 'plin', 'hum']);
     assert.equal(preference.items[0].unit_price, 40);
     assert.equal(preference.items[0].currency_id, 'PEN');
     assert.equal(Object.hasOwn(preference, 'payer'), false);
@@ -113,7 +117,8 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
 
     await receive({ ...message, id: 'wamid.audio', type: 'audio', text: undefined, audio: { id: '56' } });
     assert.equal((await drain()).processed, 1);
-    assert.match(sent.at(-1).text.body, /personal revisará/);
+    assert.match(sent.at(-1).text.body, /personal la revisará/);
+    assert.match(sent.at(-1).text.body, /^📅/);
 
     const mpBody = JSON.stringify({ type: 'payment', data: { id: '987' } });
     const signedMp = { 'x-request-id': 'solicitud-1', 'x-signature': 'ts=123,v1='
@@ -129,8 +134,10 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     assert.equal(verified.payments.length, 1);
     assert.equal(verified.payments[0].amount, 4000);
     assert.equal(verified.receipts.length, 1);
-    assert.equal(sent.length, 4);
-    assert.match(sent.at(-1).text.body, /Anticipo verificado/);
+    assert.equal(sent.length, 5);
+    assert.equal(sent.at(-1).interactive.type, 'cta_url');
+    assert.match(sent.at(-1).interactive.body.text, /Anticipo verificado/);
+    assert.match(sent.at(-1).interactive.action.parameters.url, /\/comprobante\//);
     assert.ok(verified.incidents.some(i => i.type === 'Solicitud de reprogramación'));
 
     const { data: rule } = await call('config', undefined, 200);

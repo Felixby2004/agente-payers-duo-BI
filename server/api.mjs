@@ -4,7 +4,9 @@ import { openStore, updateOrder } from './store.mjs';
 import { providers, hmac, matches } from './providers.mjs';
 import { agentAI } from './agent-ai.mjs';
 import { contactTime, defaults, validateSettings } from './agent-settings.mjs';
-import { balance, depositDue, money, terminal, visitText, stageLabels } from '../shared/orders.mjs';
+import { balance, depositDue, money, terminal, stageLabels } from '../shared/orders.mjs';
+import { displayText, emojis, friendlyDate, parseAction, reservationFocus, reservationMenu, reservationPrompt,
+  paymentCta, paymentFollowUp, receiptCta, confirmationCta, requestMessage } from './interactive.mjs';
 import { Problem, requireThat, createOrder, addEvent, openIssue, applyPayment, arrive, recordCounterPayment, issueReceipt, reschedule, endReservation } from './domain.mjs';
 
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
@@ -83,16 +85,25 @@ export async function makeApi(env, options = {}) {
       })).result;
     });
   }
-  async function send(order, text, params) {
-    const id = await service.sendWhatsApp(order, text, params);
+  async function sessionOpen(phone) {
+    return (await store.phone(phone)).some(order => order.chat.some(message =>
+      message.direction === 'in' && Date.now() - +new Date(message.at) < 24 * 3600000));
+  }
+  async function send(order, text, params = {}) {
+    const id = await service.sendWhatsApp(order, text, { ...params, session: await sessionOpen(order.phone) });
+    const shown = displayText(text);
     return (await update(order.id, data => {
-      data.chat.push({ id, at: instant(), text, direction: 'out', status: 'accepted' });
+      data.chat.push({ id, at: instant(), text: shown, direction: 'out', status: 'accepted' });
       addEvent(data, 'Mensaje aceptado por WhatsApp', id);
     })).order;
   }
+  async function sendReply(order, reply) {
+    for (const message of Array.isArray(reply) ? reply : [reply]) if (message) await send(order, message);
+  }
   function depositText(order, intent) {
-    return 'Hola, ' + order.payer + '. Para confirmar ' + order.ref + ' en Parrilladas El Establo, paga ' + money(intent.amount)
-      + ' de anticipo en este enlace de demostración: ' + linkFor(intent) + '. Visita: ' + visitText(order.visitAt) + '.';
+    return emojis.payment + ' Hola, ' + order.payer + '. Para confirmar ' + order.ref + ' en Parrilladas El Establo, paga '
+      + money(intent.amount) + ' de anticipo en este enlace de demostración: ' + linkFor(intent) + '. Visita: '
+      + friendlyDate(order.visitAt, new Date(), true) + '.';
   }
   function finishDeposit(data, payment, token) {
     const changed = applyPayment(data, payment);
@@ -103,9 +114,9 @@ export async function makeApi(env, options = {}) {
     if (config.waMode !== 'cloud' || !order.consent || !config.allowedPhones.has(order.phone) || !(await settings()).automaticConfirmation) return;
     const receipt = order.receipts.find(r => r.purpose === 'deposit');
     try {
-      await send(order, 'Anticipo verificado. Tu reserva ' + order.ref + ' está confirmada para el ' + visitText(order.visitAt)
-        + '. Saldo a pagar en el local: ' + money(balance(order)) + '.' + (receipt ? ' Constancia: ' + receiptLink(receipt) : ''),
-      { template: 'confirmation' });
+      const text = emojis.verified + ' Anticipo verificado. Tu reserva *' + order.ref + '* está confirmada para el *'
+        + friendlyDate(order.visitAt, new Date(), true) + '*. Saldo a pagar en el local: *' + money(balance(order)) + '*.';
+      await send(order, receipt ? confirmationCta(order, receiptLink(receipt)) : text, { template: 'confirmation' });
     } catch (error) { await update(order.id, data => openIssue(data, 'Confirmación de WhatsApp pendiente', error.message)); }
   }
   async function syncMp(id, verified = null) {
@@ -150,8 +161,10 @@ export async function makeApi(env, options = {}) {
     return { order, changed: result };
   }
   async function replyTo(order, text, proof, forcedIntent) {
-    const summary = order.ref + ' · ' + stageLabels[order.stage] + '. Visita: ' + visitText(order.visitAt) + '. Saldo: ' + money(balance(order)) + '.';
-    const { intent: intentType, method } = forcedIntent ? { intent: forcedIntent, method: 'checkout' } : await ai.classify(text);
+    const summary = order.ref + ' · ' + stageLabels[order.stage] + '. Visita: '
+      + friendlyDate(order.visitAt, new Date(), true) + '. Saldo: ' + money(balance(order)) + '.';
+    const forced = typeof forcedIntent === 'string' ? { intent: forcedIntent, method: 'checkout' } : forcedIntent;
+    const { intent: intentType, method } = forced || await ai.classify(text);
     switch (intentType) {
       case 'link': {
         if (order.stage !== 'awaiting_deposit') return summary;
@@ -159,10 +172,11 @@ export async function makeApi(env, options = {}) {
         if (/\befectivo\b/i.test(text)) return 'El anticipo de ' + order.ref + ' se paga en línea. Puedes pagar el saldo en efectivo cuando llegues al restaurante.';
         const rule = await settings();
         if (method !== 'checkout' && !rule[method + 'Demo']) return 'Ese medio de demostración está desactivado. Puedes escribir «tarjeta» para abrir el checkout disponible.';
-        const alternatives = [rule.yapeDemo && 'Yape', rule.plinDemo && 'Plin'].filter(Boolean);
-        const suffix = method !== 'checkout' ? ' Elegiste ' + method + ' de demostración.'
-          : alternatives.length ? ' Si prefieres simular ' + alternatives.join(' o ') + ', escribe el nombre del medio.' : '';
-        return depositText(order, await checkout(order.id, method)) + suffix;
+        const intent = await checkout(order.id, method);
+        const cta = paymentCta(order, intent, method, linkFor(intent));
+        if (method !== 'checkout') return cta;
+        const follow = paymentFollowUp(order, rule);
+        return follow ? [cta, follow] : cta;
       }
       case 'paid': {
         if (depositDue(order) === 0) return summary + ' El anticipo figura verificado.';
@@ -178,11 +192,11 @@ export async function makeApi(env, options = {}) {
       case 'human': {
         const type = { change: 'Solicitud de reprogramación', cancel: 'Solicitud de cancelación o devolución', issue: 'Dificultad de pago', human: 'Ayuda del personal' }[intentType];
         await update(order.id, data => openIssue(data, type, text.slice(0, 500)));
-        return 'Registré tu solicitud para ' + order.ref + '. El personal revisará tu caso y confirmará los próximos pasos.';
+        return requestMessage(order, intentType);
       }
       case 'receipt': {
         const receipt = order.receipts.at(-1);
-        return receipt ? 'Aquí tienes la constancia de demostración para ' + order.ref + ': ' + receiptLink(receipt) : 'El comprobante se habilitará tras verificar el pago correspondiente.';
+        return receipt ? receiptCta(order, receiptLink(receipt)) : 'El comprobante se habilitará tras verificar el pago correspondiente.';
       }
       case 'visit': {
         if (/\b(confirmo (?:mi )?asistencia|si (?:voy a ir|asistire))\b/.test(text.normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase())) {
@@ -195,8 +209,17 @@ export async function makeApi(env, options = {}) {
         return summary;
       }
       case 'balance': return summary;
-      default: return summary + ' Puedes escribir «anticipo», «saldo», «reprogramar» o «ayuda».';
+      case 'menu':
+      default: return reservationMenu(order);
     }
+  }
+  async function actionReply(order, action) {
+    const forced = { pay: { intent: 'link', method: 'checkout' }, yape: { intent: 'link', method: 'yape' },
+      plin: { intent: 'link', method: 'plin' }, bal: { intent: 'balance' }, rcp: { intent: 'receipt' },
+      chg: { intent: 'change' }, hum: { intent: 'human' } }[action];
+    const phrase = { pay: 'anticipo', yape: 'yape', plin: 'plin', bal: 'saldo', rcp: 'comprobante',
+      chg: 'reprogramar', hum: 'ayuda' }[action];
+    return replyTo(order, phrase || '', undefined, forced);
   }
   async function incoming(message) {
     const phone = message.from;
@@ -206,6 +229,8 @@ export async function makeApi(env, options = {}) {
     const orders = (await store.phone(phone)).filter(o => o.consent);
     if (!orders.length || orders.some(o => o.chat.some(m => m.id === message.id))) return;
     const attachment = ['image', 'audio', 'document'].includes(message.type) ? message[message.type] : null;
+    const reply = message.interactive?.button_reply || message.interactive?.list_reply;
+    const action = parseAction(reply?.id);
     let text = String(message.text?.body || message.interactive?.button_reply?.title || message.interactive?.list_reply?.title
       || message.button?.text || attachment?.caption || '').slice(0, 1000);
     let proof, mediaError;
@@ -231,14 +256,25 @@ export async function makeApi(env, options = {}) {
       return true;
     });
     if (!isNew) return;
+    const target = action?.ref ? orders.find(o => o.ref === action.ref) : null;
+    let recipient = target || order;
     try {
       let response;
-      if (candidates.length > 1) response = 'Tienes varias reservas. Responde con la referencia que deseas consultar: ' + candidates.map(o => o.ref).join(', ') + '.';
-      else if (mediaError || (proof && proof.kind !== 'voucher')) {
+      if (action && (action.action === 'menu' || (action.ref && !target))) {
+        response = reservationPrompt(orders);
+        recipient = reservationFocus(orders) || order;
+      } else if (action?.action === 'sel') {
+        response = target ? reservationMenu(target) : reservationPrompt(orders);
+        recipient = target || reservationFocus(orders) || order;
+      } else if (target) response = await actionReply(target, action.action);
+      else if (!ref && orders.length > 1) {
+        response = reservationPrompt(orders);
+        recipient = reservationFocus(orders) || order;
+      } else if (mediaError || (proof && proof.kind !== 'voucher')) {
         await update(order.id, data => openIssue(data, 'Adjunto por revisar', mediaError || 'La imagen requiere revisión del personal.', message.id));
         response = 'Recibí el archivo para ' + order.ref + '. El personal revisará el adjunto. También puedes contarme por escrito cómo te ayudo.';
       } else response = await replyTo(order, text, proof, proof ? 'paid' : undefined);
-      await send(order, response);
+      await sendReply(recipient, response);
     } catch (error) {
       await update(order.id, data => openIssue(data, 'Respuesta de WhatsApp pendiente', error.message, message.id));
     }
@@ -331,8 +367,9 @@ export async function makeApi(env, options = {}) {
         const intent = askForDeposit ? await checkout(order.id) : null;
         const current = (await store.get(order.id)).data;
         if (current.stage === order.stage && current.visitAt === order.visitAt) {
-          await send(current, askForDeposit ? depositText(current, intent) : 'Te esperamos en El Establo el ' + visitText(current.visitAt)
-            + '. Reserva ' + current.ref + '. Saldo en el local: ' + money(balance(current)) + '.', { template: askForDeposit ? 'deposit' : 'visit', intent });
+          await send(current, askForDeposit ? depositText(current, intent) : emojis.visit + ' Te esperamos en El Establo el '
+            + friendlyDate(current.visitAt, new Date(), true) + '. Reserva ' + current.ref + '. Saldo en el local: '
+            + money(balance(current)) + '.', { template: askForDeposit ? 'deposit' : 'visit', intent });
           await update(order.id, data => { data.reminders[key].status = 'sent'; });
           sent++;
         } else await update(order.id, data => { data.reminders[key].status = 'skipped'; });
@@ -515,12 +552,13 @@ export async function makeApi(env, options = {}) {
           order = await send(order, depositText(order, intent), { template: 'deposit', intent });
         } else if (input.type === 'visit') {
           requireThat(order.stage === 'confirmed', 'La visita debe estar confirmada.', 409);
-          order = await send(order, 'Hola, ' + order.payer + '. Te esperamos el ' + visitText(order.visitAt)
-            + ' en El Establo. Reserva ' + order.ref + '. Saldo en el local: ' + money(balance(order)) + '.', { template: 'visit' });
+          order = await send(order, emojis.visit + ' Hola, ' + order.payer + '. Te esperamos el '
+            + friendlyDate(order.visitAt, new Date(), true) + ' en El Establo. Reserva ' + order.ref
+            + '. Saldo en el local: ' + money(balance(order)) + '.', { template: 'visit' });
         } else if (input.type === 'receipt') {
           const receipt = order.receipts.at(-1);
           requireThat(receipt, 'Aún no hay un comprobante emitido.', 409);
-          order = await send(order, 'Aquí tienes tu comprobante de demostración: ' + receiptLink(receipt),
+          order = await send(order, receiptCta(order, receiptLink(receipt)),
             { template: receipt.purpose === 'settlement' ? 'settlement' : undefined });
         } else throw new Problem('Selecciona un mensaje válido.');
         return json(res, 200, { order });

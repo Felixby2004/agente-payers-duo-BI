@@ -83,7 +83,7 @@ Los nombres `WA_TEMPLATE_*` deben corresponder a plantillas aprobadas y a los pa
 3. **Filtro de número de empresa.** Solo procesa los cambios cuyo `metadata.phone_number_id` coincide exactamente con `WA_PHONE_NUMBER_ID`. (`server/api.mjs`: `route`, rama POST del webhook.)
 4. **Filtro de remitentes y enqueue.** Solo se encolan mensajes cuyo `from` coincide exactamente con un elemento de `WA_ALLOWED_PHONES` y tienen `id`. La configuración de la lista elimina caracteres no numéricos al cargarla; el `from` recibido no se normaliza en este filtro. (`server/config.mjs`: `readConfig`; `server/api.mjs`: `route`.)
 5. **Procesamiento del trabajo.** En `incoming`, el agente descarta silenciosamente mensajes sin ID, con teléfono no permitido, timestamp no numérico, más antiguo de 24 horas o más de 60 segundos en el futuro. Luego busca pedidos de ese teléfono con `consent` y descarta si no hay ninguno o el ID ya existe en el chat. (`server/api.mjs`: `incoming`.)
-6. **Referencia `EST-XXXXXXXX`.** Si el texto contiene una referencia con ese formato, el agente selecciona los pedidos cuyo código coincide. Si no hay candidatos, no continúa ni responde. Sin referencia, elige pedidos activos del teléfono (o, si no hay, los pedidos restantes); si hay varios candidatos, pide que se especifique la referencia. (`server/api.mjs`: `incoming`.)
+6. **Referencia `EST-XXXXXXXX` e identificadores interactivos.** Si el texto contiene una referencia con ese formato, el agente selecciona los pedidos cuyo código coincide. Si no hay candidatos, no continúa ni responde. Sin referencia, elige pedidos activos del teléfono (o, si no hay, los pedidos restantes); si hay varias reservas, envía una lista `sel:REF` para elegir. Los `button_reply` y `list_reply` se leen por `id`; la referencia del id se resuelve solo entre reservas con consentimiento de ese teléfono. (`server/api.mjs`: `incoming`; `server/interactive.mjs`: `parseAction`.)
 7. **Cola y n8n.** El POST válido se guarda en el almacén. En modo `n8n`, el workflow llama `POST /api/internal/agent/inbox`; el servidor exige `Authorization: Bearer <N8N_AGENT_TOKEN>`, procesa hasta dos trabajos por ejecución y devuelve contadores `processed` y `failed`. (`server/api.mjs`: `route`, `processInbox`, `drainInbox`; `server/store.mjs`: `openStore`.)
 
 Los eventos de estado (`sent`, `delivered`, `read`, `failed`) también se encolan y actualizan el estado del mensaje asociado. Una cola vacía puede producir `processed: 0, failed: 0`; es un resultado, no necesariamente un error. (`server/api.mjs`: manejador POST, `delivery`, `processInbox`.)
@@ -108,16 +108,33 @@ El clasificador local de `server/intents.mjs` incluye atajos y ejemplos en espa�
 
 | Intención / ejemplos | Comportamiento |
 |---|---|
-| **Anticipo**, **enlace**, “quiero pagar” | Si el pedido sigue pendiente y no venció, crea o reutiliza el intento y responde con el enlace de demostración. Si ya no está pendiente, informa el resumen; si venció, indica que el personal puede revisar. |
-| **Yape**, **Plin** | Si se escriben solos, se interpretan como solicitud de enlace para ese método de demostración. Los métodos pueden desactivarse en la configuración del agente. No representan una transferencia real. |
-| **Saldo** | Responde el resumen del pedido, su estado, fecha de visita y saldo pendiente. |
+| **Menú**, **hola**, **buenas**, **buenos días**, **buenas tardes**, **buenas noches**, **inicio**, **ayuda** | Muestra el menú de la reserva con botones. Con dos o más reservas activas del mismo teléfono, envía una lista agrupada por estado para elegir; con una sola activa va directo a su menú y, si solo hay finalizadas, abre la más reciente. **Ayuda** ya no abre una incidencia: para pedir personal usa **Hablar con alguien** o “quiero hablar con alguien”. |
+| **Anticipo**, **enlace**, “quiero pagar”, botón **Pagar anticipo** | Si la reserva sigue pendiente y el plazo está vigente, crea o reutiliza el intento y responde con un mensaje `cta_url` cuyo botón dice **Pagar {importe}**. Después, si Yape o Plin de demostración están activos, envía un segundo mensaje con botones para esos medios. |
+| **Yape**, **Plin**, botones **Pagar con Yape** o **Pagar con Plin** | Crean o reutilizan el enlace de ese medio de demostración y responden con un `cta_url`. Los métodos pueden desactivarse en la configuración del agente. No representan una transferencia real. |
+| **Saldo**, botón **Ver saldo** | Responde el resumen del pedido, su estado, fecha de visita y saldo pendiente. |
 | **Ya pagué**, “te envié el comprobante” | Registra un aviso/incidencia para revisión; no marca automáticamente el pago como confirmado. La confirmación depende del flujo de pago verificado. |
-| **Reprogramar**, **cancelar**, **devolución**, **error de pago**, **ayuda** o pedir una persona | Registra una incidencia y responde que el personal revisará el caso. No realiza por chat la cancelación, devolución ni reprogramación. |
-| **Constancia**, **comprobante** | Devuelve el enlace de la última constancia emitida; si aún no existe, indica que se habilitará al verificar el pago. |
+| **Reprogramar**, **cancelar**, **devolución**, **error de pago**, botón **Cambiar fecha** o **Hablar con alguien** | Registra una incidencia y responde que el personal revisará el caso. No realiza por chat la cancelación, devolución ni reprogramación. |
+| **Constancia**, **comprobante**, botón **Ver constancia** | Responde con un `cta_url` **Ver constancia** si existe un comprobante; si aún no existe, indica que se habilitará al verificar el pago. |
 | **Visita**, **asistencia** | Devuelve el resumen. Una afirmación de asistencia puede registrar una intención, pero la llegada se registra en recepción. |
-| Otra consulta | Responde con el resumen y sugiere comandos como anticipo, saldo, reprogramar o ayuda. |
+| Otra consulta | Muestra el menú de la reserva en lugar de pedir comandos de texto. |
 
-Las reglas de `classify` son intencionalmente limitadas; no se garantiza que cualquier paráfrasis se clasifique como se espera.
+Las reglas de `classify` son intencionalmente limitadas; no se garantiza que cualquier paráfrasis se clasifique como se espera. Los comandos de texto anteriores siguen funcionando como respaldo.
+
+### Botones, listas y CTA
+
+Los mensajes interactivos solo se envían dentro de la ventana de 24 horas. Fuera de esa ventana se mantienen las plantillas aprobadas y no se intenta ningún formato interactivo. (`server/providers.mjs`: `sendWhatsApp`; `server/api.mjs`: `send`.)
+
+- **Menús por estado:** anticipo pendiente → **Pagar anticipo**, **Ver saldo**, **Hablar con alguien**; plazo vencido → **Hablar con alguien**; confirmada → **Ver constancia** (si existe) o **Ver saldo**, **Cambiar fecha**, **Hablar con alguien**; reserva terminal → **Ver constancia** si existe. Los importes y las fechas se muestran en negrita de WhatsApp. Los textos usan un emoji funcional o temático al inicio (`🔥`, `⚠️`, `🥩`, `🍖`) y las fechas legibles de la lista (`hoy 20:16`, `mañana 20:00`, `vie 13 nov, 21:30`).
+- **Protocolo de identificadores:** `accion:REF` (por ejemplo `pay:EST-1A2B3C4D`) o `menu` sin referencia. Acciones permitidas: `pay`, `yape`, `plin`, `bal`, `rcp`, `chg`, `hum`, `sel` y `menu`. Cualquier otro identificador se trata como no reconocido.
+- **Resolución segura:** el identificador lo controla el cliente. La referencia se busca **solo** entre las reservas con consentimiento del teléfono que envió el mensaje (`store.phone(phone)`). Si la referencia no existe o pertenece a otro teléfono, no se ejecuta ninguna acción sobre ninguna reserva y se responde con el menú o la lista de sus reservas. Un identificador no reconocido conserva el comportamiento anterior: se clasifica el título como texto.
+- **Sin acciones sensibles:** los botones no aprueban devoluciones, no cambian importes, no registran llegadas ni marcan pagos como verificados. **Cambiar fecha**, **Hablar con alguien** y los casos de cancelación abren una incidencia, igual que por texto.
+- **Varias reservas:** si el mensaje no indica la reserva, se envía una lista `sel:REF` agrupada por estado, en este orden y solo con las secciones que tengan filas: **⏳ Por pagar anticipo** (anticipo vigente), **✅ Confirmadas** (anticipo verificado y visita aún no cerrada), **⚠️ Requieren atención** (anticipo vencido o incidencia abierta que bloquea) y **🧾 Finalizadas** (reservas terminales, solo si sobran filas). Dentro de cada sección va primero la visita futura más próxima; las visitas pasadas quedan al final, de la más reciente a la más antigua. El cuerpo indica cuántas reservas activas hay y, si el teléfono tiene más de 10 en total, añade **Mostrando las 10 más relevantes de {n}. Si buscas otra, escríbeme su referencia.**
+- **Filas de la lista:** el título (máx. 24) usa la fecha en hora de Lima (`Hoy 20:16`, `Mañana 20:00`, `Vie 13 nov · 21:30`, recortada con “…” si hiciera falta). La descripción (máx. 72) combina estado y dato clave, personas en singular o plural y referencia; si no cabe, se retira primero la referencia y no el estado. Ejemplos: `Falta anticipo S/ 50.00 · 5 personas · EST-6310D417`, `Confirmada · saldo S/ 36.00 · 2 personas · EST-FCC67EA9`, `Anticipo vencido · 2 personas · EST-84045C40`, `Finalizada · 2 personas · EST-67E8328B`.
+- **Qué se muestra:** por defecto solo se listan las reservas activas; las finalizadas se agregan únicamente si quedan filas hasta el máximo de 10. Si el teléfono tiene una sola reserva activa, se abre directamente su menú aunque existan otras finalizadas. Si no hay activas pero sí finalizadas, se abre el menú de la finalizada más reciente (constancia). Con dos o más activas se muestra la lista y, al elegir una fila, se responde con el menú de esa reserva.
+- **Emojis:** como máximo uno por mensaje, al inicio del cuerpo o de la línea clave. Las secciones y las descripciones de fila pueden llevar su emoji de estado. No se usan emojis de comida en pagos, vencimientos o incidencias, y los títulos de botones no llevan emojis. Los textos y formatos están centralizados en `server/interactive.mjs` (`emojis` y `friendlyDate`).
+- **Límites aplicados en código:** 3 botones, título de botón 20 caracteres, cuerpo 1024, texto del botón de lista 20, 10 filas, título de fila 24, descripción de fila 72, `display_text` del CTA 20 e identificador 256. Los títulos se sanean sin saltos de línea y se recortan con “…” si exceden el límite.
+- **Fallback:** si Meta rechaza el mensaje interactivo, se reintenta una sola vez como texto plano con el cuerpo más el enlace o las opciones. Si la lista cae a texto plano, cada opción se enumera con su fecha legible y su estado, no solo con la referencia. Si el texto también falla, el error se propaga como antes.
+- **Trazabilidad:** el chat del panel conserva un texto legible, por ejemplo el cuerpo seguido de `[Botones: Pagar anticipo · Ver saldo · Hablar con alguien]`. El identificador de Meta se guarda en la reserva sobre la que se responde.
 
 ### Imágenes, notas de voz y documentos
 
@@ -129,7 +146,9 @@ Las reglas de `classify` son intencionalmente limitadas; no se garantiza que cua
 
 ## 7. Reglas de mensajería
 
-`server/providers.mjs`, función `sendWhatsApp`, permite texto libre cuando el pedido tiene un mensaje entrante en su chat dentro de las últimas 24 horas. Fuera de esa ventana exige la plantilla correspondiente; si no hay nombre configurado para la plantilla, la operación falla con 409. También exige consentimiento y teléfono permitido.
+`server/providers.mjs`, función `sendWhatsApp`, permite texto libre o mensajes interactivos cuando el **teléfono** tiene cualquier mensaje entrante dentro de las últimas 24 horas, aunque la respuesta se guarde en otra reserva del mismo número (`server/api.mjs`: `sessionOpen`, `send`). Fuera de esa ventana exige la plantilla correspondiente; si no hay nombre configurado para la plantilla, la operación falla con 409. También exige consentimiento y teléfono permitido.
+
+Dentro de la ventana, `sendWhatsApp` acepta un string (texto plano, como antes) o un objeto `{ kind: 'buttons' | 'list' | 'cta', body, buttons?, list?, cta?, fallback }`. Si Meta rechaza el mensaje interactivo, se reintenta una sola vez con `fallback` como texto plano; si ese texto también falla, se propaga el error. El texto guardado en `order.chat` es legible para el panel e incluye un resumen de las opciones. La confirmación automática y el envío manual de constancia usan `cta_url` **Ver constancia** cuando hay sesión abierta; sin sesión siguen usando las plantillas de la tabla.
 
 | Plantilla | Variables de cuerpo, en orden | Botón dinámico |
 |---|---|---|
@@ -140,7 +159,7 @@ Las reglas de `classify` son intencionalmente limitadas; no se garantiza que cua
 
 El idioma se toma de `WA_TEMPLATE_LANGUAGE` (predeterminado documentado en `.env.example`). Los nombres de plantilla deben ser los aprobados en Meta y su estructura/idioma deben coincidir con las variables anteriores.
 
-**Caso particular:** al enviar una constancia de anticipo desde el botón de comprobante, el servidor no asigna `WA_TEMPLATE_SETTLEMENT` (esa plantilla se asigna a la liquidación). Por lo tanto, sin ventana de 24 horas, ese envío no tiene una plantilla configurada en el código y puede devolver 409. (`server/api.mjs`: rama `receipt` de la acción `message`; `server/providers.mjs`: `sendWhatsApp`.)
+**Caso particular:** al enviar una constancia de anticipo desde el botón de comprobante, el servidor no asigna `WA_TEMPLATE_SETTLEMENT` (esa plantilla se asigna a la liquidación). Dentro de la ventana de 24 horas ese envío usa `cta_url`; sin ventana, no tiene una plantilla configurada en el código y puede devolver 409. (`server/api.mjs`: rama `receipt` de la acción `message`; `server/providers.mjs`: `sendWhatsApp`.)
 
 ## 8. Seguridad
 
@@ -230,6 +249,11 @@ También comprueba que `metadata.phone_number_id` coincida con `WA_PHONE_NUMBER_
 - El túnel temporal no garantiza una dirección fija ni disponibilidad continua.
 - La guía no cubre el alta de un número real, la verificación del negocio ni la publicación/revisión de la app para producción.
 - Las respuestas de pago son de demostración y las imágenes de comprobante no verifican ni confirman un pago.
+- Los mensajes interactivos solo viajan dentro de la ventana de 24 horas; fuera de ella se usan plantillas y el agente no puede iniciar un menú con botones.
+- Al tocar un botón con enlace (`cta_url`) no se pudo confirmar un evento interactivo entrante; el agente no depende de ese evento. El enlace abre la página de pago o constancia.
+- **Cambiar fecha** abre una incidencia; no implementa una lista de horarios ni modifica la reserva por chat.
+- Sin ninguna reserva con consentimiento no se puede enviar un menú ni una lista: el agente mantiene el silencio actual.
+- El texto real y la aprobación de las plantillas de Meta no están verificados por este repositorio.
 - La suscripción de la WABA y las pantallas actuales de Meta son configuración externa; su estado no se puede verificar desde este repositorio.
 
 ### Elementos marcados como “no verificado”

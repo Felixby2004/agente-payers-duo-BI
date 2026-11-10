@@ -104,5 +104,8 @@ test('El agente distingue las intenciones principales sin inferir confirmaciones
   assert.equal(classify('Necesito cambiar la fecha de mi reserva'), 'change');
   assert.equal(classify('¿Cuánto falta por pagar?'), 'balance');
   assert.equal(classify('Quiero hablar con alguien'), 'human');
+  assert.equal(classify('hola'), 'menu');
+  assert.equal(classify('buenos días'), 'menu');
+  assert.equal(classify('ayuda'), 'menu');
   assert.equal(classify('🧩'), 'unknown');
 });

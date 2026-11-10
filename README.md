@@ -47,8 +47,10 @@ Copia `.env.example` a `.env`. Mantén las claves en el servidor. Para exponer l
 
 1. Configura `WHATSAPP_MODE=cloud` y completa las variables `WA_` obligatorias. Usa la versión de Graph API que indique tu aplicación de Meta, con el prefijo `v`. En `WA_ALLOWED_PHONES`, coloca los números autorizados para la demostración, separados por comas y con código de país. Si usas el número de prueba de Meta, agrega también esos destinatarios en su panel.
 2. En Meta, registra `https://TU-DOMINIO/api/webhooks/whatsapp` con el mismo `WA_VERIFY_TOKEN`, suscribe `messages` y vincula la aplicación a la cuenta de WhatsApp Business. El servidor verifica la firma con `WA_APP_SECRET`.
-3. Registra un caso con el número de prueba autorizado y su permiso de contacto. Desde WhatsApp, escribe **anticipo EST-XXXXXXXX**, usando la referencia del panel. El agente devolverá el enlace. También entiende **saldo**, **reprogramar**, **comprobante** y **ayuda**.
-4. Para iniciar mensajes fuera de la ventana de atención, configura plantillas aprobadas. La de anticipo usa nombre, referencia e importe en el cuerpo y un botón URL dinámico con base `https://TU-DOMINIO/pago/`. Las de visita y confirmación usan nombre, referencia, fecha de visita y saldo en ese orden. La constancia puede solicitarse desde el chat. Para habilitar avisos automáticos, establece `ENABLE_REMINDERS=true`. Los mensajes fallidos aparecen como incidencias.
+3. Registra un caso con el número de prueba autorizado y su permiso de contacto. Desde WhatsApp, escribe **hola** para recibir el menú de la reserva o **anticipo EST-XXXXXXXX** como respaldo. El agente responde con botones (**Pagar anticipo**, **Ver saldo**, **Hablar con alguien**) y un `cta_url` con el enlace de pago; si Yape o Plin de demostración están activos, ofrece un segundo mensaje con esos medios. También entiende **saldo**, **reprogramar**, **comprobante** y los comandos de texto anteriores. **Ayuda** ahora muestra el menú; para abrir una incidencia de personal usa **Hablar con alguien** o “quiero hablar con alguien”.
+4. Los mensajes interactivos solo se envían dentro de la ventana de 24 horas. Fuera de ella, configura plantillas aprobadas: la de anticipo usa nombre, referencia e importe en el cuerpo y un botón URL dinámico con base `https://TU-DOMINIO/pago/`; las de visita y confirmación usan nombre, referencia, fecha de visita y saldo en ese orden. La constancia puede solicitarse desde el chat y, con sesión abierta, se envía como `cta_url` **Ver constancia**. Para habilitar avisos automáticos, establece `ENABLE_REMINDERS=true`. Los mensajes fallidos aparecen como incidencias.
+
+Los botones y las filas usan identificadores `accion:REF` (`pay`, `yape`, `plin`, `bal`, `rcp`, `chg`, `hum`, `sel`) o `menu`. El servidor resuelve la referencia solo entre las reservas con consentimiento del teléfono y no ejecuta acciones sensibles desde un botón. Con dos o más reservas activas se envía una lista `sel:REF` agrupada por estado —**⏳ Por pagar anticipo**, **✅ Confirmadas**, **⚠️ Requieren atención** y **🧾 Finalizadas**—, con la visita futura más próxima primero y las pasadas al final. Las finalizadas solo se agregan si sobran filas; con una sola activa se muestra su menú directamente y, si solo hay finalizadas, se abre la más reciente. Los títulos usan la hora de Lima (`Hoy 20:16`, `Mañana 20:00`, `Vie 13 nov · 21:30`) y las descripciones combinan estado, personas en singular o plural y referencia. Se aplican los límites de WhatsApp (3 botones, 10 filas, títulos de 20/24 caracteres, descripciones de 72 y cuerpo de 1024); los emojis se usan con moderación (máximo uno por mensaje, sin comida en pagos o incidencias y sin emojis en botones). Si Meta rechaza un interactivo, se reintenta una vez como texto plano con la fecha y el estado de cada opción. El detalle está en [la guía de WhatsApp](WHATSAPP_INTEGRACION.md#botones-listas-y-cta).
 
 [WhatsApp Cloud API de Meta](https://www.postman.com/meta/whatsapp-business-platform/documentation/wlk6lh4/whatsapp-cloud-api) · [Política de mensajería](https://whatsappbusiness.com/policy/)
 
@@ -72,3 +74,15 @@ La versión de demostración usa constancias internas, un único operador y regi
 npm test
 npm run build
 ```
+
+### Iniciar o detener la demo en Windows
+
+En PowerShell, desde la raíz del proyecto:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-demo.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\start-demo.ps1 -DryRun
+powershell -ExecutionPolicy Bypass -File .\scripts\stop-demo.ps1
+```
+
+El inicio levanta el servidor y los túneles temporales, actualiza `PUBLIC_URL` y, si `AGENT_ORCHESTRATION=n8n`, `N8N_WAKE_URL`. Después de cada inicio debes actualizar en Meta la URL de devolución del webhook. Los registros y la lista de procesos se guardan en `.demo/`.
