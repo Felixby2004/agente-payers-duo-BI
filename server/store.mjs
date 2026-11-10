@@ -1,4 +1,5 @@
 import { readFile, mkdir } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { createClient } from '@supabase/supabase-js';
@@ -14,14 +15,48 @@ export async function openStore(config, { memory = false } = {}) {
     const table = () => client.from('payers_orders');
     const jobs = () => client.from('payers_agent_jobs');
     const settings = () => client.from('payers_agent_settings');
+    const contacts = () => client.from('payers_agent_contacts');
+    const queries = () => client.from('payers_agent_queries');
     const check = ({ data, error }) => {
       if (error) throw new Problem('Error de acceso a Supabase. Comprueba las claves y aplica la migración.', 503);
       return data;
     };
+    async function incrementQuery(row) {
+      return check(await queries().update({ message_count: row.message_count + 1, updated_at: new Date().toISOString() })
+        .eq('id', row.id).select('id,phone,state,message_count,excerpt,created_at,handled_at').maybeSingle());
+    }
+    async function noteQuery(phone, excerpt, create) {
+      const current = check(await queries().select('id,phone,state,message_count,excerpt,created_at,handled_at')
+        .eq('phone', phone).eq('state', 'open').maybeSingle());
+      if (current) return { created: false, query: await incrementQuery(current) };
+      if (!create) return { created: false, query: null };
+      const row = { id: randomUUID(), phone, state: 'open', message_count: 1, excerpt: String(excerpt || '').slice(0, 200) };
+      const result = await queries().insert(row).select('id,phone,state,message_count,excerpt,created_at,handled_at').maybeSingle();
+      if (!result.error) return { created: true, query: result.data };
+      // Otra ejecución pudo abrir la consulta entre la lectura y la inserción.
+      const existing = check(await queries().select('id,phone,state,message_count,excerpt,created_at,handled_at')
+        .eq('phone', phone).eq('state', 'open').maybeSingle());
+      if (!existing) check(result);
+      return { created: false, query: await incrementQuery(existing) };
+    }
     return {
       label: 'Supabase',
       async settings() { return check(await settings().select('data').eq('id', 1).maybeSingle())?.data; },
       async saveSettings(data) { check(await settings().upsert({ id: 1, data, updated_at: new Date().toISOString() })); },
+      async contact(phone) { return check(await contacts().select('phone,opted_out,opted_out_at').eq('phone', phone).maybeSingle()); },
+      async setOptOut(phone, value) {
+        check(await contacts().upsert({ phone, opted_out: Boolean(value), opted_out_at: value ? new Date().toISOString() : null,
+          updated_at: new Date().toISOString() }, { onConflict: 'phone' }));
+      },
+      async queries(limit = 200) {
+        return check(await queries().select('id,phone,state,message_count,excerpt,created_at,handled_at')
+          .order('created_at', { ascending: false }).limit(limit));
+      },
+      async noteQuery(phone, excerpt, create = false) { return noteQuery(phone, excerpt, create); },
+      async handleQuery(id) {
+        return Boolean(check(await queries().update({ state: 'handled', handled_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+          .eq('id', id).eq('state', 'open').select('id').maybeSingle()));
+      },
       async enqueue(rows) { if (rows.length) check(await jobs().upsert(rows, { onConflict: 'id', ignoreDuplicates: true })); },
       async queued(limit) { return check(await jobs().select('id,kind,payload').eq('state', 'queued').order('queued_at').order('id').limit(limit)); },
       async claim(id) { return Boolean(check(await jobs().update({ state: 'processing', claimed_at: new Date().toISOString() })
@@ -63,10 +98,40 @@ export async function openStore(config, { memory = false } = {}) {
   end $$;`);
   await db.exec(await readFile(new URL('../supabase/migrations/001_payers.sql', import.meta.url), 'utf8'));
   await db.exec(await readFile(new URL('../supabase/migrations/002_payers_agent.sql', import.meta.url), 'utf8'));
+  await db.exec(await readFile(new URL('../supabase/migrations/003_contactos.sql', import.meta.url), 'utf8'));
+  const queryRow = 'id,phone,state,message_count,excerpt,created_at,handled_at';
+  async function noteQuery(phone, excerpt, create) {
+    const current = (await db.query(`select ${queryRow} from payers_agent_queries where phone = $1 and state = 'open'`, [phone])).rows[0];
+    if (current) {
+      const updated = (await db.query(`update payers_agent_queries set message_count = message_count + 1, updated_at = now()
+        where id = $1 returning ${queryRow}`, [current.id])).rows[0];
+      return { created: false, query: updated };
+    }
+    if (!create) return { created: false, query: null };
+    const row = (await db.query(`insert into payers_agent_queries (id, phone, excerpt) values ($1, $2, $3)
+      returning ${queryRow}`, [randomUUID(), phone, String(excerpt || '').slice(0, 200)])).rows[0];
+    return { created: true, query: row };
+  }
   return {
     label: 'PostgreSQL local',
     async settings() { return (await db.query('select data from payers_agent_settings where id = 1')).rows[0]?.data; },
     async saveSettings(data) { await db.query('insert into payers_agent_settings (id,data) values (1,$1) on conflict (id) do update set data = excluded.data, updated_at = now()', [JSON.stringify(data)]); },
+    async contact(phone) {
+      return (await db.query('select phone,opted_out,opted_out_at from payers_agent_contacts where phone = $1', [phone])).rows[0];
+    },
+    async setOptOut(phone, value) {
+      await db.query(`insert into payers_agent_contacts (phone, opted_out, opted_out_at) values ($1, $2, $3)
+        on conflict (phone) do update set opted_out = excluded.opted_out, opted_out_at = excluded.opted_out_at, updated_at = now()`,
+      [phone, Boolean(value), value ? new Date().toISOString() : null]);
+    },
+    async queries(limit = 200) {
+      return (await db.query(`select ${queryRow} from payers_agent_queries order by created_at desc limit $1`, [limit])).rows;
+    },
+    async noteQuery(phone, excerpt, create = false) { return noteQuery(phone, excerpt, create); },
+    async handleQuery(id) {
+      return Boolean((await db.query(`update payers_agent_queries set state = 'handled', handled_at = now(), updated_at = now()
+        where id = $1 and state = 'open' returning id`, [id])).rows.length);
+    },
     async enqueue(rows) {
       if (!rows.length) return;
       await db.query(`insert into payers_agent_jobs (id,kind,payload) select id,kind,payload

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Activity, Save, Settings2 } from 'lucide-react';
+import { Activity, MessageSquare, Save, Settings2 } from 'lucide-react';
 import { api } from './client.mjs';
 import { visitText } from '../shared/orders.mjs';
 
@@ -27,12 +27,26 @@ export function AgentSettings({ config, onSave }) {
   const [draft, setDraft] = useState(() => ({ ...config, rate: config.depositPerPerson / 100 }));
   const [status, setStatus] = useState(null);
   const [activityError, setActivityError] = useState('');
+  const [queries, setQueries] = useState([]);
+  const [queryError, setQueryError] = useState('');
+  const [queryBusy, setQueryBusy] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const change = (key, value) => setDraft(v => ({ ...v, [key]: value }));
   async function refresh() {
     try { setStatus(await api('agent/activity')); setActivityError(''); }
     catch (e) { setActivityError(e.message); }
+    await refreshQueries();
+  }
+  async function refreshQueries() {
+    try { setQueries(await api('agent/queries')); setQueryError(''); }
+    catch (e) { setQueryError(e.message); }
+  }
+  async function markHandled(id) {
+    setQueryBusy(id);
+    try { await api('agent/queries/' + id + '/handled', {}); await refreshQueries(); }
+    catch (e) { setQueryError(e.message); }
+    finally { setQueryBusy(''); }
   }
   useEffect(() => { refresh(); }, []);
   async function save(event) {
@@ -79,6 +93,26 @@ export function AgentSettings({ config, onSave }) {
             {status.map((row, index) => <tr key={index}><td>{visitText(row.queued_at)}</td>
               <td>{states[row.state]}</td><td>{row.error || '—'}</td></tr>)}
           </tbody></table></div>}
+      </div>
+    </section>
+    <section className="panel">
+      <div className="panel-head"><div><h2>Consultas sin reserva</h2>
+        <p>Números que escribieron al agente sin una reserva registrada. El personal las atiende desde aquí.</p></div>
+        <button className="button outline" onClick={refreshQueries}><MessageSquare size={16} /> Actualizar consultas</button></div>
+      <div className="config-footer">
+        {queryError && <p className="error" role="alert">{queryError}</p>}
+        {!queries.length && <p>No hay consultas sin reserva.</p>}
+        {queries.length > 0 && <div className="table-scroll"><table>
+          <thead><tr><th>Fecha</th><th>Teléfono</th><th>Mensajes</th><th>Texto</th><th>Estado</th><th /></tr></thead>
+          <tbody>{queries.map(row => <tr key={row.id}>
+            <td className="nowrap">{visitText(row.created_at)}</td>
+            <td className="nowrap">{row.phone}</td>
+            <td>{row.message_count}</td>
+            <td className="query-text">{row.excerpt || '—'}</td>
+            <td><span className={'badge ' + (row.state === 'open' ? 'arrived' : 'confirmed')}>{row.state === 'open' ? 'Abierta' : 'Atendida'}</span></td>
+            <td>{row.state === 'open' && <button className="button outline" disabled={queryBusy === row.id}
+              onClick={() => markHandled(row.id)}>{queryBusy === row.id ? 'Guardando…' : 'Marcar atendida'}</button>}</td>
+          </tr>)}</tbody></table></div>}
       </div>
     </section>
   </>;

@@ -6,8 +6,9 @@ import { agentAI } from './agent-ai.mjs';
 import { contactTime, defaults, validateSettings } from './agent-settings.mjs';
 import { balance, depositDue, money, terminal, stageLabels } from '../shared/orders.mjs';
 import { displayText, emojis, friendlyDate, parseAction, reservationFocus, reservationMenu, reservationPrompt,
-  paymentCta, paymentFollowUp, receiptCta, confirmationCta, requestMessage } from './interactive.mjs';
-import { Problem, requireThat, createOrder, addEvent, openIssue, applyPayment, arrive, recordCounterPayment, issueReceipt, reschedule, endReservation } from './domain.mjs';
+  paymentCta, paymentFollowUp, receiptCta, confirmationCta, requestMessage, noReservationMessage, reservationHelpMessage,
+  reservationRequest, parseReservation, reservationKey, reservationConfirmation, reservationRepeatedMessage, texts } from './interactive.mjs';
+import { Problem, requireThat, createOrder, addEvent, openIssue, applyPayment, arrive, recordCounterPayment, issueReceipt, reschedule, endReservation, digits } from './domain.mjs';
 
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const instant = () => new Date().toISOString();
@@ -39,6 +40,34 @@ export async function makeApi(env, options = {}) {
   const initialSettings = defaults(config);
   const settings = async () => ({ ...initialSettings, ...await store.settings() });
   const locks = new Map();
+  const rateEvents = new Map();
+  const rateWarned = new Map();
+  const noReservationReplied = new Map();
+  const seenMessages = new Set();
+  const optOutPhrases = new Set(['stop', 'baja', 'darme de baja', 'no quiero mensajes']);
+
+  function rateCheck(phone) {
+    const now = Date.now();
+    const recent = (rateEvents.get(phone) || []).filter(at => now - at < config.rateLimitWindowMs);
+    recent.push(now);
+    rateEvents.set(phone, recent);
+    if (recent.length <= config.rateLimitMax) return { allowed: true, warn: false };
+    // Un solo aviso por ventana; el resto se ignora sin llamar a OpenAI ni a Graph.
+    if (now - (rateWarned.get(phone) || 0) >= config.rateLimitWindowMs) {
+      rateWarned.set(phone, now);
+      return { allowed: false, warn: true };
+    }
+    return { allowed: false, warn: false };
+  }
+
+  function commandText(value) {
+    return String(value || '').normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase()
+      .replace(/[^\p{L}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  async function optedOut(phone) {
+    return Boolean((await store.contact(phone))?.opted_out);
+  }
   const sign = (value) => hmac(config.sessionSecret, value);
   const cookie = (value, age) => 'establo_session=' + value + '; Path=/; HttpOnly; SameSite=Strict; Max-Age=' + age + (config.publicUrl ? '; Secure' : '');
   function authenticated(req) {
@@ -87,10 +116,11 @@ export async function makeApi(env, options = {}) {
   }
   async function sessionOpen(phone) {
     return (await store.phone(phone)).some(order => order.chat.some(message =>
-      message.direction === 'in' && Date.now() - +new Date(message.at) < 24 * 3600000));
+      message.direction === 'in' && (!message.from || digits(message.from) === phone)
+      && Date.now() - +new Date(message.at) < 24 * 3600000));
   }
   async function send(order, text, params = {}) {
-    const id = await service.sendWhatsApp(order, text, { ...params, session: await sessionOpen(order.phone) });
+    const id = await service.sendWhatsApp(order, text, { ...params, reply: Boolean(params.reply), session: await sessionOpen(order.phone) });
     const shown = displayText(text);
     return (await update(order.id, data => {
       data.chat.push({ id, at: instant(), text: shown, direction: 'out', status: 'accepted' });
@@ -98,7 +128,101 @@ export async function makeApi(env, options = {}) {
     })).order;
   }
   async function sendReply(order, reply) {
-    for (const message of Array.isArray(reply) ? reply : [reply]) if (message) await send(order, message);
+    for (const message of Array.isArray(reply) ? reply : [reply]) if (message) await send(order, message, { reply: true });
+  }
+  async function registerReservation(phone, text, parsed, timestamp, messageId) {
+    const excerpt = String(text || '').slice(0, 200);
+    const refuse = async error => {
+      // El intento fallido no registra pedido, pero queda como consulta para el personal.
+      await store.noteQuery(phone, excerpt, true);
+      await service.sendWhatsAppReply(phone, error);
+    };
+    if (!parsed.ok) return refuse(parsed.error);
+
+    const value = parsed.value;
+    const payerPhone = value.phone || phone;
+    return lock('reservation:' + payerPhone, async () => {
+      const operator = payerPhone !== phone;
+      const rule = await settings();
+      const previous = await store.phone(payerPhone);
+      const key = reservationKey({ ...value, phone: payerPhone });
+      const now = Date.now();
+      const duplicate = previous.find(order => {
+        const age = now - +new Date(order.createdAt);
+        return !terminal(order) && age >= 0 && age <= 10 * 60000 && reservationKey(order) === key;
+      });
+      if (duplicate) {
+        await service.sendWhatsAppReply(phone, reservationRepeatedMessage(duplicate));
+        return;
+      }
+      const open = previous.filter(order => {
+        const age = now - +new Date(order.createdAt);
+        return !terminal(order) && age >= 0 && age <= 30 * 86400000;
+      });
+      if (open.length >= 3) return refuse(texts.reservationLimit);
+
+      let order;
+      try {
+        order = createOrder({
+          agreed: true, payer: value.name, phone: payerPhone, guests: value.guests, visitAt: value.visitAt,
+          items: value.items, notes: value.notes, consent: operator ? value.consent === true : true, synthetic: false,
+        }, { depositPerPerson: rule.depositPerPerson, deadlineMs: rule.deadlineMinutes * 60000 });
+      } catch (error) {
+        return refuse(error.message);
+      }
+      order.events = order.events.filter(event => event.title !== 'Pedido recibido de LEADS');
+      addEvent(order, 'Pedido recibido por WhatsApp', operator
+        ? 'Alta de operador mediante mensaje estructurado.' : 'Alta de cliente mediante mensaje estructurado.',
+      operator ? 'Operador' : 'Cliente');
+      addEvent(order, 'Origen: ' + (operator ? 'operador' : 'cliente'), '', operator ? 'Operador' : 'Cliente');
+      order.chat.push({ id: messageId, direction: 'in', from: phone, at: new Date(timestamp).toISOString(),
+        text: String(text || '').slice(0, 1000) });
+      await store.insert(order);
+
+      let intent = null;
+      try { intent = await checkout(order.id); }
+      catch (error) {
+        await update(order.id, data => openIssue(data, 'Enlace de anticipo pendiente', error.message));
+      }
+      const confirmation = reservationConfirmation(order, intent ? linkFor(intent) : '');
+      if (operator) {
+        // El alta de operador responde al remitente; el tercero no inicia la conversación.
+        try {
+          const id = await service.sendWhatsAppReply(phone, confirmation);
+          await update(order.id, data => {
+            data.chat.push({ id, at: instant(), text: displayText(confirmation), direction: 'out', status: 'accepted' });
+            addEvent(data, 'Mensaje aceptado por WhatsApp', id);
+          });
+        } catch (error) {
+          await update(order.id, data => openIssue(data, 'Respuesta de WhatsApp pendiente', error.message, messageId));
+        }
+        return;
+      }
+      try { await sendReply(order, confirmation); }
+      catch (error) { await update(order.id, data => openIssue(data, 'Respuesta de WhatsApp pendiente', error.message, messageId)); }
+    });
+  }
+  async function replyWithoutReservation(phone, text, action) {
+    const excerpt = String(text || '').slice(0, 200);
+    let staff = action?.action === 'staff';
+    // Los saludos y «ayuda» de un desconocido solo muestran el aviso, sin clasificar.
+    const greeting = new Set(['hola', 'ayuda', 'menu', 'menu principal', 'buenas', 'buenos dias', 'buenas tardes',
+      'buenas noches', 'inicio', 'hola que tal', 'hola buenas']).has(commandText(text));
+    // Solo texto libre sin acción ni saludo: se evita clasificar pedidos de reserva y botones ajenos.
+    if (!staff && !action && !greeting && !reservationRequest(text)) {
+      try { staff = (await ai.classify(text)).intent === 'human'; } catch { staff = false; }
+    }
+    if (staff) {
+      await store.noteQuery(phone, excerpt, true);
+      await service.sendWhatsAppReply(phone, texts.staff);
+      return;
+    }
+    await store.noteQuery(phone, excerpt, false);
+    // Anti-eco: el mensaje informativo se repite como máximo cada 12 horas.
+    const last = noReservationReplied.get(phone) || 0;
+    if (Date.now() - last < 12 * 3600000) return;
+    noReservationReplied.set(phone, Date.now());
+    await service.sendWhatsAppReply(phone, noReservationMessage());
   }
   function depositText(order, intent) {
     return emojis.payment + ' Hola, ' + order.payer + '. Para confirmar ' + order.ref + ' en Parrilladas El Establo, paga '
@@ -111,7 +235,8 @@ export async function makeApi(env, options = {}) {
     return changed;
   }
   async function notifyConfirmation(order) {
-    if (config.waMode !== 'cloud' || !order.consent || !config.allowedPhones.has(order.phone) || !(await settings()).automaticConfirmation) return;
+    if (config.waMode !== 'cloud' || !order.consent || !config.isPhoneAllowed(order.phone) || await optedOut(order.phone)
+      || !(await settings()).automaticConfirmation) return;
     const receipt = order.receipts.find(r => r.purpose === 'deposit');
     try {
       const text = emojis.verified + ' Anticipo verificado. Tu reserva *' + order.ref + '* está confirmada para el *'
@@ -222,17 +347,68 @@ export async function makeApi(env, options = {}) {
     return replyTo(order, phrase || '', undefined, forced);
   }
   async function incoming(message) {
-    const phone = message.from;
-    if (!config.allowedPhones.has(phone) || !message.id) return;
+    const phone = digits(message.from);
+    if (!message.id || config.isPhoneBlocked(phone) || !config.isPhoneAllowed(phone)) return;
     const timestamp = Number(message.timestamp) * 1000;
     if (!Number.isFinite(timestamp) || timestamp < Date.now() - 24 * 3600000 || timestamp > Date.now() + 60000) return;
-    const orders = (await store.phone(phone)).filter(o => o.consent);
-    if (!orders.length || orders.some(o => o.chat.some(m => m.id === message.id))) return;
+    if (seenMessages.has(message.id)) return;
+    seenMessages.add(message.id);
+    if (seenMessages.size > 5000) seenMessages.delete(seenMessages.values().next().value);
+
     const attachment = ['image', 'audio', 'document'].includes(message.type) ? message[message.type] : null;
     const reply = message.interactive?.button_reply || message.interactive?.list_reply;
     const action = parseAction(reply?.id);
     let text = String(message.text?.body || message.interactive?.button_reply?.title || message.interactive?.list_reply?.title
       || message.button?.text || attachment?.caption || '').slice(0, 1000);
+    if (!text && !attachment) return;
+
+    // Baja y alta se evalúan antes de clasificar la intención.
+    const command = commandText(text);
+    if (optOutPhrases.has(command)) {
+      await store.setOptOut(phone, true);
+      await service.sendWhatsAppReply(phone, texts.optOut);
+      return;
+    }
+    if (command === 'alta') {
+      await store.setOptOut(phone, false);
+      await service.sendWhatsAppReply(phone, texts.optIn);
+      return;
+    }
+
+    const rate = rateCheck(phone);
+    if (!rate.allowed) {
+      if (rate.warn) await service.sendWhatsAppReply(phone, texts.rate);
+      return;
+    }
+
+    // Alta por mensaje estructurado: solo cuando el modo lo permite y la palabra RESERVA abre el texto.
+    if (config.canReserve(phone)) {
+      const reservation = parseReservation(text);
+      if (reservation) {
+        await registerReservation(phone, text, reservation, timestamp, message.id);
+        return;
+      }
+    }
+
+    // Responder a quien escribe no exige consentimiento; solo los mensajes que
+    // inicia el restaurante exigen order.consent y un número no dado de baja.
+    const orders = await store.phone(phone);
+    const ref = text.match(/\bEST-[a-f0-9]{8}\b/i)?.[0]?.toUpperCase();
+    const ownsRef = !ref || orders.some(order => order.ref === ref);
+    if (!orders.length || !ownsRef) {
+      await replyWithoutReservation(phone, text, action);
+      return;
+    }
+
+    const staffFocus = action?.action === 'staff' ? (reservationFocus(orders) || orders[0]) : null;
+    const active = orders.filter(order => !terminal(order));
+    const candidates = staffFocus ? [staffFocus]
+      : ref ? orders.filter(order => order.ref === ref) : (active.length ? active : orders);
+    if (!candidates.length) {
+      await replyWithoutReservation(phone, text, action);
+      return;
+    }
+
     let proof, mediaError;
     if (attachment) {
       try {
@@ -243,11 +419,7 @@ export async function makeApi(env, options = {}) {
         if (proof) proof.messageId = message.id;
       } catch (error) { mediaError = error.message; }
     }
-    if (!text && !attachment) return;
-    const ref = text.match(/\bEST-[a-f0-9]{8}\b/i)?.[0]?.toUpperCase();
-    const active = orders.filter(o => !terminal(o));
-    const candidates = ref ? orders.filter(o => o.ref === ref) : (active.length ? active : orders);
-    if (!candidates.length) return;
+
     const { order, result: isNew } = await update(candidates[0].id, data => {
       if (data.chat.some(m => m.id === message.id)) return false;
       data.chat.push({ id: message.id, direction: 'in', at: new Date(timestamp).toISOString(),
@@ -256,7 +428,22 @@ export async function makeApi(env, options = {}) {
       return true;
     });
     if (!isNew) return;
-    const target = action?.ref ? orders.find(o => o.ref === action.ref) : null;
+
+    // El botón sin referencia solo existe para derivar al personal.
+    if (action?.action === 'staff') {
+      await update(order.id, data => openIssue(data, 'Ayuda del personal', text.slice(0, 500) || message.id));
+      await sendReply(order, requestMessage(order, 'human'));
+      return;
+    }
+
+    // El agente no ofrece ni gestiona reservas nuevas: deriva al personal con un texto fijo.
+    if (reservationRequest(text)) {
+      await update(order.id, data => openIssue(data, 'Ayuda del personal', text.slice(0, 500) || message.id));
+      await sendReply(order, reservationHelpMessage());
+      return;
+    }
+
+    const target = action?.ref ? orders.find(order => order.ref === action.ref) : null;
     let recipient = target || order;
     try {
       let response;
@@ -345,7 +532,8 @@ export async function makeApi(env, options = {}) {
         });
         if (created) escalated++;
       }
-      if (attempted >= 4 || config.waMode !== 'cloud' || !rule.reminders || !contactTime(rule, new Date(t)) || !order.consent || !config.allowedPhones.has(order.phone)) continue;
+      if (attempted >= 4 || config.waMode !== 'cloud' || !rule.reminders || !contactTime(rule, new Date(t)) || !order.consent
+        || !config.isPhoneAllowed(order.phone) || await optedOut(order.phone)) continue;
       const initialKey = 'initial:' + order.deadline;
       const needsDeposit = order.stage === 'awaiting_deposit' && depositDue(order) > 0 && t < +new Date(order.deadline);
       const latestLink = [...order.chat].reverse().find(m => m.direction === 'out' && m.text.includes('/pago/'));
@@ -440,7 +628,8 @@ export async function makeApi(env, options = {}) {
         for (const entry of body.entry || []) for (const change of entry.changes || []) {
           const value = change.value || {};
           if (String(value.metadata?.phone_number_id) !== config.env.WA_PHONE_NUMBER_ID) continue;
-          for (const message of value.messages || []) if (config.allowedPhones.has(message.from) && message.id) {
+          for (const message of value.messages || []) if (message.id && config.isPhoneAllowed(message.from)
+            && !config.isPhoneBlocked(message.from)) {
             queue.push({ id: 'message:' + message.id, kind: 'message', payload: message });
           }
           for (const status of value.statuses || []) if (status.id && ['sent', 'delivered', 'read', 'failed'].includes(status.status)) {
@@ -530,6 +719,13 @@ export async function makeApi(env, options = {}) {
       return json(res, 200, next);
     }
     if (path === '/api/agent/activity' && isGet) return json(res, 200, await store.agentStatus());
+    if (path === '/api/agent/queries' && isGet) return json(res, 200, await store.queries());
+    const handledQuery = path.match(/^\/api\/agent\/queries\/([a-f0-9-]+)\/handled$/);
+    if (handledQuery && isPost && uuid.test(handledQuery[1])) {
+      const handled = await store.handleQuery(handledQuery[1]);
+      requireThat(handled, 'La consulta ya fue atendida o no existe.', 409);
+      return json(res, 200, { handled: true });
+    }
     if (path === '/api/orders' && isGet) return json(res, 200, await store.list());
     if (path === '/api/orders' && isPost) {
       const rule = await settings();
@@ -547,6 +743,10 @@ export async function makeApi(env, options = {}) {
         requireThat(config.waMode === 'cloud', 'Activa WhatsApp Cloud API en la configuración.', 409);
         let order = (await store.get(id))?.data;
         requireThat(order, 'Reserva no encontrada.', 404);
+        // Un envío manual solo sale sin plantilla si la baja no está activa o hay sesión abierta.
+        if (await optedOut(order.phone) && !(await sessionOpen(order.phone))) {
+          throw new Problem('El cliente se dio de baja de los mensajes', 409);
+        }
         if (input.type === 'deposit') {
           const intent = await checkout(id, input.method);
           order = await send(order, depositText(order, intent), { template: 'deposit', intent });
@@ -628,7 +828,8 @@ export async function makeApi(env, options = {}) {
         throw new Problem('Acción no disponible.', 404);
       });
       if (kind === 'receipt' && result.result?.token === receiptToken && rule.automaticConfirmation
-        && config.waMode === 'cloud' && result.order.consent && config.allowedPhones.has(result.order.phone)) {
+        && config.waMode === 'cloud' && result.order.consent && config.isPhoneAllowed(result.order.phone)
+        && !(await optedOut(result.order.phone))) {
         try {
           await send(result.order, 'Verificamos tu llegada y el pago completo de ' + result.order.ref + '. Tu constancia de demostración: '
             + receiptLink(result.result), { template: 'settlement' });

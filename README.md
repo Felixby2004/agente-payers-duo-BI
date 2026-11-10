@@ -28,7 +28,7 @@ Copia `.env.example` a `.env`. Mantén las claves en el servidor. Para exponer l
 
 ### 1. PostgreSQL en Supabase
 
-1. Crea o selecciona un proyecto de Supabase y ejecuta [la migración de reservas](supabase/migrations/001_payers.sql) y [la migración del agente](supabase/migrations/002_payers_agent.sql) en ese orden en su editor SQL.
+1. Crea o selecciona un proyecto de Supabase y ejecuta [la migración de reservas](supabase/migrations/001_payers.sql), [la migración del agente](supabase/migrations/002_payers_agent.sql) y [la migración de contactos](supabase/migrations/003_contactos.sql) en ese orden en su editor SQL.
 2. Configura `SUPABASE_URL` y `SUPABASE_SECRET_KEY` con la URL y una clave de servidor. La tabla está en el esquema `public`, con RLS y permisos retirados para `anon` y `authenticated`. React accede por la API del servidor.
 3. El arranque con Supabase usa su registro remoto. Los pedidos de pruebas locales permanecen separados.
 
@@ -45,12 +45,35 @@ Copia `.env.example` a `.env`. Mantén las claves en el servidor. Para exponer l
 
 ### 3. WhatsApp Cloud API de Meta
 
-1. Configura `WHATSAPP_MODE=cloud` y completa las variables `WA_` obligatorias. Usa la versión de Graph API que indique tu aplicación de Meta, con el prefijo `v`. En `WA_ALLOWED_PHONES`, coloca los números autorizados para la demostración, separados por comas y con código de país. Si usas el número de prueba de Meta, agrega también esos destinatarios en su panel.
+1. Configura `WHATSAPP_MODE=cloud` y completa las variables `WA_` obligatorias. Usa la versión de Graph API que indique tu aplicación de Meta, con el prefijo `v`. `WA_ALLOWED_PHONES` es opcional: si se deja vacío, el agente atiende a cualquier número que le escriba; si se llena, solo atiende a esos números (coma-separados y con código de país). `WA_BLOCKED_PHONES` ignora por completo los números indicados. Los destinatarios del número de prueba de Meta se siguen agregando a mano en el panel de Meta; eso no se puede automatizar desde este código.
 2. En Meta, registra `https://TU-DOMINIO/api/webhooks/whatsapp` con el mismo `WA_VERIFY_TOKEN`, suscribe `messages` y vincula la aplicación a la cuenta de WhatsApp Business. El servidor verifica la firma con `WA_APP_SECRET`.
-3. Registra un caso con el número de prueba autorizado y su permiso de contacto. Desde WhatsApp, escribe **hola** para recibir el menú de la reserva o **anticipo EST-XXXXXXXX** como respaldo. El agente responde con botones (**Pagar anticipo**, **Ver saldo**, **Hablar con alguien**) y un `cta_url` con el enlace de pago; si Yape o Plin de demostración están activos, ofrece un segundo mensaje con esos medios. También entiende **saldo**, **reprogramar**, **comprobante** y los comandos de texto anteriores. **Ayuda** ahora muestra el menú; para abrir una incidencia de personal usa **Hablar con alguien** o “quiero hablar con alguien”.
+3. Escribe desde cualquier número. Si el teléfono tiene reservas, el agente mantiene el menú o la lista de la mejora de experiencia. Si no tiene ninguna, responde con el aviso de cobranza y el botón **Hablar con alguien**; ese botón crea una consulta visible en **Conexiones → Consultas sin reserva**. El agente no negocia ni ofrece disponibilidad: solo cobranza de reservas ya registradas y, si `WA_RESERVATION_MODE` está habilitado, alta de un pedido ya acordado mediante el mensaje estructurado `RESERVA` (ver abajo). Un pedido de reserva escrito en texto libre se deriva al personal y, si el número tiene una reserva, abre la incidencia **Ayuda del personal**. Los mensajes **stop**, **baja**, **darme de baja** y **no quiero mensajes** dan de baja al número; **alta** revierte la baja.
 4. Los mensajes interactivos solo se envían dentro de la ventana de 24 horas. Fuera de ella, configura plantillas aprobadas: la de anticipo usa nombre, referencia e importe en el cuerpo y un botón URL dinámico con base `https://TU-DOMINIO/pago/`; las de visita y confirmación usan nombre, referencia, fecha de visita y saldo en ese orden. La constancia puede solicitarse desde el chat y, con sesión abierta, se envía como `cta_url` **Ver constancia**. Para habilitar avisos automáticos, establece `ENABLE_REMINDERS=true`. Los mensajes fallidos aparecen como incidencias.
 
-Los botones y las filas usan identificadores `accion:REF` (`pay`, `yape`, `plin`, `bal`, `rcp`, `chg`, `hum`, `sel`) o `menu`. El servidor resuelve la referencia solo entre las reservas con consentimiento del teléfono y no ejecuta acciones sensibles desde un botón. Con dos o más reservas activas se envía una lista `sel:REF` agrupada por estado —**⏳ Por pagar anticipo**, **✅ Confirmadas**, **⚠️ Requieren atención** y **🧾 Finalizadas**—, con la visita futura más próxima primero y las pasadas al final. Las finalizadas solo se agregan si sobran filas; con una sola activa se muestra su menú directamente y, si solo hay finalizadas, se abre la más reciente. Los títulos usan la hora de Lima (`Hoy 20:16`, `Mañana 20:00`, `Vie 13 nov · 21:30`) y las descripciones combinan estado, personas en singular o plural y referencia. Se aplican los límites de WhatsApp (3 botones, 10 filas, títulos de 20/24 caracteres, descripciones de 72 y cuerpo de 1024); los emojis se usan con moderación (máximo uno por mensaje, sin comida en pagos o incidencias y sin emojis en botones). Si Meta rechaza un interactivo, se reintenta una vez como texto plano con la fecha y el estado de cada opción. El detalle está en [la guía de WhatsApp](WHATSAPP_INTEGRACION.md#botones-listas-y-cta).
+Los botones y las filas usan identificadores `accion:REF` (`pay`, `yape`, `plin`, `bal`, `rcp`, `chg`, `hum`, `sel`), `menu` o `staff` sin referencia. El servidor resuelve la referencia solo entre las reservas del teléfono y no ejecuta acciones sensibles desde un botón. Para responder a quien escribe no se exige consentimiento; el consentimiento solo se exige para los mensajes que inicia el restaurante. Con dos o más reservas activas se envía una lista `sel:REF` agrupada por estado —**⏳ Por pagar anticipo**, **✅ Confirmadas**, **⚠️ Requieren atención** y **🧾 Finalizadas**—, con la visita futura más próxima primero y las pasadas al final. Las finalizadas solo se agregan si sobran filas; con una sola activa se muestra su menú directamente y, si solo hay finalizadas, se abre la más reciente. Los títulos usan la hora de Lima (`Hoy 20:16`, `Mañana 20:00`, `Vie 13 nov · 21:30`) y las descripciones combinan estado, personas en singular o plural y referencia. Se aplican los límites de WhatsApp (3 botones, 10 filas, títulos de 20/24 caracteres, descripciones de 72 y cuerpo de 1024); los emojis se usan con moderación (máximo uno por mensaje, sin comida en pagos o incidencias y sin emojis en botones). Si Meta rechaza un interactivo, se reintenta una vez como texto plano con la fecha y el estado de cada opción. El detalle está en [la guía de WhatsApp](WHATSAPP_INTEGRACION.md#botones-listas-y-cta).
+
+#### Alta de reservas por mensaje estructurado
+
+`WA_RESERVATION_MODE` controla esta ruta: `off` (predeterminado) mantiene el comportamiento actual, `staff` solo autoriza a los números de `WA_RESERVATION_STAFF` y `open` permite a cualquier remitente. Un mensaje que empieza con `RESERVA` crea un pedido ya acordado; el precio siempre sale del catálogo, nunca del mensaje. Después del alta se genera el enlace de anticipo, se registra el origen y el pedido entra en el motor de alertas y constancias como cualquier otro.
+
+```text
+RESERVA
+Nombre: Ana Cárdenas
+Telefono: 51999999999
+Fecha: 2026-11-14
+Hora: 20:00
+Personas: 4
+Items: 2x Parrilla familiar, 1x Parrilla personal, 1x Jarra de chicha morada
+Notas: Cumpleaños de 40
+Consentimiento: si
+```
+
+- `Nombre`, `Fecha` (`AAAA-MM-DD`), `Hora` (`HH:MM` de Lima), `Personas` (1–40) e `Items` son obligatorios. La visita debe ser futura y con al menos 2 horas de anticipo.
+- `Items` usa el catálogo fijo de 12 productos y el formato `2x Producto`, con cantidades de 1 a 100 y hasta 30 líneas. No se aceptan importes por chat.
+- Si `Telefono` falta, el pagador es el remitente y el consentimiento es implícito. Si `Telefono` es de un tercero, es un alta de operador: el pedido se crea con `consent: true` solo si el mensaje trae `Consentimiento: si`; la respuesta con el enlace vuelve al operador, no inicia una conversación con el tercero.
+- Un reenvío con el mismo teléfono, fecha, personas y productos dentro de 10 minutos responde la reserva existente en lugar de duplicarla. Cada número admite hasta 3 pedidos abiertos en 30 días.
+- Si el mensaje está incompleto o tiene un dato inválido no se registra nada: el bot responde el error exacto y deja una consulta abierta en **Conexiones → Consultas sin reserva**.
+- El botón **Copiar plantilla de reserva** del formulario de registro deja el mensaje listo para pegar desde el celular.
 
 [WhatsApp Cloud API de Meta](https://www.postman.com/meta/whatsapp-business-platform/documentation/wlk6lh4/whatsapp-cloud-api) · [Política de mensajería](https://whatsappbusiness.com/policy/)
 
@@ -65,6 +88,10 @@ npm start
 La aplicación sirve la interfaz y los webhooks en el mismo origen. Mantén un proceso Node activo para recibir notificaciones y ejecutar los recordatorios. Selecciona `PORT` si el alojamiento lo requiere. La demostración utiliza un único acceso de operador y un catálogo editable al registrar el pedido. Recepción y caja validan el cupo y los cambios autorizados.
 
 ## Alcance del agente
+
+El agente solo gestiona cobranza: anticipos, seguimiento de pagos y saldo de reservas ya registradas por el personal. No negocia, sugiere ni ofrece disponibilidad. Si un mensaje pide reservar en texto libre, responde con un texto fijo y deriva al personal; no pregunta fecha, personas ni disponibilidad. La única puerta de alta es el mensaje estructurado `RESERVA` descrito arriba, y solo cuando `WA_RESERVATION_MODE` no es `off`.
+
+El modo abierto es el predeterminado: `WA_ALLOWED_PHONES` vacío atiende a cualquier número. Si se llena, funciona como restricción opcional para demos controladas. `WA_BLOCKED_PHONES` ignora números por completo. Cada número puede enviar como máximo 20 mensajes cada 10 minutos (`WA_RATE_LIMIT_MAX` y `WA_RATE_LIMIT_WINDOW_MS`); al superar el límite se ignora el mensaje y se envía un solo aviso por ventana. A un número sin reservas se le responde como máximo una vez cada 12 horas, salvo que pulse **Hablar con alguien** o pida hablar con una persona. Las bajas y las consultas sin reserva se guardan en Supabase (migración `003_contactos.sql`) o en el PostgreSQL local; las consultas se ven en **Conexiones → Consultas sin reserva** y se pueden marcar como atendidas. Con el número de prueba de Meta, los destinatarios se siguen agregando a mano en el panel de Meta.
 
 El agente usa OpenAI para clasificar mensajes y procesar imágenes y audios cuando se configura la clave. Cuenta con un clasificador local para texto como alternativa. Las respuestas se adaptan con el estado confirmado de la reserva. Los importes, los cierres y las devoluciones pasan por reglas de negocio. El historial conserva el origen de las confirmaciones.
 

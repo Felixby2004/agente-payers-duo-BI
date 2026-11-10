@@ -126,6 +126,7 @@ tr:last-child td { padding-bottom: 12px; }
 .table-link small { display: block; margin-top: 3px; color: var(--muted); font-weight: 450; white-space: nowrap; }
 .amount { font-variant-numeric: tabular-nums; font-weight: 700; }
 .nowrap { white-space: nowrap; }
+.query-text { max-width: 360px; white-space: pre-wrap; }
 .badge { display: inline-flex; align-items: center; gap: 6px; border-radius: 20px; padding: 4px 8px; font-size: 11px;
   white-space: nowrap; font-weight: 680; background: #f3e9dd; color: #82572e; }
 .badge i { width: 6px; height: 6px; background: currentColor; border-radius: 50%; }

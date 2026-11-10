@@ -1,6 +1,6 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { requestJson } from './config.mjs';
-import { requireThat } from './domain.mjs';
+import { digits, requireThat } from './domain.mjs';
 import { clip, limits } from './interactive.mjs';
 import { money, balance, visitText } from '../shared/orders.mjs';
 
@@ -55,6 +55,23 @@ export function providers(config) {
     const isTest = seller.tags?.includes('test_user') || seller.user_type === 'test_user';
     requireThat(isTest && String(seller.id) === e.MP_TEST_SELLER_ID, 'La credencial no corresponde a la cuenta vendedora de prueba configurada.', 502);
     sellerVerified = true;
+  }
+  // Un solo POST a Graph para textos, interactivos y plantillas.
+  async function submit(phone, body) {
+    const result = await requestJson('https://graph.facebook.com/' + e.WA_GRAPH_VERSION + '/' + e.WA_PHONE_NUMBER_ID + '/messages',
+      post({ messaging_product: 'whatsapp', recipient_type: 'individual', to: phone, ...body }, e.WA_ACCESS_TOKEN, 'WhatsApp'));
+    requireThat(result.messages?.[0]?.id, 'WhatsApp no devolvió una referencia del mensaje.', 502);
+    return result.messages[0].id;
+  }
+  // Dentro de la ventana de 24 h: texto libre o interactivo con reintento como texto.
+  async function deliver(phone, text) {
+    if (typeof text === 'string') return submit(phone, textBody(text));
+    try { return await submit(phone, interactiveBody(text)); }
+    catch (error) {
+      const fallback = text?.fallback || text?.body;
+      if (!fallback) throw error;
+      return submit(phone, textBody(fallback));
+    }
   }
   return {
     async downloadMedia(id, limit) {
@@ -117,26 +134,15 @@ export function providers(config) {
       const expected = hmac(e.MP_WEBHOOK_SECRET, 'id:' + id + ';request-id:' + requestId + ';ts:' + fields.ts + ';');
       return matches(expected, fields.v1) ? id : null;
     },
-    async sendWhatsApp(order, text, { template, intent, session: open } = {}) {
+    async sendWhatsApp(order, text, { template, intent, session: open, reply = false } = {}) {
       requireThat(config.waMode === 'cloud', 'Conecta WhatsApp Cloud API para enviar mensajes.', 409);
-      requireThat(order.consent && config.allowedPhones.has(order.phone), 'El pagador debe autorizar el contacto y su número debe estar habilitado para la demostración.', 409);
+      // Responder a quien escribe no exige consentimiento; iniciar un mensaje sí.
+      requireThat((reply || order.consent) && config.isPhoneAllowed(order.phone) && !config.isPhoneBlocked(order.phone),
+        'El pagador debe autorizar el contacto y su número debe estar habilitado para la demostración.', 409);
       const session = typeof open === 'boolean' ? open
-        : order.chat.some(m => m.direction === 'in' && Date.now() - +new Date(m.at) < 24 * 3600000);
-      const submit = async (body) => {
-        const result = await requestJson('https://graph.facebook.com/' + e.WA_GRAPH_VERSION + '/' + e.WA_PHONE_NUMBER_ID + '/messages',
-          post({ messaging_product: 'whatsapp', recipient_type: 'individual', to: order.phone, ...body }, e.WA_ACCESS_TOKEN, 'WhatsApp'));
-        requireThat(result.messages?.[0]?.id, 'WhatsApp no devolvió una referencia del mensaje.', 502);
-        return result.messages[0].id;
-      };
-      if (session) {
-        if (typeof text === 'string') return submit(textBody(text));
-        try { return await submit(interactiveBody(text)); }
-        catch (error) {
-          const fallback = text?.fallback || text?.body;
-          if (!fallback) throw error;
-          return submit(textBody(fallback));
-        }
-      }
+        : order.chat.some(m => m.direction === 'in' && (!m.from || digits(m.from) === digits(order.phone))
+          && Date.now() - +new Date(m.at) < 24 * 3600000);
+      if (session) return deliver(order.phone, text);
       const name = { deposit: e.WA_TEMPLATE_DEPOSIT, visit: e.WA_TEMPLATE_VISIT, confirmation: e.WA_TEMPLATE_CONFIRMATION,
         settlement: e.WA_TEMPLATE_SETTLEMENT }[template];
       requireThat(name, 'Pide al pagador que escriba al número de WhatsApp o configura una plantilla aprobada.', 409);
@@ -147,7 +153,14 @@ export function providers(config) {
       if (template === 'deposit') components.push({ type: 'button', sub_type: 'url', index: '0', parameters: [{ type: 'text', text: intent.id }] });
       if (template === 'settlement') components.push({ type: 'button', sub_type: 'url', index: '0',
         parameters: [{ type: 'text', text: order.receipts.find(r => r.purpose === 'settlement').token }] });
-      return submit({ type: 'template', template: { name, language: { code: e.WA_TEMPLATE_LANGUAGE || 'es_PE' }, components } });
+      return submit(order.phone, { type: 'template', template: { name, language: { code: e.WA_TEMPLATE_LANGUAGE || 'es_PE' }, components } });
+    },
+    // Solo para responder a un mensaje entrante reciente. Nunca inicia una conversación.
+    async sendWhatsAppReply(phone, text) {
+      requireThat(config.waMode === 'cloud', 'Conecta WhatsApp Cloud API para enviar mensajes.', 409);
+      requireThat(config.isPhoneAllowed(phone) && !config.isPhoneBlocked(phone),
+        'El número no está habilitado para la demostración.', 409);
+      return deliver(phone, text);
     },
   };
 }

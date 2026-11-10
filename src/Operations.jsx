@@ -8,6 +8,24 @@ import { Badge, Empty, OrdersTable } from './Dashboard.jsx';
 const blank = () => ({ payer: '', phone: '', guests: 1, visit: localDateInput(), notes: '', items: [], consent: false, agreed: false, synthetic: false });
 const buttonLink = (href) => new URL(href, location.origin).href;
 const normalize = (v) => v.toLowerCase().normalize('NFD').replace(/\p{Diacritic}/gu, '');
+const reservationTemplate = (form) => {
+  const [date = '', time = ''] = String(form.visit || '').split('T');
+  const phone = String(form.phone || '').replace(/\D/g, '');
+  const items = form.items.length
+    ? form.items.map(item => (Number(item.quantity) || 1) + 'x ' + (item.name || 'Producto')).join(', ')
+    : '1x Parrilla familiar';
+  return [
+    'RESERVA',
+    'Nombre: ' + (form.payer || 'Nombre y apellidos'),
+    phone ? 'Telefono: ' + phone : null,
+    'Fecha: ' + (date || 'AAAA-MM-DD'),
+    'Hora: ' + ((time || '20:00').slice(0, 5)),
+    'Personas: ' + (form.guests || 1),
+    'Items: ' + items,
+    form.notes ? 'Notas: ' + form.notes : null,
+    'Consentimiento: ' + (form.consent ? 'si' : 'no'),
+  ].filter(Boolean).join('\n');
+};
 
 export function Register({ config, created, notify }) {
   const [form, setForm] = useState(blank);
@@ -39,6 +57,13 @@ export function Register({ config, created, notify }) {
       created(order);
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
+  }
+  async function copyTemplate() {
+    setError('');
+    try {
+      await navigator.clipboard.writeText(reservationTemplate(form));
+      notify('Plantilla de reserva copiada.');
+    } catch { setError('No se pudo copiar la plantilla. Revisa los permisos del navegador.'); }
   }
   return <>
     <div className="page-head"><div><span className="eyebrow">ENTRADA DESDE LEADS</span><h1>Registrar pedido</h1><p>Entrega a cobranza un pedido acordado para atención en el local.</p></div>
@@ -89,6 +114,7 @@ export function Register({ config, created, notify }) {
         {form.synthetic && <p className="inline-note">Caso ficticio. Agrega tu propio número autorizado para la prueba por WhatsApp.</p>}
         <label className="check"><input type="checkbox" checked={form.agreed} onChange={e => set('agreed', e.target.checked)} /> El pedido, el total y la visita ya fueron acordados.</label>
         {error && <p className="error" role="alert">{error}</p>}
+        <button type="button" className="button outline full" onClick={copyTemplate}><Copy size={16} /> Copiar plantilla de reserva</button>
         <button type="submit" className="button primary full" disabled={busy}>{busy ? 'Registrando…' : 'Registrar en PAYERS'} <ArrowRight size={17} /></button>
       </section>
     </form>
