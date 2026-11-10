@@ -24,7 +24,7 @@ El panel, la API y n8n comparten las reservas a través del servidor PAYERS. En 
 3. Crea una credencial **Header Auth** con nombre **PAYERS Token interno**. El nombre del encabezado es `Authorization` y su valor es `Bearer <N8N_AGENT_TOKEN>`.
 4. Selecciona esa credencial en **Procesar mensajes y adjuntos**, **Evaluar alertas configuradas** y **Despertar por WhatsApp**.
 5. Ejecuta **Ejecutar prueba manual** y comprueba los conteos. Los nodos pueden devolver cero cuando no hay reservas o mensajes pendientes. Publica o activa el workflow para que el horario se ejecute cada minuto.
-6. Para reducir la espera de una respuesta, copia la **Production URL** de **Despertar por WhatsApp** a `N8N_WAKE_URL` y reinicia el servidor. La revisión por minuto queda activa si esa llamada falla. La URL que se configura en Meta sigue siendo la de la API del restaurante.
+6. Las respuestas a WhatsApp se procesan directamente en el servidor cuando Meta entrega cada mensaje; `N8N_WAKE_URL` no interviene en esa respuesta. Activa el workflow para conservar las alertas programadas y la revisión de respaldo de la cola, que corre cada minuto. La URL que se configura en Meta sigue siendo la de la API del restaurante.
 
 [Importar workflows en n8n](https://docs.n8n.io/workflows/export-import/) · [Programar ejecuciones](https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.scheduletrigger/)
 

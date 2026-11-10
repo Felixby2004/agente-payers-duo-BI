@@ -116,7 +116,6 @@ test('El agente usa botones, listas y CTA con ids seguros y fallback de texto', 
     let out = await answer({ from: '51999999999', type: 'text', text: { body: 'hola' } });
     assert.equal(out.length, 1);
     assert.equal(out[0].interactive.type, 'button');
-    assert.match(bodyOf(out[0]), /Ana Demo/);
     assert.match(bodyOf(out[0]), new RegExp(order.ref));
     assert.match(bodyOf(out[0]), /S\/\s*40/);
     assert.deepEqual(idsOf(out[0]), ['pay:' + order.ref, 'bal:' + order.ref, 'hum:' + order.ref]);
@@ -124,25 +123,23 @@ test('El agente usa botones, listas y CTA con ids seguros y fallback de texto', 
     let stored = await findOrder(order.id);
     assert.ok(stored.chat.some(message => message.direction === 'out' && /\[Botones:/.test(message.text)));
 
-    // Pagar anticipo: CTA con enlace y, después, atajos Yape/Plin.
+    // Pagar anticipo: un solo CTA, sin un segundo mensaje de opciones.
     out = await answer({ from: '51999999999', type: 'interactive', interactive: { type: 'button_reply',
       button_reply: { id: 'pay:' + order.ref, title: 'Pagar anticipo' } } });
-    assert.equal(out.length, 2);
+    assert.equal(out.length, 1);
     assert.equal(out[0].interactive.type, 'cta_url');
     assert.match(out[0].interactive.action.parameters.url, /^https:\/\/establo\.example\/pago\//);
-    assert.equal(out[1].interactive.type, 'button');
-    assert.deepEqual(idsOf(out[1]), ['yape:' + order.ref, 'plin:' + order.ref, 'hum:' + order.ref]);
+    assert.match(bodyOf(out[0]), /Yape.*Plin/);
     stored = await findOrder(order.id);
     assert.equal(stored.incidents.length, 0);
     assert.equal(stored.payments.length, 0);
     assert.ok(stored.intents.length >= 1);
 
-    // Yape simulado: un solo CTA del medio elegido.
-    out = await answer({ from: '51999999999', type: 'interactive', interactive: { type: 'button_reply',
-      button_reply: { id: 'yape:' + order.ref, title: 'Pagar con Yape' } } });
+    // Yape sigue disponible si la persona lo escribe.
+    out = await answer({ from: '51999999999', type: 'text', text: { body: 'Yape' } });
     assert.equal(out.length, 1);
     assert.equal(out[0].interactive.type, 'cta_url');
-    assert.match(bodyOf(out[0]), /Tu anticipo/);
+    assert.match(bodyOf(out[0]), /Anticipo listo/);
     assert.match(out[0].interactive.action.parameters.display_text, /Yape/);
     assert.match(out[0].interactive.action.parameters.url, /^https:\/\/establo\.example\/pago\//);
 
@@ -179,20 +176,20 @@ test('El agente usa botones, listas y CTA con ids seguros y fallback de texto', 
     out = await answer({ from: '51999999999', type: 'text', text: { body: 'hola' } });
     assert.equal(out.length, 1);
     assert.equal(out[0].interactive.type, 'list');
-    assert.equal(out[0].interactive.action.sections[0].title, emojis.deposit + ' Por pagar anticipo');
+    assert.equal(out[0].interactive.action.sections[0].title, 'Por pagar anticipo');
     assert.equal(out[0].interactive.action.button, 'Ver opciones');
-    assert.match(bodyOf(out[0]), /Tienes 2 reservas activas\. Elige la que quieres revisar\./);
+    assert.match(bodyOf(out[0]), /Tienes 2 reservas activas\. Elige una para ver sus detalles y opciones\./);
     const rowIds = out[0].interactive.action.sections.flatMap(section => section.rows).map(row => row.id);
     assert.ok(rowIds.includes('sel:' + order.ref));
     assert.ok(rowIds.includes('sel:' + second.ref));
     const descriptions = out[0].interactive.action.sections.flatMap(section => section.rows).map(row => row.description);
-    assert.ok(descriptions.some(text => /^Falta anticipo S\/ 40\.00 · 2 personas · EST-/.test(text)));
-    assert.ok(descriptions.some(text => /^Falta anticipo S\/ 60\.00 · 3 personas · EST-/.test(text)));
+    assert.ok(descriptions.some(text => /^Falta anticipo S\/\s*40\.00 · 2 personas · EST-/.test(text)));
+    assert.ok(descriptions.some(text => /^Falta anticipo S\/\s*60\.00 · 3 personas · EST-/.test(text)));
     out = await answer({ from: '51999999999', type: 'interactive', interactive: { type: 'list_reply',
       list_reply: { id: 'sel:' + second.ref, title: 'Elegida' } } });
     assert.equal(out.length, 1);
     assert.equal(out[0].interactive.type, 'button');
-    assert.match(bodyOf(out[0]), /Luis Demo/);
+    assert.match(bodyOf(out[0]), new RegExp(second.ref));
     assert.deepEqual(idsOf(out[0]), ['pay:' + second.ref, 'bal:' + second.ref, 'hum:' + second.ref]);
     const selected = await findOrder(second.id);
     assert.ok(selected.chat.some(message => message.direction === 'out' && message.id));
@@ -230,7 +227,7 @@ test('El agente usa botones, listas y CTA con ids seguros y fallback de texto', 
     assert.equal(out.length, 2);
     assert.equal(out[0].type, 'interactive');
     assert.equal(out.at(-1).type, 'text');
-    assert.match(bodyOf(out.at(-1)), /Hola/);
+    assert.match(bodyOf(out.at(-1)), /Pagar anticipo/);
     assert.match(bodyOf(out.at(-1)), /Pagar anticipo/);
     failInteractive = false;
 
@@ -308,10 +305,7 @@ test('La lista agrupa por estado, ordena visitas y usa plural y fechas legibles'
   const list = reservationList([depositLater, depositSoon, depositPast, confirmed, attention, finished], fixedNow);
 
   assert.deepEqual(list.list.sections.map(section => section.title), [
-    emojis.deposit + ' Por pagar anticipo',
-    emojis.confirmed + ' Confirmadas',
-    emojis.attention + ' Requieren atención',
-    emojis.finished + ' Finalizadas',
+    'Por pagar anticipo', 'Confirmadas', 'Requieren atención', 'Finalizadas',
   ]);
   const depositRows = list.list.sections[0].rows;
   assert.deepEqual(depositRows.map(row => row.id), [
@@ -320,13 +314,13 @@ test('La lista agrupa por estado, ordena visitas y usa plural y fechas legibles'
   assert.equal(depositRows[0].title, 'Hoy 21:00');
   assert.equal(depositRows[1].title, 'Hoy 22:00');
   assert.equal(depositRows[2].title, 'Mar 10 nov · 19:00');
-  assert.match(depositRows[0].description, /^Falta anticipo S\/ 80\.00 · 2 personas · EST-AAAAAAA2$/);
-  assert.match(depositRows[1].description, /^Falta anticipo S\/ 40\.00 · 1 persona · EST-AAAAAAA1$/);
-  assert.match(list.list.sections[1].rows[0].description, /^Confirmada · saldo S\/ 69\.00 · 2 personas · EST-AAAAAAA4$/);
+  assert.match(depositRows[0].description, /^Falta anticipo S\/\s*80\.00 · 2 personas · EST-AAAAAAA2$/);
+  assert.match(depositRows[1].description, /^Falta anticipo S\/\s*40\.00 · 1 persona · EST-AAAAAAA1$/);
+  assert.match(list.list.sections[1].rows[0].description, /^Confirmada · saldo S\/\s*69\.00 · 2 personas · EST-AAAAAAA4$/);
   assert.match(list.list.sections[2].rows[0].description, /^Anticipo vencido · 2 personas · EST-AAAAAAA5$/);
   assert.match(list.list.sections[3].rows[0].description, /^Finalizada · 2 personas · EST-AAAAAAA6$/);
-  assert.match(list.body, /^Tienes 5 reservas activas\. Elige la que quieres revisar\.$/);
-  assert.match(list.fallback, /Falta anticipo S\/ 80\.00/);
+  assert.match(list.body, /^📋 Tienes 5 reservas activas\. Elige una para ver sus detalles y opciones\.$/);
+  assert.match(list.fallback, /Falta anticipo S\/\s*80\.00/);
   assert.match(list.fallback, /Hoy 21:00/);
   assert.match(list.fallback, /Anticipo vencido/);
 });
@@ -341,11 +335,11 @@ test('Una sola activa va al menú, varias usan lista y sin activas se elige la f
   const single = reservationPrompt([active, olderFinished, recentFinished], fixedNow);
   assert.equal(single.kind, 'buttons');
   assert.match(single.body, new RegExp(active.ref));
-  assert.match(single.body, /^🔥/);
+  assert.match(single.body, /^💳/);
   assert.equal(reservationPrompt([active, secondActive], fixedNow).kind, 'list');
   const finishedOnly = reservationPrompt([olderFinished, recentFinished], fixedNow);
   assert.equal(finishedOnly.kind, 'buttons');
-  assert.match(finishedOnly.body, /^🍖/);
+  assert.match(finishedOnly.body, /^👋/);
   assert.equal(finishedOnly.buttons[0].id, 'rcp:' + recentFinished.ref);
   assert.equal(reservationFocus([olderFinished, recentFinished], fixedNow), recentFinished);
   assert.equal(reservationFocus([active, secondActive], fixedNow), null);
@@ -392,10 +386,10 @@ test('Cada situación usa un emoji funcional o temático, sin comida en pagos ni
     messageBody(reservationMenu(confirmed, fixedNow)),
     messageBody(reservationMenu(terminal, fixedNow)),
   ];
-  assert.match(menuBodies[0], /^🔥/);
+  assert.match(menuBodies[0], /^💳/);
   assert.match(menuBodies[1], /^⚠️/);
-  assert.match(menuBodies[2], /^🥩/);
-  assert.match(menuBodies[3], /^🍖/);
+  assert.match(menuBodies[2], /^📅/);
+  assert.match(menuBodies[3], /^👋/);
   menuBodies.forEach(body => assert.ok(oneEmojiAtMost(body)));
   assert.match(messageBody(paymentCta(valid, { amount: 4000 }, 'checkout', 'https://establo.example/pago/1')), /^💳/);
   assert.match(messageBody(receiptCta(valid, 'https://establo.example/comprobante/1')), /^🧾/);

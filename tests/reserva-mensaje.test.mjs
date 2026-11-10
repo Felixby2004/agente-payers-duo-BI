@@ -211,13 +211,14 @@ test('RESERVA crea una reserva PAYERS con catálogo, anticipo, CTA y chat trazab
     assert.ok(order.events.some(event => event.title === 'Origen: cliente'));
     assert.equal(order.events.some(event => event.title === 'Pedido recibido de LEADS'), false);
     assert.equal(order.synthetic, false);
-    assert.equal(order.chat.some(item => item.direction === 'out' && item.text.includes('[Enlace: Pagar S/ 80.00')), true);
+    assert.equal(order.chat.some(item => item.direction === 'out' && item.text.includes('[Botón: Pagar anticipo]')), true);
     assert.equal(r.sent.length, 1);
     assert.equal(r.sent[0].to, '51911111111');
     assert.equal(r.sent[0].type, 'interactive');
     assert.equal(r.sent[0].interactive.type, 'cta_url');
-    assert.equal(r.sent[0].interactive.action.parameters.display_text, 'Pagar S/ 80.00');
-    assert.match(r.sent[0].interactive.body.text, /Total S\/ 316\.00 · Anticipo S\/ 80\.00/);
+    assert.equal(r.sent[0].interactive.action.parameters.display_text, 'Pagar anticipo');
+    assert.match(r.sent[0].interactive.body.text, /Total: S\/\s*316\.00/);
+    assert.match(r.sent[0].interactive.body.text, /Anticipo: \*S\/\s*80\.00\*/);
     assert.match(r.sent[0].interactive.action.parameters.url, /^https:\/\/establo\.example\/pago\//);
 
     const detail = (await r.orders()).find(item => item.id === order.id);

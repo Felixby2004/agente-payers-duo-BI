@@ -5,14 +5,20 @@ import { providers, hmac, matches } from './providers.mjs';
 import { agentAI } from './agent-ai.mjs';
 import { contactTime, defaults, validateSettings } from './agent-settings.mjs';
 import { balance, depositDue, money, terminal, stageLabels } from '../shared/orders.mjs';
-import { displayText, emojis, friendlyDate, parseAction, reservationFocus, reservationMenu, reservationPrompt,
-  paymentCta, paymentFollowUp, receiptCta, confirmationCta, requestMessage, noReservationMessage, reservationHelpMessage,
+import { displayText, emojis, friendlyDate, parseAction, reservationFocus, reservationMenu, reservationPrompt, reservationList,
+  paymentCta, paymentRejectedCta, receiptCta, confirmationCta, requestMessage, noReservationMessage, reservationHelpMessage,
   reservationRequest, parseReservation, reservationKey, reservationConfirmation, reservationRepeatedMessage, texts } from './interactive.mjs';
 import { Problem, requireThat, createOrder, addEvent, openIssue, applyPayment, arrive, recordCounterPayment, issueReceipt, reschedule, endReservation, digits } from './domain.mjs';
 
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const instant = () => new Date().toISOString();
 const hash = (text) => createHash('sha256').update(String(text)).digest('hex');
+function isMercadoPagoInitPoint(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && /^(www\.)?mercadopago\.com(\.[a-z]{2})?$/.test(url.hostname);
+  } catch { return false; }
+}
 function json(res, status, data) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
   res.end(JSON.stringify(data));
@@ -43,6 +49,7 @@ export async function makeApi(env, options = {}) {
   const rateEvents = new Map();
   const rateWarned = new Map();
   const noReservationReplied = new Map();
+  const reservationListRepliedAt = new Map();
   const seenMessages = new Set();
   const optOutPhrases = new Set(['stop', 'baja', 'darme de baja', 'no quiero mensajes']);
 
@@ -64,6 +71,8 @@ export async function makeApi(env, options = {}) {
     return String(value || '').normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase()
       .replace(/[^\p{L}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
   }
+  const greetings = new Set(['hola', 'buenas', 'buenos dias', 'buenas tardes', 'buenas noches', 'hola que tal', 'hola buenas']);
+  const isGreeting = value => greetings.has(commandText(value));
 
   async function optedOut(phone) {
     return Boolean((await store.contact(phone))?.opted_out);
@@ -97,7 +106,8 @@ export async function makeApi(env, options = {}) {
         requireThat(data.stage === 'awaiting_deposit' && depositDue(data) > 0, 'La reserva no tiene anticipo pendiente.', 409);
         requireThat(new Date(data.deadline) > new Date(), 'El plazo del anticipo venció. Revisa la reserva.', 409);
         const reusable = data.intents.find(i => i.mode === mode && (i.method || 'checkout') === method && i.amount === depositDue(data)
-          && i.status === 'pending' && i.expiresAt === data.deadline);
+          && i.status === 'pending' && i.expiresAt === data.deadline
+          && (mode !== 'mercado_pago' || isMercadoPagoInitPoint(i.checkoutUrl)));
         if (reusable) return reusable;
         const row = { id: intentId, amount: depositDue(data), expiresAt: data.deadline, status: 'pending', mode, method };
         data.intents.push(row);
@@ -123,7 +133,8 @@ export async function makeApi(env, options = {}) {
     const id = await service.sendWhatsApp(order, text, { ...params, reply: Boolean(params.reply), session: await sessionOpen(order.phone) });
     const shown = displayText(text);
     return (await update(order.id, data => {
-      data.chat.push({ id, at: instant(), text: shown, direction: 'out', status: 'accepted' });
+      data.chat.push({ id, at: instant(), text: shown, direction: 'out', status: 'accepted',
+        ...(text?.kind === 'cta' && String(text.cta?.url || '').includes('/pago/') ? { paymentLink: true } : {}) });
       addEvent(data, 'Mensaje aceptado por WhatsApp', id);
     })).order;
   }
@@ -206,8 +217,7 @@ export async function makeApi(env, options = {}) {
     const excerpt = String(text || '').slice(0, 200);
     let staff = action?.action === 'staff';
     // Los saludos y «ayuda» de un desconocido solo muestran el aviso, sin clasificar.
-    const greeting = new Set(['hola', 'ayuda', 'menu', 'menu principal', 'buenas', 'buenos dias', 'buenas tardes',
-      'buenas noches', 'inicio', 'hola que tal', 'hola buenas']).has(commandText(text));
+    const greeting = isGreeting(text) || new Set(['ayuda', 'menu', 'menu principal', 'inicio']).has(commandText(text));
     // Solo texto libre sin acción ni saludo: se evita clasificar pedidos de reserva y botones ajenos.
     if (!staff && !action && !greeting && !reservationRequest(text)) {
       try { staff = (await ai.classify(text)).intent === 'human'; } catch { staff = false; }
@@ -224,11 +234,6 @@ export async function makeApi(env, options = {}) {
     noReservationReplied.set(phone, Date.now());
     await service.sendWhatsAppReply(phone, noReservationMessage());
   }
-  function depositText(order, intent) {
-    return emojis.payment + ' Hola, ' + order.payer + '. Para confirmar ' + order.ref + ' en Parrilladas El Establo, paga '
-      + money(intent.amount) + ' de anticipo en este enlace de demostración: ' + linkFor(intent) + '. Visita: '
-      + friendlyDate(order.visitAt, new Date(), true) + '.';
-  }
   function finishDeposit(data, payment, token) {
     const changed = applyPayment(data, payment);
     if (changed && data.stage === 'confirmed' && !data.receipts.some(r => r.purpose === 'deposit')) issueReceipt(data, 'deposit', token);
@@ -244,13 +249,42 @@ export async function makeApi(env, options = {}) {
       await send(order, receipt ? confirmationCta(order, receiptLink(receipt)) : text, { template: 'confirmation' });
     } catch (error) { await update(order.id, data => openIssue(data, 'Confirmación de WhatsApp pendiente', error.message)); }
   }
+  async function notifyRejectedPayment(order, rejectedIntent) {
+    if (config.waMode !== 'cloud' || !order.consent || !config.isPhoneAllowed(order.phone)
+      || config.isPhoneBlocked(order.phone) || await optedOut(order.phone)) return;
+    const activeSession = await sessionOpen(order.phone);
+    if (!activeSession && !config.env.WA_TEMPLATE_PAYMENT_REJECTED) {
+      await update(order.id, data => openIssue(data, 'Aviso de pago no aprobado pendiente',
+        'Fuera de la ventana de WhatsApp se necesita una plantilla aprobada. Configura WA_TEMPLATE_PAYMENT_REJECTED.', rejectedIntent.id));
+      return;
+    }
+    try {
+      const intent = await checkout(order.id);
+      await send(order, paymentRejectedCta(order, intent, linkFor(intent)), { template: 'paymentRejected', intent });
+    } catch (error) {
+      await update(order.id, data => openIssue(data, 'Aviso de pago no aprobado pendiente', error.message, rejectedIntent.id));
+    }
+  }
+  async function notifyPaymentReview(order, payment) {
+    if (config.waMode !== 'cloud' || !order.consent || !config.isPhoneAllowed(order.phone)
+      || config.isPhoneBlocked(order.phone) || await optedOut(order.phone) || !(await sessionOpen(order.phone))) return;
+    try {
+      const message = '✅ Mercado Pago verificó el anticipo de *' + money(payment.amount) + '* para la reserva *' + order.ref
+        + '*. La reserva requiere revisión porque el pago llegó fuera del plazo. El personal te confirmará la disponibilidad.';
+      await send(order, message, { reply: true });
+    } catch (error) {
+      await update(order.id, data => openIssue(data, 'Aviso de pago por revisar pendiente', error.message, payment.ref));
+    }
+  }
   async function syncMp(id, verified = null) {
     const p = verified || await service.payment(id);
     requireThat(uuid.test(String(p.external_reference || '')), 'La operación no corresponde a una reserva de la aplicación.', 404);
     const target = await store.find('intents', { id: p.external_reference, mode: 'mercado_pago' });
     requireThat(target, 'Referencia de anticipo no encontrada.', 404);
     const token = randomUUID();
+    let rejectedIntent = null;
     const { order, result } = await update(target.id, data => {
+      rejectedIntent = null;
       const intent = data.intents.find(i => i.id === p.external_reference);
       const ref = 'MP-' + String(p.id);
       const amount = Math.round(Number(p.transaction_amount) * 100);
@@ -277,13 +311,65 @@ export async function makeApi(env, options = {}) {
           changed = true;
         }
       } else if (['rejected', 'cancelled'].includes(p.status)) {
-        if (intent.status === 'pending') intent.status = 'rejected';
+        if (intent.status === 'pending') {
+          intent.status = 'rejected';
+          rejectedIntent = structuredClone(intent);
+        }
         openIssue(data, 'Intento rechazado', 'Mercado Pago informó un intento fallido de anticipo.', ref);
       }
       return changed;
     });
-    if (result && order.stage === 'confirmed' && p.status === 'approved') await notifyConfirmation(order);
+    if (result && p.status === 'approved') {
+      if (order.stage === 'confirmed') await notifyConfirmation(order);
+      else {
+        const reviewPayment = order.payments.find(item => item.ref === 'MP-' + String(p.id) && item.review);
+        if (reviewPayment) await notifyPaymentReview(order, reviewPayment);
+      }
+    }
+    if (rejectedIntent) await notifyRejectedPayment(order, rejectedIntent);
     return { order, changed: result };
+  }
+  let paymentReconciliationRunning = false;
+  async function reconcilePendingPayments() {
+    if (config.paymentMode !== 'mercado_pago' || paymentReconciliationRunning) return { checked: 0, updated: 0 };
+    paymentReconciliationRunning = true;
+    let checked = 0, updated = 0;
+    try {
+      const now = Date.now();
+      const orders = await store.list();
+      const pending = orders.flatMap(order => (order.intents || [])
+        .filter(intent => intent.mode === 'mercado_pago' && intent.status === 'pending'
+          && intent.expiresAt && now <= +new Date(intent.expiresAt) + 7 * 86400000
+          && now - +new Date(intent.lastMpCheckAt || 0) >= 120000)
+        .map(intent => ({ order, intent })))
+        .sort((a, b) => +new Date(a.intent.expiresAt) - +new Date(b.intent.expiresAt)).slice(0, 10);
+      for (const { order, intent } of pending) {
+        const stamp = instant();
+        const { result: claimed } = await update(order.id, data => {
+          const row = data.intents.find(item => item.id === intent.id);
+          if (!row || row.status !== 'pending' || Date.now() - +new Date(row.lastMpCheckAt || 0) < 120000) return false;
+          row.lastMpCheckAt = stamp;
+          return true;
+        });
+        if (!claimed) continue;
+        checked++;
+        try {
+          const results = await service.paymentsByExternalReference(intent.id);
+          const candidates = results.filter(item => String(item.external_reference) === intent.id && /^\d+$/.test(String(item.id)));
+          const candidate = candidates.find(item => item.status === 'approved')
+            || candidates.sort((a, b) => +new Date(b.date_created || 0) - +new Date(a.date_created || 0))
+              .find(item => ['rejected', 'cancelled', 'refunded', 'charged_back'].includes(item.status));
+          if (!candidate) continue;
+          const payment = await service.payment(String(candidate.id));
+          if (String(payment.external_reference) !== intent.id) continue;
+          const result = await syncMp(String(candidate.id), payment);
+          if (result.changed) updated++;
+        } catch (error) {
+          console.error('Mercado Pago: no se pudo reconciliar un anticipo pendiente:', error.message);
+        }
+      }
+    } finally { paymentReconciliationRunning = false; }
+    return { checked, updated };
   }
   async function replyTo(order, text, proof, forcedIntent) {
     const summary = order.ref + ' · ' + stageLabels[order.stage] + '. Visita: '
@@ -298,18 +384,15 @@ export async function makeApi(env, options = {}) {
         const rule = await settings();
         if (method !== 'checkout' && !rule[method + 'Demo']) return 'Ese medio de demostración está desactivado. Puedes escribir «tarjeta» para abrir el checkout disponible.';
         const intent = await checkout(order.id, method);
-        const cta = paymentCta(order, intent, method, linkFor(intent));
-        if (method !== 'checkout') return cta;
-        const follow = paymentFollowUp(order, rule);
-        return follow ? [cta, follow] : cta;
+        return paymentCta(order, intent, method, linkFor(intent), rule);
       }
       case 'paid': {
         if (depositDue(order) === 0) return summary + ' El anticipo figura verificado.';
         const details = proof ? ['Medio: ' + (proof.provider || 'sin identificar'), 'Importe visible: ' + (proof.amount || 'ilegible'),
           'Operación: ' + (proof.operation || 'ilegible'), 'Datos extraídos de una imagen aportada por el pagador.'].join(' · ') : 'Revisar la transacción con la pasarela.';
         await update(order.id, data => openIssue(data, 'Pago informado por el cliente', details, proof ? 'voucher:' + (proof.operation || proof.messageId) : 'paid-reported'));
-        return (proof ? 'Recibí tu comprobante.' : 'Gracias por avisar.') + ' El pago todavía está en verificación para ' + order.ref
-          + '. Espera la confirmación antes de intentar pagar de nuevo.';
+        return (proof ? 'Recibí tu comprobante.' : 'Recibí tu aviso.') + ' ⏳ *Pago en verificación*\n'
+          + 'Reserva: *' + order.ref + '*\nAún no aparece aprobado en Mercado Pago. Espera la confirmación antes de volver a intentarlo.';
       }
       case 'change':
       case 'cancel':
@@ -361,6 +444,11 @@ export async function makeApi(env, options = {}) {
     let text = String(message.text?.body || message.interactive?.button_reply?.title || message.interactive?.list_reply?.title
       || message.button?.text || attachment?.caption || '').slice(0, 1000);
     if (!text && !attachment) return;
+    // Los saludos antiguos no deben producir menús atrasados tras una caída o una cola acumulada.
+    if (isGreeting(text) && Date.now() - timestamp > 90_000) {
+      console.info('WhatsApp: se omitió un saludo atrasado; ageSeconds=' + Math.round((Date.now() - timestamp) / 1000));
+      return;
+    }
 
     // Baja y alta se evalúan antes de clasificar la intención.
     const command = commandText(text);
@@ -455,7 +543,13 @@ export async function makeApi(env, options = {}) {
         recipient = target || reservationFocus(orders) || order;
       } else if (target) response = await actionReply(target, action.action);
       else if (!ref && orders.length > 1) {
-        response = reservationPrompt(orders);
+        if (isGreeting(text)) {
+          const previous = reservationListRepliedAt.get(phone) || 0;
+          if (timestamp - previous >= 120_000) {
+            response = reservationPrompt(orders);
+            if (response?.kind === 'list') reservationListRepliedAt.set(phone, timestamp);
+          }
+        } else response = reservationPrompt(orders);
         recipient = reservationFocus(orders) || order;
       } else if (mediaError || (proof && proof.kind !== 'voucher')) {
         await update(order.id, data => openIssue(data, 'Adjunto por revisar', mediaError || 'La imagen requiere revisión del personal.', message.id));
@@ -479,21 +573,40 @@ export async function makeApi(env, options = {}) {
     });
   }
   let inboxRunning = false;
+  let inboxRequested = false;
   async function drainInbox() {
-    if (inboxRunning) return { processed: 0, failed: 0, busy: true };
+    if (inboxRunning) { inboxRequested = true; return { processed: 0, failed: 0, busy: true }; }
     inboxRunning = true;
-    try { return await processInbox(); }
+    const result = { processed: 0, failed: 0 };
+    try {
+      // Vuelve a consultar la cola para recoger mensajes que llegaron mientras se procesaba
+      // el lote anterior. El límite de tiempo deja espacio para el resto de la API.
+      const started = Date.now();
+      for (let pass = 0; pass < 8 && Date.now() - started < 20_000; pass++) {
+        const batch = await processInbox();
+        result.processed += batch.processed;
+        result.failed += batch.failed;
+        const requested = inboxRequested;
+        inboxRequested = false;
+        if (!batch.processed && !batch.failed && !requested) break;
+      }
+      return result;
+    }
     finally { inboxRunning = false; }
   }
   async function processInbox() {
     await store.expireJobs(new Date(Date.now() - 5 * 60000).toISOString());
     const result = { processed: 0, failed: 0 };
-    for (const job of await store.queued(2)) {
+    for (const job of await store.queued(20)) {
       const rich = job.kind === 'message' && ['image', 'audio'].includes(job.payload.type);
       if (rich && result.processed + result.failed > 0) break;
       if (!await store.claim(job.id)) continue;
       try {
-        if (job.kind === 'message') await incoming(job.payload);
+        if (job.kind === 'message') {
+          const ageSeconds = Math.max(0, Math.round((Date.now() - Number(job.payload.timestamp) * 1000) / 1000));
+          console.info('WhatsApp: procesando mensaje; ageSeconds=' + ageSeconds);
+          await incoming(job.payload);
+        }
         else await delivery(job.payload);
         await store.finishJob(job.id, 'done');
         result.processed++;
@@ -515,13 +628,15 @@ export async function makeApi(env, options = {}) {
   }
   async function processAlerts() {
     const rule = await settings();
+    const now = Date.now();
+    const orders = await store.list();
     let sent = 0, escalated = 0, attempted = 0;
-    for (const order of await store.list()) {
+    for (const order of orders) {
       if (terminal(order)) continue;
-      const t = Date.now(), before = +new Date(order.visitAt) - t;
-      const issue = order.stage === 'awaiting_deposit' && t >= +new Date(order.deadline) ? ['Anticipo vencido', 'Revisa el pago y el cupo antes de renovar.', 'deadline:' + order.deadline]
+      const before = +new Date(order.visitAt) - now;
+      const issue = order.stage === 'awaiting_deposit' && now >= +new Date(order.deadline) ? ['Anticipo vencido', 'Revisa el pago y el cupo antes de renovar.', 'deadline:' + order.deadline]
         : order.stage === 'confirmed' && before <= -rule.graceMinutes * 60000 ? ['Verificar llegada', 'Pasó la tolerancia. Recepción debe verificar si asistió.', 'arrival:' + order.visitAt]
-          : order.stage === 'arrived' && balance(order) > 0 && t - +new Date(order.attendance.at) >= rule.counterAlertMinutes * 60000
+          : order.stage === 'arrived' && balance(order) > 0 && now - +new Date(order.attendance.at) >= rule.counterAlertMinutes * 60000
             ? ['Saldo por verificar', 'El cliente ya llegó y caja aún no confirmó el saldo.', 'counter:' + order.attendance.at] : null;
       if (rule.internalAlerts && issue && !order.incidents.some(i => i.key === issue[2])) {
         const { result: created } = await update(order.id, data => {
@@ -532,40 +647,100 @@ export async function makeApi(env, options = {}) {
         });
         if (created) escalated++;
       }
-      if (attempted >= 4 || config.waMode !== 'cloud' || !rule.reminders || !contactTime(rule, new Date(t)) || !order.consent
-        || !config.isPhoneAllowed(order.phone) || await optedOut(order.phone)) continue;
-      const initialKey = 'initial:' + order.deadline;
-      const needsDeposit = order.stage === 'awaiting_deposit' && depositDue(order) > 0 && t < +new Date(order.deadline);
-      const latestLink = [...order.chat].reverse().find(m => m.direction === 'out' && m.text.includes('/pago/'));
-      const initial = rule.initialRequest && needsDeposit && !latestLink && !order.reminders[initialKey];
-      const sinceRequest = t - +new Date(latestLink?.at || order.reminders[initialKey]?.at || order.createdAt);
-      const deposit = rule.depositReminder && needsDeposit && sinceRequest >= rule.depositReminderMinutes * 60000;
-      const visit = rule.visitReminder && order.stage === 'confirmed' && before > 0 && before <= rule.firstVisitHours * 3600000;
-      const askForDeposit = initial || deposit;
-      const key = initial ? initialKey : deposit ? 'deposit:' + order.deadline : visit ? 'visit:' + order.visitAt + ':' + (before <= rule.lastVisitHours * 3600000 ? 'last' : 'first') : null;
-      if (!key || order.reminders[key]) continue;
-      const { result: claimed } = await update(order.id, data => {
-        if (data.reminders[key] || data.stage !== order.stage || data.visitAt !== order.visitAt || data.deadline !== order.deadline) return false;
-        data.reminders[key] = { at: instant(), status: 'pending' };
-        return true;
-      });
-      if (!claimed) continue;
-      attempted++;
-      try {
-        const intent = askForDeposit ? await checkout(order.id) : null;
-        const current = (await store.get(order.id)).data;
-        if (current.stage === order.stage && current.visitAt === order.visitAt) {
-          await send(current, askForDeposit ? depositText(current, intent) : emojis.visit + ' Te esperamos en El Establo el '
-            + friendlyDate(current.visitAt, new Date(), true) + '. Reserva ' + current.ref + '. Saldo en el local: '
-            + money(balance(current)) + '.', { template: askForDeposit ? 'deposit' : 'visit', intent });
-          await update(order.id, data => { data.reminders[key].status = 'sent'; });
-          sent++;
-        } else await update(order.id, data => { data.reminders[key].status = 'skipped'; });
-      } catch (error) {
-        await update(order.id, data => {
-          data.reminders[key].status = 'failed';
-          openIssue(data, 'Recordatorio pendiente', error.message, key);
+    }
+
+    if (config.waMode !== 'cloud' || !rule.reminders || !contactTime(rule, new Date(now))) return { sent, escalated };
+
+    const groups = new Map();
+    for (const order of orders) {
+      if (terminal(order) || !order.phone) continue;
+      if (!groups.has(order.phone)) groups.set(order.phone, []);
+      groups.get(order.phone).push(order);
+    }
+
+    for (const [phone, group] of groups) {
+      if (attempted >= 4) break;
+      if (!config.isPhoneAllowed(phone) || config.isPhoneBlocked(phone) || await optedOut(phone)) continue;
+      const plans = [];
+      for (const order of group) {
+        if (!order.consent) continue;
+        const before = +new Date(order.visitAt) - now;
+        const needsDeposit = order.stage === 'awaiting_deposit' && depositDue(order) > 0 && now < +new Date(order.deadline);
+        const initialKey = 'initial:' + order.deadline;
+        const latestLink = [...order.chat].reverse().find(m => m.direction === 'out' && (m.paymentLink || m.text.includes('/pago/')));
+        const initial = rule.initialRequest && needsDeposit && !latestLink && !order.reminders[initialKey];
+        const sinceRequest = now - +new Date(latestLink?.at || order.reminders[initialKey]?.at || order.createdAt);
+        const deposit = rule.depositReminder && needsDeposit && sinceRequest >= rule.depositReminderMinutes * 60000;
+        const visit = rule.visitReminder && order.stage === 'confirmed' && before > 0 && before <= rule.firstVisitHours * 3600000;
+        const key = initial ? initialKey : deposit ? 'deposit:' + order.deadline
+          : visit ? 'visit:' + order.visitAt + ':' + (before <= rule.lastVisitHours * 3600000 ? 'last' : 'first') : null;
+        if (key && !order.reminders[key]) plans.push({ order, key, kind: initial || deposit ? 'deposit' : 'visit' });
+      }
+      if (!plans.length) continue;
+
+      const deposits = plans.filter(plan => plan.kind === 'deposit')
+        .sort((a, b) => +new Date(a.order.deadline) - +new Date(b.order.deadline));
+      const visits = plans.filter(plan => plan.kind === 'visit')
+        .sort((a, b) => +new Date(a.order.visitAt) - +new Date(b.order.visitAt));
+      const paymentAlert = deposits.length > 0;
+      const chosenPlans = paymentAlert ? deposits : visits;
+      const claimed = [];
+      for (const plan of chosenPlans) {
+        const { result: didClaim } = await update(plan.order.id, data => {
+          if (data.reminders[plan.key] || data.stage !== plan.order.stage || data.visitAt !== plan.order.visitAt
+            || data.deadline !== plan.order.deadline) return false;
+          data.reminders[plan.key] = { at: instant(), status: 'pending' };
+          return true;
         });
+        if (didClaim) claimed.push(plan);
+      }
+      if (!claimed.length) continue;
+      attempted++;
+      let messagePlan = claimed[0];
+      try {
+        const activeSession = await sessionOpen(phone);
+        let current = (await store.get(messagePlan.order.id))?.data;
+        const pendingPayments = group.filter(order => order.consent && order.stage === 'awaiting_deposit'
+          && depositDue(order) > 0 && now < +new Date(order.deadline));
+
+        if (paymentAlert && activeSession && pendingPayments.length > 1) {
+          const freshOrders = await store.phone(phone);
+          const currentPayments = freshOrders.filter(order => order.consent && order.stage === 'awaiting_deposit'
+            && depositDue(order) > 0 && now < +new Date(order.deadline));
+          await send(current, reservationList(currentPayments, new Date(now)));
+          for (const plan of claimed) await update(plan.order.id, data => {
+            if (data.reminders[plan.key]?.status === 'pending') data.reminders[plan.key].status = 'sent';
+          });
+          for (const plan of visits) await update(plan.order.id, data => {
+            if (!data.reminders[plan.key]) data.reminders[plan.key] = { at: instant(), status: 'skipped' };
+          });
+          sent++;
+          continue;
+        }
+
+        if (paymentAlert) {
+          const intent = await checkout(current.id);
+          current = (await store.get(current.id))?.data;
+          await send(current, paymentCta(current, intent, 'checkout', linkFor(intent), rule), { template: 'deposit', intent });
+        } else {
+          const visit = emojis.visit + ' *Próxima visita*\nReserva: *' + current.ref + '*\n'
+            + friendlyDate(current.visitAt, new Date(now), true) + '\nSaldo en el local: *' + money(balance(current)) + '*';
+          await send(current, visit, { template: 'visit' });
+        }
+
+        for (const plan of claimed) await update(plan.order.id, data => {
+          if (data.reminders[plan.key]?.status === 'pending') data.reminders[plan.key].status = plan === messagePlan ? 'sent' : 'skipped';
+        });
+        const secondary = paymentAlert ? visits : chosenPlans.slice(1);
+        for (const plan of secondary) await update(plan.order.id, data => {
+          if (!data.reminders[plan.key]) data.reminders[plan.key] = { at: instant(), status: 'skipped' };
+        });
+        sent++;
+      } catch (error) {
+        for (const plan of claimed) await update(plan.order.id, data => {
+          if (data.reminders[plan.key]?.status === 'pending') data.reminders[plan.key].status = plan === messagePlan ? 'failed' : 'skipped';
+        });
+        await update(messagePlan.order.id, data => openIssue(data, 'Recordatorio pendiente', error.message, messagePlan.key));
       }
     }
     return { sent, escalated };
@@ -581,6 +756,15 @@ export async function makeApi(env, options = {}) {
     finally { running = false; }
   }, 30000) : null;
   timer?.unref();
+  const paymentTimer = config.paymentMode === 'mercado_pago' ? setInterval(async () => {
+    try { await reconcilePendingPayments(); }
+    catch (error) { console.error('Mercado Pago: falló la reconciliación de pagos pendientes:', error.message); }
+  }, 120000) : null;
+  paymentTimer?.unref();
+  const initialPaymentReconciliation = config.paymentMode === 'mercado_pago' && !options.memory ? setTimeout(() => {
+    reconcilePendingPayments().catch(error => console.error('Mercado Pago: falló la reconciliación inicial:', error.message));
+  }, 2000) : null;
+  initialPaymentReconciliation?.unref();
 
   async function route(req, res, next) {
     const url = new URL(req.url, 'http://localhost');
@@ -637,11 +821,14 @@ export async function makeApi(env, options = {}) {
           }
         }
         await store.enqueue(queue);
-        if (config.orchestration === 'server' && queue.length) await drainInbox();
-        else if (queue.length && config.env.N8N_WAKE_URL) {
-          fetch(config.env.N8N_WAKE_URL, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(5000),
-            headers: { Authorization: 'Bearer ' + config.env.N8N_AGENT_TOKEN } }).catch(() => {});
-        }
+        const queuedMessages = queue.filter(job => job.kind === 'message').length;
+        const queuedStatuses = queue.length - queuedMessages;
+        if (queue.length) console.info('WhatsApp webhook: mensajes=' + queuedMessages + '; estados=' + queuedStatuses);
+        // Atiende la cola desde el servidor en cuanto Meta entrega el webhook. n8n
+        // conserva la programación de alertas, pero no media la respuesta conversacional.
+        if (queue.length) void drainInbox().then(result => {
+          if (result.failed) console.error('WhatsApp: falló el procesamiento de ' + result.failed + ' elemento(s) de la cola.');
+        }).catch(error => console.error('WhatsApp: no se pudo vaciar la cola:', error.message));
         return json(res, 200, { received: true });
       }
     }
@@ -649,21 +836,47 @@ export async function makeApi(env, options = {}) {
       const raw = await readBody(req);
       const id = service.verifyMp(req, url);
       requireThat(id, 'Firma de Mercado Pago inválida.', 403);
-      if ((parse(raw).type || url.searchParams.get('type')) === 'payment') await syncMp(id);
+      const notification = parse(raw);
+      if ((notification.type || url.searchParams.get('type')) === 'payment') {
+        try {
+          const result = await syncMp(id);
+          const payment = result.order.payments.find(item => item.ref === 'MP-' + id);
+          console.log('Mercado Pago webhook: payment verified; status=' + (payment ? 'recorded' : 'pending')
+            + '; reservation=' + result.order.ref + '; changed=' + Boolean(result.changed));
+        } catch (error) {
+          console.error('Mercado Pago webhook: payment processing failed:', error.message);
+          throw error;
+        }
+      }
       return json(res, 200, { received: true });
     }
     const publicPay = path.match(/^\/api\/payment\/([a-f0-9-]+)$/);
     if (publicPay && uuid.test(publicPay[1])) {
-      const target = await store.find('intents', { id: publicPay[1] });
+      let target = await store.find('intents', { id: publicPay[1] });
       requireThat(target, 'Enlace no encontrado.', 404);
-      const intent = target.intents.find(i => i.id === publicPay[1]);
+      let intent = target.intents.find(i => i.id === publicPay[1]);
+      if (isGet && intent.mode === 'mercado_pago' && config.paymentMode === 'mercado_pago') {
+        const returnedPaymentId = url.searchParams.get('payment_id') || url.searchParams.get('collection_id');
+        if (returnedPaymentId) {
+          requireThat(/^\d{1,30}$/.test(returnedPaymentId), 'Identificador de pago inválido.');
+          const payment = await service.payment(returnedPaymentId);
+          requireThat(String(payment.external_reference) === intent.id, 'El pago no corresponde a este enlace.', 409);
+          await syncMp(returnedPaymentId, payment);
+          target = (await store.get(target.id))?.data;
+          requireThat(target, 'Reserva no encontrada.', 404);
+          intent = target.intents.find(i => i.id === publicPay[1]);
+        }
+      }
       const method = intent.method || 'checkout';
       const methodEnabled = method === 'checkout' || (await settings())[method + 'Demo'];
       if (isGet) {
         const usable = methodEnabled && target.stage === 'awaiting_deposit' && intent.amount === depositDue(target)
           && new Date(intent.expiresAt) > new Date() && new Date(target.deadline) > new Date() && intent.status === 'pending';
+        const safeCheckout = intent.mode !== 'mercado_pago' || isMercadoPagoInitPoint(intent.checkoutUrl);
+        const requiresReview = target.payments.some(payment => payment.intentId === intent.id && payment.review);
         return json(res, 200, { ref: target.ref, amount: intent.amount, status: intent.status, mode: intent.mode,
-          method, usable, checkoutUrl: usable ? intent.checkoutUrl : null });
+          stage: target.stage, requiresReview,
+          method, usable: usable && safeCheckout, checkoutUrl: usable && safeCheckout ? intent.checkoutUrl : null });
       }
       if (isPost) {
         requireThat(methodEnabled && intent.mode === 'local' && (method !== 'checkout' || config.paymentMode === 'local'), 'Este pago se confirma desde el medio autorizado.', 409);
@@ -693,7 +906,15 @@ export async function makeApi(env, options = {}) {
       const order = await store.find('receipts', { token: publicReceipt[1] });
       requireThat(order, 'Comprobante no encontrado.', 404);
       const receipt = order.receipts.find(r => r.token === publicReceipt[1]);
-      return json(res, 200, { ...receipt, ref: order.ref, payer: order.payer, total: order.total });
+      const payment = order.payments.filter(item => item.channel === 'mercadopago' && item.purpose === receipt.purpose
+        && item.amount === receipt.amount && /^MP-\d+$/.test(String(item.ref || '')))
+        .sort((a, b) => +new Date(b.at || 0) - +new Date(a.at || 0))
+        .find(item => !order.payments.some(adjustment => adjustment.original === item.ref && adjustment.amount < 0));
+      const operationId = payment ? payment.ref.slice(3) : null;
+      const mercadoPagoReceiptUrl = operationId ? 'https://www.mercadopago.com.pe/ccap/file-viewer/receipt?'
+        + new URLSearchParams({ flow: 'cow_payment_receipts', origin: 'feedback-screen', payment_id: operationId }) : null;
+      return json(res, 200, { ...receipt, ref: order.ref, payer: order.payer, total: order.total,
+        ...(operationId ? { mercadoPagoOperationId: operationId, mercadoPagoReceiptUrl } : {}) });
     }
     requireThat(authenticated(req), 'Inicia sesión para acceder al panel.', 401);
     const attachment = path.match(/^\/api\/orders\/([a-f0-9-]+)\/media\/([^/]+)$/);
@@ -749,12 +970,11 @@ export async function makeApi(env, options = {}) {
         }
         if (input.type === 'deposit') {
           const intent = await checkout(id, input.method);
-          order = await send(order, depositText(order, intent), { template: 'deposit', intent });
+          order = await send(order, paymentCta(order, intent, input.method || 'checkout', linkFor(intent), await settings()), { template: 'deposit', intent });
         } else if (input.type === 'visit') {
           requireThat(order.stage === 'confirmed', 'La visita debe estar confirmada.', 409);
-          order = await send(order, emojis.visit + ' Hola, ' + order.payer + '. Te esperamos el '
-            + friendlyDate(order.visitAt, new Date(), true) + ' en El Establo. Reserva ' + order.ref
-            + '. Saldo en el local: ' + money(balance(order)) + '.', { template: 'visit' });
+          order = await send(order, emojis.visit + ' *Próxima visita*\nReserva: *' + order.ref + '*\n'
+            + friendlyDate(order.visitAt, new Date(), true) + '\nSaldo en el local: *' + money(balance(order)) + '*', { template: 'visit' });
         } else if (input.type === 'receipt') {
           const receipt = order.receipts.at(-1);
           requireThat(receipt, 'Aún no hay un comprobante emitido.', 409);
@@ -844,5 +1064,7 @@ export async function makeApi(env, options = {}) {
     if (!res.headersSent) json(res, error.status || 500, { error: error.status ? error.message : 'No se pudo completar la operación.' });
     else res.end();
   });
-  return { middleware, async close() { clearInterval(timer); await store.close?.(); } };
+  return { middleware, async close() {
+    clearInterval(timer); clearInterval(paymentTimer); clearTimeout(initialPaymentReconciliation); await store.close?.();
+  } };
 }

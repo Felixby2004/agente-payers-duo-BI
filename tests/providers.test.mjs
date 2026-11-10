@@ -13,7 +13,7 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     WHATSAPP_MODE: 'cloud', WA_GRAPH_VERSION: 'v25.0', WA_PHONE_NUMBER_ID: '456',
     WA_ACCESS_TOKEN: 'wa-ficticio', WA_VERIFY_TOKEN: 'verificacion-ficticia',
     WA_APP_SECRET: 'firma-wa-ficticia', WA_ALLOWED_PHONES: '51999999999',
-    PAYMENT_MODE: 'mercado_pago', MP_TEST_ACCESS_TOKEN: 'mp-ficticio', MP_TEST_SELLER_ID: '123',
+    PAYMENT_MODE: 'mercado_pago', MP_TEST_ACCESS_TOKEN: 'mp-ficticio', MP_TEST_SELLER_ID: '123', MP_TEST_BUYER_ID: '3829653747',
     MP_WEBHOOK_SECRET: 'firma-mp-ficticia',
     AGENT_ORCHESTRATION: 'n8n', N8N_AGENT_TOKEN: 'token-interno-de-prueba-para-n8n-2026',
     OPENAI_API_KEY: 'ia-ficticia',
@@ -31,10 +31,11 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     if (url === 'https://api.mercadolibre.com/users/me') return Response.json({ id: 123, tags: ['test_user'] });
     if (url === 'https://api.mercadopago.com/checkout/preferences') {
       preference = JSON.parse(options.body);
-      return Response.json({ id: 'preferencia-1', init_point: 'https://www.mercadopago.com.pe/checkout/test' });
+      return Response.json({ id: 'preferencia-1', init_point: 'https://www.mercadopago.com.pe/checkout/live',
+        sandbox_init_point: 'https://sandbox.mercadopago.com.pe/checkout/test' });
     }
     if (url === 'https://api.mercadopago.com/v1/payments/987') {
-      return Response.json({ id: 987, status: 'approved', collector_id: 123, live_mode: false,
+      return Response.json({ id: 987, status: 'approved', collector_id: 123, payer: { id: '3829653747' }, live_mode: true,
         currency_id: currency, external_reference: preference.external_reference,
         transaction_amount: preference.items[0].unit_price, date_approved: new Date().toISOString() });
     }
@@ -96,13 +97,14 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     await receive(message);
     assert.equal(sent.length, 0);
     assert.equal((await drain()).processed, 1);
-    assert.equal(sent.length, 2);
+    assert.equal(sent.length, 1);
     assert.equal(sent[0].to, '51999999999');
     assert.equal(sent[0].type, 'interactive');
     assert.equal(sent[0].interactive.type, 'cta_url');
     assert.match(sent[0].interactive.action.parameters.url, /^https:\/\/establo\.example\/pago\//);
-    assert.equal(sent[1].interactive.type, 'button');
-    assert.deepEqual(sent[1].interactive.action.buttons.map(button => button.reply.id.split(':')[0]), ['yape', 'plin', 'hum']);
+    assert.equal(preference.auto_return, 'approved');
+    assert.match(sent[0].interactive.action.parameters.url, /^https:\/\/establo\.example\/pago\//);
+    assert.match(sent[0].interactive.body.text, /Yape.*Plin/);
     assert.equal(preference.items[0].unit_price, 40);
     assert.equal(preference.items[0].currency_id, 'PEN');
     assert.equal(Object.hasOwn(preference, 'payer'), false);
@@ -134,11 +136,25 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     assert.equal(verified.payments.length, 1);
     assert.equal(verified.payments[0].amount, 4000);
     assert.equal(verified.receipts.length, 1);
-    assert.equal(sent.length, 5);
+    assert.equal(sent.length, 4);
     assert.equal(sent.at(-1).interactive.type, 'cta_url');
     assert.match(sent.at(-1).interactive.body.text, /Anticipo verificado/);
     assert.match(sent.at(-1).interactive.action.parameters.url, /\/comprobante\//);
     assert.ok(verified.incidents.some(i => i.type === 'Solicitud de reprogramación'));
+
+    const { data: returnOrder } = await call('orders', JSON.stringify({
+      agreed: true, payer: 'Compra por retorno', phone: '+51999999999', consent: true, guests: 1,
+      visitAt: new Date(Date.now() + 3 * 3600000).toISOString(), items: [{ name: 'Parrilla familiar', price: 14900, quantity: 1 }],
+    }), 201);
+    const { data: returnLink } = await call('orders/' + returnOrder.id + '/link', JSON.stringify({ method: 'checkout' }), 200);
+    assert.equal(preference.external_reference, returnLink.intent.id);
+    assert.equal(returnLink.intent.checkoutUrl, 'https://www.mercadopago.com.pe/checkout/live');
+    const { data: returned } = await call('payment/' + returnLink.intent.id + '?payment_id=987', undefined, 200);
+    assert.equal(returned.status, 'approved');
+    assert.equal(returned.stage, 'confirmed');
+    assert.equal((await call('orders', undefined, 200)).data.find(item => item.id === returnOrder.id).payments.length, 1);
+    assert.equal(sent.at(-1).interactive.type, 'cta_url');
+    assert.match(sent.at(-1).interactive.body.text, /Anticipo verificado/);
 
     const { data: rule } = await call('config', undefined, 200);
     await call('agent/settings', JSON.stringify({ ...rule, deadlineMinutes: 1 }), 200);

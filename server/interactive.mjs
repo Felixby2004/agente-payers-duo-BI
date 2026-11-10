@@ -9,9 +9,9 @@ export const emojis = Object.freeze({
   confirmed: '✅',
   attention: '⚠️',
   finished: '🧾',
-  greeting: '🔥',
-  visit: '🥩',
-  farewell: '🍖',
+  greeting: '💳',
+  visit: '📅',
+  farewell: '👋',
   payment: '💳',
   receipt: '🧾',
   verified: '✅',
@@ -27,7 +27,9 @@ const onlyDigits = (value = '') => String(value).replace(/\D/g, '');
 const productKey = (value) => fold(value).toLowerCase().replace(/[·•]/g, ' ')
   .replace(/[^\p{L}\p{N}]+/gu, ' ').replace(/\s+/g, ' ').trim();
 export function clip(value, max) {
-  const text = normalized(value);
+  const text = String(value ?? '').replace(/\r\n?/g, '\n')
+    .split('\n').map(line => line.replace(/[ \t]+/g, ' ').trim()).join('\n')
+    .replace(/\n{3,}/g, '\n\n').trim();
   return text.length > max ? text.slice(0, max - 1).trimEnd() + '…' : text;
 }
 const identifier = (value) => String(value ?? '').trim().slice(0, limits.id);
@@ -75,7 +77,7 @@ export function displayText(message) {
   if (message.kind === 'buttons') return message.body + ' [Botones: ' + message.buttons.map(item => item.title).join(' · ') + ']';
   if (message.kind === 'list') return message.body + ' [Lista: ' + (message.list.sections || []).flatMap(section =>
     section.rows.map(row => section.title + ' — ' + row.title + (row.description ? ' — ' + row.description : ''))).join(' · ') + ']';
-  if (message.kind === 'cta') return message.body + ' [Enlace: ' + message.cta.displayText + ' — ' + message.cta.url + ']';
+  if (message.kind === 'cta') return message.body + ' [Botón: ' + message.cta.displayText + ']';
   return String(message.body || '');
 }
 
@@ -276,17 +278,16 @@ export function reservationRepeatedMessage(order) {
 
 export function reservationConfirmation(order, url = '', now = new Date()) {
   const body = [
-    texts.reservationRegistered.replace('{ref}', order.ref),
-    texts.reservationDetails
-      .replace('{payer}', order.payer)
-      .replace('{people}', personLabel(order.guests))
-      .replace('{date}', capitalize(friendlyDate(order.visitAt, now, true))),
-    texts.reservationTotal.replace('{total}', money(order.total)).replace('{deposit}', money(order.deposit)),
-    texts.reservationDeadline.replace('{date}', friendlyDate(order.deadline, now, true)),
+    emojis.confirmed + ' *Reserva registrada*',
+    'Referencia: *' + order.ref + '*',
+    'Fecha y hora: ' + capitalize(friendlyDate(order.visitAt, now, true)),
+    'Personas: ' + personLabel(order.guests),
+    'Total: ' + money(order.total),
+    'Anticipo: *' + money(order.deposit) + '*',
+    'Vence: ' + friendlyDate(order.deadline, now, true),
   ].join('\n');
-  if (!url) return body;
-  const label = 'Pagar ' + money(order.deposit);
-  return ctaMessage(body, label.length <= limits.ctaText ? label : 'Pagar anticipo', url);
+  if (!url) return body + '\nEl enlace de pago está pendiente. Escribe «anticipo» para solicitarlo de nuevo.';
+  return ctaMessage(body, 'Pagar anticipo', url);
 }
 
 const capitalize = (value) => value ? value.charAt(0).toUpperCase() + value.slice(1) : '';
@@ -321,7 +322,7 @@ export function reservationMenu(order, now = new Date()) {
   if (terminal(order)) {
     const text = order.stage === 'closed'
       ? emojis.farewell + ' Gracias por visitarnos, ' + order.payer + '. ¡Esperamos verte pronto en El Establo!'
-      : emojis.farewell + ' Gracias por escribirnos, ' + order.payer + '. Tu reserva *' + order.ref + '* está cerrada.';
+      : emojis.farewell + ' *Reserva cerrada*\nReferencia: *' + order.ref + '*';
     return receipt ? buttonsMessage(text, [button('rcp:' + order.ref, 'Ver constancia')]) : text;
   }
   const date = friendlyDate(order.visitAt, now, true);
@@ -329,17 +330,16 @@ export function reservationMenu(order, now = new Date()) {
   if (order.stage === 'awaiting_deposit') {
     const expired = new Date(order.deadline) <= new Date(now);
     const text = expired
-      ? emojis.attention + ' Hola, ' + order.payer + '. El plazo del anticipo de tu reserva *' + order.ref
-        + '* venció. Puedo derivarte con el personal para revisarlo.'
-      : emojis.greeting + ' Hola, ' + order.payer + '. Tu reserva *' + order.ref + '* en Parrilladas El Establo para el *'
-        + date + '* (' + people + ') se confirma al pagar el anticipo de *' + money(depositDue(order)) + '*.';
+      ? emojis.attention + ' *Venció el plazo del anticipo*\nReserva: *' + order.ref + '*\nSi necesitas revisarlo, puedo avisar al personal.'
+      : emojis.greeting + ' *Anticipo pendiente*\nReserva: *' + order.ref + '*\nVisita: ' + date + ' · ' + people
+        + '\nImporte: *' + money(depositDue(order)) + '*';
     return buttonsMessage(text, expired
       ? [button('hum:' + order.ref, 'Hablar con alguien')]
       : [button('pay:' + order.ref, 'Pagar anticipo'), button('bal:' + order.ref, 'Ver saldo'),
         button('hum:' + order.ref, 'Hablar con alguien')]);
   }
-  const text = emojis.visit + ' Hola, ' + order.payer + '. Tu reserva *' + order.ref + '* está confirmada para el *'
-    + date + '* (' + people + '). Saldo en el local: *' + money(balance(order)) + '*. ¡Te esperamos!';
+  const text = emojis.visit + ' *Reserva confirmada*\nReferencia: *' + order.ref + '*\nVisita: ' + date + ' · ' + people
+    + '\nSaldo en el local: *' + money(balance(order)) + '*';
   if (order.stage === 'confirmed') {
     return buttonsMessage(text, [receiptButton(order, receipt), button('chg:' + order.ref, 'Cambiar fecha'),
       button('hum:' + order.ref, 'Hablar con alguien')]);
@@ -348,10 +348,10 @@ export function reservationMenu(order, now = new Date()) {
 }
 
 const sectionDefinitions = Object.freeze([
-  { key: 'deposit', title: emojis.deposit + ' Por pagar anticipo' },
-  { key: 'confirmed', title: emojis.confirmed + ' Confirmadas' },
-  { key: 'attention', title: emojis.attention + ' Requieren atención' },
-  { key: 'finished', title: emojis.finished + ' Finalizadas' },
+  { key: 'deposit', title: 'Por pagar anticipo' },
+  { key: 'confirmed', title: 'Confirmadas' },
+  { key: 'attention', title: 'Requieren atención' },
+  { key: 'finished', title: 'Finalizadas' },
 ]);
 const blockingIncidents = new Set(['Pago por revisar', 'Reverso por revisar', 'Anticipo por resolver', 'Anticipo vencido']);
 
@@ -401,10 +401,10 @@ export function reservationList(orders, now = new Date()) {
   const buckets = new Map(sectionDefinitions.map(section => [section.key, []]));
   for (const order of all) buckets.get(sectionOf(order, now)).push(order);
   for (const rows of buckets.values()) rows.sort(visitSorter(now));
-  const body = 'Tienes ' + (activeCount === 1 ? '1 reserva activa' : activeCount + ' reservas activas') + '. '
+  const body = '📋 Tienes ' + (activeCount === 1 ? '1 reserva activa' : activeCount + ' reservas activas') + '. '
     + (all.length > limits.rows
       ? 'Mostrando las 10 más relevantes de ' + all.length + '. Si buscas otra, escríbeme su referencia.'
-      : 'Elige la que quieres revisar.');
+      : 'Elige una para ver sus detalles y opciones.');
   const sections = [];
   let remaining = limits.rows;
   for (const definition of sectionDefinitions) {
@@ -428,9 +428,11 @@ export function reservationFocus(orders, now = new Date()) {
 }
 
 export function reservationPrompt(orders, now = new Date()) {
-  const focus = reservationFocus(orders, now);
+  const current = [...(orders || [])];
+  const active = current.filter(order => !terminal(order));
+  const focus = reservationFocus(active.length ? active : current, now);
   if (focus) return reservationMenu(focus, now);
-  return (orders || []).filter(order => !terminal(order)).length > 1 ? reservationList(orders, now) : null;
+  return active.length > 1 ? reservationList(active, now) : null;
 }
 
 export function requestMessage(order, type) {
@@ -438,29 +440,29 @@ export function requestMessage(order, type) {
     + '*. El personal la revisará y te confirmará los próximos pasos.';
 }
 
-export function paymentCta(order, intent, method, url) {
-  const label = method === 'yape' ? 'Yape' : method === 'plin' ? 'Plin' : '';
-  const text = emojis.payment + ' Tu anticipo de *' + money(intent.amount) + '* para *' + order.ref + '* está listo.';
-  const preferred = label ? 'Pagar con ' + label : 'Pagar ' + money(intent.amount);
-  return ctaMessage(text, preferred.length <= limits.ctaText ? preferred : 'Pagar anticipo', url);
-}
-
-export function paymentFollowUp(order, rule) {
-  const names = [rule.yapeDemo && 'Yape', rule.plinDemo && 'Plin'].filter(Boolean);
-  if (!names.length) return null;
-  const buttons = [];
-  if (rule.yapeDemo) buttons.push(button('yape:' + order.ref, 'Pagar con Yape'));
-  if (rule.plinDemo) buttons.push(button('plin:' + order.ref, 'Pagar con Plin'));
-  buttons.push(button('hum:' + order.ref, 'Hablar con alguien'));
-  return buttonsMessage('También puedes simular el anticipo con *' + names.join('* o *') + '*, si lo prefieres.', buttons);
+export function paymentCta(order, intent, method, url, options = {}) {
+  const label = method === 'yape' ? 'Simular con Yape' : method === 'plin' ? 'Simular con Plin' : 'Pagar anticipo';
+  const channel = method === 'checkout' ? 'Mercado Pago de prueba' : 'el medio de demostración elegido';
+  const alternatives = [options.yapeDemo && 'Yape', options.plinDemo && 'Plin'].filter(Boolean);
+  const text = emojis.payment + ' *Anticipo listo*\nReserva: *' + order.ref + '*\nImporte: *' + money(intent.amount)
+    + '*\nContinúa en ' + channel + ' con el botón.'
+    + (method === 'checkout' && alternatives.length ? '\nPara otro medio simulado, escribe *' + alternatives.join('* o *') + '*.' : '');
+  return ctaMessage(text, clip(label, limits.ctaText), url);
 }
 
 export function receiptCta(order, url) {
-  return ctaMessage(emojis.receipt + ' Aquí tienes tu constancia de *' + order.ref + '*.', 'Ver constancia', url);
+  return ctaMessage(emojis.receipt + ' *Constancia interna de reserva*\nReferencia: *' + order.ref
+    + '*\nEste documento es de El Establo y no reemplaza el comprobante oficial de Mercado Pago.', 'Ver constancia', url);
 }
 
 export function confirmationCta(order, url, now = new Date()) {
-  return ctaMessage(emojis.verified + ' Anticipo verificado. Tu reserva *' + order.ref + '* está confirmada para el *'
-    + friendlyDate(order.visitAt, now, true) + '*. Saldo a pagar en el local: *' + money(balance(order)) + '*.',
+  return ctaMessage(emojis.verified + ' *Anticipo verificado*\nReserva: *' + order.ref + '*\nVisita: '
+    + friendlyDate(order.visitAt, now, true) + '\nSaldo en el local: *' + money(balance(order)) + '*.',
   'Ver constancia', url);
+}
+
+export function paymentRejectedCta(order, intent, url) {
+  const text = emojis.attention + ' *Pago no aprobado*\nReserva: *' + order.ref + '*\nNo se confirmó el anticipo de '
+    + money(intent.amount) + '. Puedes intentarlo de nuevo con el botón.';
+  return ctaMessage(text, 'Reintentar pago', url);
 }

@@ -106,9 +106,12 @@ export function providers(config) {
         external_reference: intent.id,
         notification_url: config.publicUrl + '/api/webhooks/mercado-pago?source_news=webhooks',
         back_urls: { success: returnUrl, pending: returnUrl, failure: returnUrl },
+        auto_return: 'approved',
         expires: true, expiration_date_to: intent.expiresAt,
         payment_methods: { installments: 1 },
       }, e.MP_TEST_ACCESS_TOKEN, 'Mercado Pago'));
+      requireThat(typeof result.init_point === 'string' && result.init_point,
+        'Mercado Pago no devolvió el enlace de Checkout Pro.', 502);
       const checkoutUrl = new URL(result.init_point);
       requireThat(checkoutUrl.protocol === 'https:' && /^(www\.)?mercadopago\.com(\.[a-z]{2})?$/.test(checkoutUrl.hostname),
         'Mercado Pago devolvió un enlace inesperado.', 502);
@@ -117,9 +120,21 @@ export function providers(config) {
     async payment(id) {
       await verifySeller();
       const p = await requestJson(mp + '/v1/payments/' + encodeURIComponent(id), mpAuth);
-      requireThat(String(p.collector_id) === e.MP_TEST_SELLER_ID && p.live_mode === false && p.currency_id === 'PEN',
-        'La operación no coincide con el entorno de prueba, la cuenta o la moneda.', 409);
+      requireThat(String(p.collector_id) === e.MP_TEST_SELLER_ID,
+        'El pago no pertenece al vendedor de prueba configurado.', 409);
+      // Checkout Pro test users use the standard init_point. In this test-user
+      // flow live_mode alone is not a safe discriminator; bind the payment to
+      // the configured test buyer as well as the verified test seller.
+      requireThat(String(p.payer?.id || '') === e.MP_TEST_BUYER_ID,
+        'El pago no proviene del comprador de prueba configurado.', 409);
+      requireThat(p.currency_id === 'PEN', 'El pago no está en soles peruanos.', 409);
       return p;
+    },
+    async paymentsByExternalReference(externalReference) {
+      await verifySeller();
+      const query = new URLSearchParams({ external_reference: String(externalReference), sort: 'date_created', criteria: 'desc', limit: '10' });
+      const result = await requestJson(mp + '/v1/payments/search?' + query, mpAuth);
+      return Array.isArray(result.results) ? result.results : [];
     },
     async refund(id, cents, key) {
       await verifySeller();
@@ -143,14 +158,15 @@ export function providers(config) {
         : order.chat.some(m => m.direction === 'in' && (!m.from || digits(m.from) === digits(order.phone))
           && Date.now() - +new Date(m.at) < 24 * 3600000);
       if (session) return deliver(order.phone, text);
-      const name = { deposit: e.WA_TEMPLATE_DEPOSIT, visit: e.WA_TEMPLATE_VISIT, confirmation: e.WA_TEMPLATE_CONFIRMATION,
+      const name = { deposit: e.WA_TEMPLATE_DEPOSIT, paymentRejected: e.WA_TEMPLATE_PAYMENT_REJECTED,
+        visit: e.WA_TEMPLATE_VISIT, confirmation: e.WA_TEMPLATE_CONFIRMATION,
         settlement: e.WA_TEMPLATE_SETTLEMENT }[template];
       requireThat(name, 'Pide al pagador que escriba al número de WhatsApp o configura una plantilla aprobada.', 409);
-      const values = template === 'deposit' ? [order.payer, order.ref, money(intent.amount)]
+      const values = ['deposit', 'paymentRejected'].includes(template) ? [order.payer, order.ref, money(intent.amount)]
         : template === 'settlement' ? [order.payer, order.ref, money(order.total)]
           : [order.payer, order.ref, visitText(order.visitAt), money(balance(order))];
       const components = [{ type: 'body', parameters: values.map(value => ({ type: 'text', text: value })) }];
-      if (template === 'deposit') components.push({ type: 'button', sub_type: 'url', index: '0', parameters: [{ type: 'text', text: intent.id }] });
+      if (['deposit', 'paymentRejected'].includes(template)) components.push({ type: 'button', sub_type: 'url', index: '0', parameters: [{ type: 'text', text: intent.id }] });
       if (template === 'settlement') components.push({ type: 'button', sub_type: 'url', index: '0',
         parameters: [{ type: 'text', text: order.receipts.find(r => r.purpose === 'settlement').token }] });
       return submit(order.phone, { type: 'template', template: { name, language: { code: e.WA_TEMPLATE_LANGUAGE || 'es_PE' }, components } });

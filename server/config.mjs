@@ -14,11 +14,12 @@ export function readConfig(env) {
   // WA_ALLOWED_PHONES es opcional: vacía significa modo abierto para cualquier remitente.
   if (waMode === 'cloud') required.push('WA_GRAPH_VERSION', 'WA_PHONE_NUMBER_ID', 'WA_ACCESS_TOKEN', 'WA_VERIFY_TOKEN', 'WA_APP_SECRET');
   if (orchestration === 'n8n') required.push('N8N_AGENT_TOKEN');
-  if (paymentMode === 'mercado_pago') required.push('MP_TEST_ACCESS_TOKEN', 'MP_TEST_SELLER_ID', 'MP_WEBHOOK_SECRET');
+  if (paymentMode === 'mercado_pago') required.push('MP_TEST_ACCESS_TOKEN', 'MP_TEST_SELLER_ID', 'MP_TEST_BUYER_ID', 'MP_WEBHOOK_SECRET');
   if (env.SUPABASE_URL || env.SUPABASE_SECRET_KEY || remote) required.push('SUPABASE_URL', 'SUPABASE_SECRET_KEY');
   const missing = required.filter(key => !env[key]);
   if (missing.length) throw new Error('Falta configurar ' + missing.join(', '));
   if (!['local', 'mercado_pago'].includes(paymentMode) || !['off', 'cloud'].includes(waMode)) throw new Error('Revisa PAYMENT_MODE y WHATSAPP_MODE.');
+  if (paymentMode === 'mercado_pago' && !/^\d{1,20}$/.test(env.MP_TEST_BUYER_ID)) throw new Error('MP_TEST_BUYER_ID debe ser el ID numérico del comprador de prueba.');
   if (!['server', 'n8n'].includes(orchestration) || (orchestration === 'n8n' && env.N8N_AGENT_TOKEN.length < 32)) throw new Error('Configura el modo de agente y un token n8n de al menos 32 caracteres.');
   if (publicUrl && (!/^https:\/\//.test(publicUrl) || new URL(publicUrl).origin !== publicUrl)) throw new Error('PUBLIC_URL debe ser el origen HTTPS público, sin ruta.');
   if (env.N8N_WAKE_URL && new URL(env.N8N_WAKE_URL).protocol !== 'https:') throw new Error('N8N_WAKE_URL debe usar HTTPS.');

@@ -65,11 +65,27 @@ function PublicPage({ type, token }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [returnPaymentId, setReturnPaymentId] = useState(() => {
+    if (type !== 'payment') return '';
+    const query = new URLSearchParams(location.search);
+    const value = query.get('payment_id') || query.get('collection_id') || '';
+    return /^\d{1,30}$/.test(value) ? value : '';
+  });
   const path = type + '/' + token;
   const refresh = useCallback(async () => {
-    try { setData(await api(path)); setError(''); }
+    const paymentId = returnPaymentId;
+    if (paymentId) {
+      // Process Mercado Pago's return parameters once; the 4.5s status polling
+      // must use the clean URL and must not replay a rejected reconciliation.
+      setReturnPaymentId('');
+      history.replaceState(null, '', location.pathname);
+    }
+    try {
+      const query = paymentId ? '?payment_id=' + encodeURIComponent(paymentId) : '';
+      setData(await api(path + query)); setError('');
+    }
     catch (e) { setError(e.message); }
-  }, [path]);
+  }, [path, returnPaymentId]);
   useEffect(() => {
     refresh();
     if (type === 'payment') {
@@ -89,7 +105,8 @@ function PublicPage({ type, token }) {
     {!data && !error && <p role="status">Consultando el estado…</p>}
     {data && type === 'payment' && <>
       <div className="public-amount"><small>IMPORTE DEL ANTICIPO</small><strong>{money(data.amount)}</strong></div>
-      {data.status === 'approved' ? <div className="closed-note"><CheckCircle2 size={21} /><span><strong>Anticipo verificado</strong><small>La operación de prueba se registró en PAYERS.</small></span></div>
+      {data.status === 'approved' && data.requiresReview ? <div className="inline-note">Mercado Pago verificó el pago, pero la reserva requiere revisión por el plazo vencido. El restaurante confirmará la disponibilidad.</div>
+        : data.status === 'approved' ? <div className="closed-note"><CheckCircle2 size={21} /><span><strong>Anticipo verificado</strong><small>La operación de prueba se registró en PAYERS.</small></span></div>
         : data.status === 'rejected' ? <p className="error">El pago de prueba fue rechazado. Solicita un nuevo enlace.</p>
         : data.status === 'refunded' || data.status === 'charged_back' ? <p className="inline-note">La operación fue revertida. Consulta a caja.</p>
         : !data.usable ? <p className="inline-note">Este enlace está vencido o la reserva cambió. Consulta al restaurante.</p>
@@ -104,13 +121,19 @@ function PublicPage({ type, token }) {
         </>}
     </>}
     {data && type === 'receipt' && <>
-      <div className="receipt-type">{data.purpose === 'deposit' ? 'Anticipo de reserva' : 'Liquidación de pedido'} · {data.number}</div>
+      <div className="receipt-type">Constancia interna · {data.purpose === 'deposit' ? 'Anticipo de reserva' : 'Liquidación de pedido'} · {data.number}</div>
       <dl className="public-receipt"><div><dt>Pagador</dt><dd>{data.payer}</dd></div><div><dt>Fecha de emisión</dt><dd>{visitText(data.at)}</dd></div>
         <div><dt>Importe {data.purpose === 'deposit' ? 'del anticipo' : 'del pedido'}</dt><dd>{money(data.amount)}</dd></div>
+        {data.mercadoPagoOperationId && <div><dt>Operación de Mercado Pago</dt><dd>{data.mercadoPagoOperationId}</dd></div>}
         {data.purpose === 'settlement' && <><div><dt>Anticipo aplicado</dt><dd>{money(data.appliedDeposit)}</dd></div>
           <div><dt>Saldo pagado en el local</dt><dd>{money(data.total - data.appliedDeposit)}</dd></div></>}</dl>
       <p className="inline-note">Constancia de demostración. Sin validez tributaria.</p>
-      <button className="button primary print-hide" onClick={() => window.print()}><Printer size={17} /> Imprimir o guardar PDF</button>
+      <div className="button-row">
+        {data.mercadoPagoReceiptUrl && <a className="button outline print-hide" href={data.mercadoPagoReceiptUrl} target="_blank" rel="noopener noreferrer">
+          <ExternalLink size={17} /> Ver comprobante en Mercado Pago</a>}
+        <button className="button primary print-hide" onClick={() => window.print()}><Printer size={17} /> Imprimir constancia interna</button>
+      </div>
+      {data.mercadoPagoReceiptUrl && <p className="receipt-help">Mercado Pago puede pedirte iniciar sesión con la cuenta compradora que hizo el pago.</p>}
     </>}
     {type === 'payment' && <button className="text-button refresh" onClick={refresh}><RefreshCw size={15} /> Actualizar estado</button>}
   </main></div>;

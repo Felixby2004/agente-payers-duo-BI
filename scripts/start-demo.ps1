@@ -509,6 +509,26 @@ try {
   if ($orchestration -ne 'server' -and $orchestration -ne 'n8n') {
     throw 'AGENT_ORCHESTRATION debe ser server o n8n.'
   }
+  $n8nPort = 5678
+  if ($environment.ContainsKey('N8N_PORT') -and $environment['N8N_PORT']) {
+    $configuredN8nPort = 0
+    $n8nPortParsed = [int]::TryParse([string]$environment['N8N_PORT'], [ref]$configuredN8nPort)
+    if (-not $n8nPortParsed -or $configuredN8nPort -lt 1024 -or $configuredN8nPort -gt 65535) {
+      throw 'N8N_PORT debe ser un puerto numérico entre 1024 y 65535.'
+    }
+    $n8nPort = $configuredN8nPort
+  }
+  $n8nOrigin = 'http://127.0.0.1:{0}' -f $n8nPort
+  $n8nBrokerPort = 5679
+  if ($environment.ContainsKey('N8N_RUNNERS_BROKER_PORT') -and $environment['N8N_RUNNERS_BROKER_PORT']) {
+    $configuredBrokerPort = 0
+    $brokerPortParsed = [int]::TryParse([string]$environment['N8N_RUNNERS_BROKER_PORT'], [ref]$configuredBrokerPort)
+    if (-not $brokerPortParsed -or $configuredBrokerPort -lt 1024 -or $configuredBrokerPort -gt 65535) {
+      throw 'N8N_RUNNERS_BROKER_PORT debe ser un puerto numérico entre 1024 y 65535.'
+    }
+    $n8nBrokerPort = $configuredBrokerPort
+  }
+  if ($n8nPort -eq $n8nBrokerPort) { throw 'N8N_PORT y N8N_RUNNERS_BROKER_PORT deben ser distintos.' }
   $n8nCommand = $null
   $cloudflaredPath = $null
   if (-not $RestartServer) {
@@ -561,13 +581,13 @@ try {
       Write-Host '2. Omitiría la compilación porque dist/index.html ya existe.'
     }
     if ($orchestration -eq 'n8n') {
-      Write-Host '3. Iniciaría n8n en segundo plano y esperaría http://localhost:5678/healthz (90 s).'
+      Write-Host ('3. Iniciaría n8n en segundo plano y esperaría {0}/healthz (90 s).' -f $n8nOrigin)
     } else {
       Write-Host '3. Omitiría n8n porque AGENT_ORCHESTRATION=server.'
     }
     Write-Host '4. Iniciaría cloudflared hacia http://127.0.0.1:5173 y leería su stderr (60 s).'
     if ($orchestration -eq 'n8n') {
-      Write-Host '5. Iniciaría el segundo túnel hacia http://localhost:5678.'
+      Write-Host ('5. Iniciaría el segundo túnel hacia {0}.' -f $n8nOrigin)
     } else {
       Write-Host '5. Omitiría el segundo túnel y dejaría N8N_WAKE_URL vacía.'
     }
@@ -677,10 +697,12 @@ try {
   }
 
   if ($orchestration -eq 'n8n') {
+    $env:N8N_PORT = [string]$n8nPort
+    $env:N8N_RUNNERS_BROKER_PORT = [string]$n8nBrokerPort
     $n8nProcess = Start-DemoProcess -Name 'n8n' -Executable $n8nCommand.Source `
       -Arguments @('start') -StdoutPath (Join-Path $script:DemoDirectory 'n8n.out.log') `
       -StderrPath (Join-Path $script:DemoDirectory 'n8n.err.log')
-    Wait-DemoHttp -Uri 'http://localhost:5678/healthz' -TimeoutSeconds 90 -ServiceName 'n8n'
+    Wait-DemoHttp -Uri ($n8nOrigin + '/healthz') -TimeoutSeconds 90 -ServiceName 'n8n'
   }
 
   $panelTunnel = Start-DemoProcess -Name 'cloudflared túnel del panel' -Executable $cloudflaredPath `
@@ -695,7 +717,7 @@ try {
   $n8nTunnelUrl = ''
   if ($orchestration -eq 'n8n') {
     $n8nTunnel = Start-DemoProcess -Name 'cloudflared túnel de n8n' -Executable $cloudflaredPath `
-      -Arguments @('tunnel', '--url', 'http://localhost:5678') `
+      -Arguments @('tunnel', '--url', $n8nOrigin) `
       -StdoutPath (Join-Path $script:DemoDirectory 'n8n-tunnel.out.log') `
       -StderrPath (Join-Path $script:DemoDirectory 'n8n-tunnel.err.log')
     $n8nTunnelUrl = Wait-DemoTunnel -Process $n8nTunnel `
@@ -780,6 +802,13 @@ try {
   Write-Host 'Token de verificación: usa el valor de WA_VERIFY_TOKEN de tu .env (no se imprime aquí).'
   Write-Host 'Pulsa “Verificar y guardar” y comprueba que el campo “messages” siga en “Suscritos”.'
   Write-Host 'Si no actualizas la URL en Meta, los mensajes de WhatsApp no llegarán.'
+  if ($environment['PAYMENT_MODE'] -eq 'mercado_pago') {
+    Write-Host ''
+    Write-Host 'WEBHOOK DE PAGOS DE MERCADO PAGO (MODO DE PRUEBA)'
+    Write-Host ('URL: {0}/api/webhooks/mercado-pago' -f $panelUrl)
+    Write-Host 'En Tus integraciones → tu aplicación → Webhooks, actualiza la URL de prueba y deja activo el evento Pagos.'
+    Write-Host 'La URL temporal cambia en cada inicio; actualízala antes de probar pagos.'
+  }
   Write-Host ''
   Write-Host ('Panel: {0}' -f $panelUrl)
   Write-Host ('Logs del servidor: {0} y {1}' -f $serverProcess.DemoStdoutPath, $serverProcess.DemoStderrPath)

@@ -72,6 +72,7 @@ La obligatoriedad de las variables se determina en `server/config.mjs`, función
 | `WA_RATE_LIMIT_MAX` | Opcional; predeterminado `20`. | Máximo de mensajes entrantes por número dentro de la ventana deslizante. Al superarlo se ignora el mensaje y se envía un solo aviso por ventana. | Se define en el entorno del servidor (entero mayor que 0). |
 | `WA_RATE_LIMIT_WINDOW_MS` | Opcional; predeterminado `600000` (10 minutos). | Duración de la ventana deslizante del límite de tasa, en milisegundos. | Se define en el entorno del servidor (mínimo 1000). |
 | `WA_TEMPLATE_DEPOSIT` | Opcional. | Nombre de la plantilla aprobada para iniciar un mensaje de anticipo. | Nombre de la plantilla aprobada en WhatsApp Manager. |
+| `WA_TEMPLATE_PAYMENT_REJECTED` | Opcional. | Nombre de la plantilla aprobada para avisar un rechazo y permitir reintentar el anticipo fuera de la ventana de 24 horas. | Plantilla con pagador, referencia e importe, más botón URL dinámico hacia el pago. |
 | `WA_TEMPLATE_VISIT` | Opcional. | Nombre de la plantilla aprobada para recordatorio de visita. | Nombre de la plantilla aprobada en WhatsApp Manager. |
 | `WA_TEMPLATE_CONFIRMATION` | Opcional. | Nombre de la plantilla aprobada para confirmación del anticipo. | Nombre de la plantilla aprobada en WhatsApp Manager. |
 | `WA_TEMPLATE_SETTLEMENT` | Opcional. | Nombre de la plantilla de liquidación/constancia final. | Nombre de la plantilla aprobada en WhatsApp Manager. |
@@ -82,6 +83,8 @@ La obligatoriedad de las variables se determina en `server/config.mjs`, función
 | `N8N_WAKE_URL` | Opcional; si se configura debe ser HTTPS. | URL Production del webhook de n8n que puede despertar el workflow cuando entra una cola nueva. | Nodo **Despertar por WhatsApp** de n8n. |
 
 Los nombres `WA_TEMPLATE_*` deben corresponder a plantillas aprobadas y a los parámetros que construye el servidor. Tener configurado un nombre no demuestra que Meta haya aprobado esa plantilla; la aprobación debe verificarse en Meta.
+
+Los avisos automáticos se agrupan por teléfono: si hay varios anticipos pendientes, durante una ventana activa se envía una sola lista de selección; fuera de la ventana, se envía como máximo un recordatorio de anticipo aprobado por ciclo. Al pedir el pago manualmente o responder al agente, se genera un único botón de pago. Si el pago es rechazado, el agente ofrece reintentar durante la ventana; fuera de ella requiere `WA_TEMPLATE_PAYMENT_REJECTED`.
 
 ## 4. Flujo del webhook
 
@@ -205,6 +208,7 @@ Dentro de la ventana, `sendWhatsApp` acepta un string (texto plano, como antes) 
 | Plantilla | Variables de cuerpo, en orden | Botón dinámico |
 |---|---|---|
 | Anticipo (`WA_TEMPLATE_DEPOSIT`) | Pagador, referencia, importe del anticipo | Índice 0: URL de pago con el identificador de intento. |
+| Pago rechazado (`WA_TEMPLATE_PAYMENT_REJECTED`) | Pagador, referencia, importe del anticipo | Índice 0: URL de reintento con el identificador del nuevo intento. |
 | Visita (`WA_TEMPLATE_VISIT`) | Pagador, referencia, fecha/hora de visita, saldo | Ninguno. |
 | Confirmación (`WA_TEMPLATE_CONFIRMATION`) | Pagador, referencia, fecha/hora de visita, saldo | Ninguno. |
 | Liquidación (`WA_TEMPLATE_SETTLEMENT`) | Pagador, referencia, importe total | Índice 0: URL de constancia con el token de la constancia. |
@@ -249,6 +253,8 @@ El idioma se toma de `WA_TEMPLATE_LANGUAGE` (predeterminado documentado en `.env
 7. **WABA.** Asegúrate de que la app correcta esté suscrita a la cuenta de WhatsApp Business (WABA); consulta el [paso crítico](#10-suscripción-crítica-de-la-waba).
 8. **n8n.** Importa `n8n/Establo-PAYERS.json`; en **API del restaurante** reemplaza el marcador por el origen HTTPS. Configura la credencial Header Auth para enviar el encabezado `Authorization` con `Bearer`, un espacio y el token interno que configuraste. Asígnala a los nodos correspondientes, configura `AGENT_ORCHESTRATION=n8n` y el mismo token en `.env`, y activa/publica el workflow.
 9. **Prueba.** Desde un número de prueba escribe **hola**. Si no tiene reservas, verás el aviso de cobranza y el botón **Hablar con alguien**; pulsa el botón y confirma que la consulta aparece en **Conexiones → Consultas sin reserva**. Si tiene una reserva, se mantiene el menú o la lista. Prueba también **stop**, **alta**, una referencia `EST-XXXXXXXX` válida y otra ajena. Confirma la recepción en el panel y la actividad de n8n. No uses datos de clientes reales para la demo.
+
+**Mercado Pago de prueba.** Con `PAYMENT_MODE=mercado_pago`, configura en la aplicación de Mercado Pago la URL de prueba `https://<TU_DOMINIO>/api/webhooks/mercado-pago` y activa el evento **Pagos**. `start-demo.ps1` muestra la URL vigente al iniciar. Como el túnel temporal cambia en cada ejecución, actualízala antes de probar pagos. PAYERS valida los webhooks, reconcilia preferencias pendientes periódicamente y vuelve a consultar el pago al recibir el retorno del checkout; si el pago queda sin conciliar, usa el número de operación en **Consultar pago**.
 
 Para analizar imágenes y audios, configura también `OPENAI_API_KEY` en el servidor. Es opcional para texto.
 
@@ -295,6 +301,7 @@ También comprueba que `metadata.phone_number_id` coincida con `WA_PHONE_NUMBER_
 
 - **Token temporal:** renueva el token desde Meta antes de que venza, actualiza `WA_ACCESS_TOKEN` solo en el entorno del servidor y reinicia Node. No lo incluyas en el workflow ni en tickets.
 - **Cambio de túnel:** cuando la dirección temporal cambie, actualiza `PUBLIC_URL`, el origen en el nodo **API del restaurante** de n8n y la URL callback en Meta; reinicia Node y vuelve a validar el webhook. Mantén el túnel y el servidor activos. (`n8n/Activacion.md`.)
+- **Cambio de túnel con Mercado Pago:** actualiza también la URL de prueba del webhook de pagos en la aplicación de Mercado Pago. El túnel temporal no recibe notificaciones en su dirección anterior.
 - **Rotación de `N8N_AGENT_TOKEN`:** genera un token nuevo de al menos 32 caracteres, actualízalo en `.env` y en la credencial Header Auth de n8n; reinicia Node y prueba el workflow. Durante el cambio, las llamadas con el token anterior dejarán de autenticarse.
 - **Rotación de Supabase:** crea/rota la credencial de servidor desde Supabase, actualiza `SUPABASE_SECRET_KEY` solo en el entorno del servidor y reinicia Node. El proyecto requiere URL y clave de servidor para el almacén remoto (`server/config.mjs`: `readConfig`; `README.md`). No la copies a n8n ni al navegador.
 - **Workflow:** confirma que esté activo y que use el origen HTTPS correcto. La URL de despertar puede reducir la espera, pero el workflow programado cada minuto es el disparador periódico.

@@ -58,7 +58,9 @@ export async function openStore(config, { memory = false } = {}) {
           .eq('id', id).eq('state', 'open').select('id').maybeSingle()));
       },
       async enqueue(rows) { if (rows.length) check(await jobs().upsert(rows, { onConflict: 'id', ignoreDuplicates: true })); },
-      async queued(limit) { return check(await jobs().select('id,kind,payload').eq('state', 'queued').order('queued_at').order('id').limit(limit)); },
+      // Los mensajes del cliente tienen prioridad frente a los recibos de entrega de Meta.
+      async queued(limit) { return check(await jobs().select('id,kind,payload').eq('state', 'queued')
+        .order('kind').order('queued_at').order('id').limit(limit)); },
       async claim(id) { return Boolean(check(await jobs().update({ state: 'processing', claimed_at: new Date().toISOString() })
         .eq('id', id).eq('state', 'queued').select('id').maybeSingle())); },
       async finishJob(id, state, error = null) { check(await jobs().update({ state, error, ...(state === 'done' ? { payload: {} } : {}) }).eq('id', id).eq('state', 'processing')); },
@@ -137,7 +139,7 @@ export async function openStore(config, { memory = false } = {}) {
       await db.query(`insert into payers_agent_jobs (id,kind,payload) select id,kind,payload
         from jsonb_to_recordset($1::jsonb) as x(id text,kind text,payload jsonb) on conflict (id) do nothing`, [JSON.stringify(rows)]);
     },
-    async queued(limit) { return (await db.query("select id,kind,payload from payers_agent_jobs where state='queued' order by queued_at,id limit $1", [limit])).rows; },
+    async queued(limit) { return (await db.query("select id,kind,payload from payers_agent_jobs where state='queued' order by case when kind='message' then 0 else 1 end,queued_at,id limit $1", [limit])).rows; },
     async claim(id) { return Boolean((await db.query("update payers_agent_jobs set state='processing', claimed_at=now() where id=$1 and state='queued' returning id", [id])).rows.length); },
     async finishJob(id, state, error = null) { await db.query("update payers_agent_jobs set state=$2,error=$3,payload=case when $2='done' then '{}'::jsonb else payload end where id=$1 and state='processing'", [id, state, error]); },
     async expireJobs(before) { await db.query("update payers_agent_jobs set state='failed',error='Ejecución interrumpida. Revisa el historial antes de responder.' where state='processing' and claimed_at<$1", [before]); },
