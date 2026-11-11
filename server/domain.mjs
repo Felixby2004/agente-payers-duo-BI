@@ -43,6 +43,7 @@ export function createOrder(input, config) {
     stage: 'awaiting_deposit', notes: String(input.notes || '').slice(0, 500),
     consent: Boolean(phone && input.consent), synthetic: Boolean(input.synthetic), events: [], intents: [],
     payments: [], receipts: [], incidents: [], chat: [], reminders: {}, attendance: null, closedAt: null,
+    rescheduleCount: 0,
   };
   addEvent(order, 'Pedido recibido de LEADS', 'Pedido acordado para atención en el restaurante.', 'Operador');
   return order;

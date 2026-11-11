@@ -86,9 +86,47 @@ export function parseAction(value) {
   if (id === 'menu') return { action: 'menu', ref: null };
   // Acción sin referencia para quien escribe sin una reserva registrada.
   if (id === 'staff') return { action: 'staff', ref: null };
+  const reschedule = id.match(/^(rsd|rst|rsc):(EST-[A-F0-9]{8}):(.+)$/i);
+  if (reschedule) {
+    const [, action, ref, value] = reschedule;
+    if ((action.toLowerCase() === 'rsd' && /^\d{4}-\d{2}-\d{2}$/.test(value))
+      || (/^(rst|rsc)$/i.test(action) && /^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d$/.test(value))) {
+      return { action: action.toLowerCase(), ref: ref.toUpperCase(), value };
+    }
+    return null;
+  }
+  const page = id.match(/^(rsm|rsh):(EST-[A-F0-9]{8}):(\d{4}-\d{2}-\d{2}|\d{1,4})(?::(\d{1,4}))?$/i);
+  if (page) return { action: page[1].toLowerCase(), ref: page[2].toUpperCase(), value: page[3], offset: Number(page[4] || (page[1].toLowerCase() === 'rsm' ? page[3] : 0)) };
   const match = id.match(/^([a-z]+):(EST-[A-F0-9]{8})$/i);
-  if (!match || !['pay', 'payb', 'yape', 'plin', 'bal', 'rcp', 'chg', 'hum', 'sel', 'selb'].includes(match[1].toLowerCase())) return null;
+  if (!match || !['pay', 'payb', 'yape', 'plin', 'bal', 'rcp', 'chg', 'hum', 'sel', 'selb', 'selc', 'rsx'].includes(match[1].toLowerCase())) return null;
   return { action: match[1].toLowerCase(), ref: match[2].toUpperCase() };
+}
+
+export function rescheduleDaysMessage(order, days, offset = 0) {
+  const page = days.slice(offset, offset + 9);
+  const rows = page.map(day => ({ id: `rsd:${order.ref}:${day.date}`, title: day.label,
+    description: day.slots.length + (day.slots.length === 1 ? ' horario disponible' : ' horarios disponibles') }));
+  if (offset + 9 < days.length) rows.push({ id: `rsm:${order.ref}:${offset + 9}`, title: 'Ver más fechas' });
+  return listMessage({ body: 'Elige una fecha para mover tu visita de *' + order.ref + '*.', button: 'Ver fechas', sections: [{ title: 'Fechas disponibles', rows }] });
+}
+
+export function rescheduleTimesMessage(order, day, offset = 0) {
+  const pageSize = offset + 9 < day.slots.length ? 8 : 9;
+  const page = day.slots.slice(offset, offset + pageSize);
+  const rows = page.map(slot => ({ id: `rst:${order.ref}:${slot.date}T${slot.time}`, title: slot.time, description: 'Cupo disponible' }));
+  if (offset + pageSize < day.slots.length) rows.push({ id: `rsh:${order.ref}:${day.date}:${offset + pageSize}`, title: 'Ver más horarios' });
+  rows.push({ id: `rsm:${order.ref}:0`, title: 'Elegir otro día' });
+  return listMessage({ body: 'Horarios disponibles para ' + day.label + '.', button: 'Ver horarios', sections: [{ title: 'Horarios', rows }] });
+}
+
+export function rescheduleConfirmMessage(order, newVisitAt, now = new Date()) {
+  const current = friendlyDate(order.visitAt, now, true), next = friendlyDate(newVisitAt, now, true);
+  const lima = new Date(+new Date(newVisitAt) - 5 * 60 * 60 * 1000);
+  const value = lima.getUTCFullYear() + '-' + String(lima.getUTCMonth() + 1).padStart(2, '0') + '-'
+    + String(lima.getUTCDate()).padStart(2, '0') + 'T' + String(lima.getUTCHours()).padStart(2, '0') + ':'
+    + String(lima.getUTCMinutes()).padStart(2, '0');
+  return buttonsMessage('¿Confirmas el cambio de fecha?\nReserva: *' + order.ref + '*\nActual: ' + current + '\nNueva: *' + next + '*',
+    [button(`rsc:${order.ref}:${value}`, 'Confirmar'), button('rsx:' + order.ref, 'Cancelar')]);
 }
 
 export const texts = Object.freeze({
@@ -335,7 +373,7 @@ export function reservationMenu(order, now = new Date()) {
         + '\nImporte: *' + money(depositDue(order)) + '*';
     return buttonsMessage(text, expired
       ? [button('hum:' + order.ref, 'Hablar con alguien')]
-      : [button('pay:' + order.ref, 'Pagar anticipo'), button('bal:' + order.ref, 'Ver saldo'),
+      : [button('pay:' + order.ref, 'Pagar anticipo'), button('chg:' + order.ref, 'Cambiar fecha'),
         button('hum:' + order.ref, 'Hablar con alguien')]);
   }
   const text = emojis.visit + ' *Reserva confirmada*\nReferencia: *' + order.ref + '*\nVisita: ' + date + ' · ' + people
@@ -465,7 +503,7 @@ export function receiptCta(order, url, summary = '') {
 
 export function confirmationCta(order, url, now = new Date(), additional = '') {
   const payment = [...(order.payments || [])].reverse().find(item => (item.purpose || 'deposit') === 'deposit' && item.amount > 0);
-  const method = payment ? (payment.channel === 'mercadopago' ? 'Mercado Pago' : payment.channel.replace('_demo', '')) : 'verificado';
+  const method = payment ? (payment.channel === 'mercadopago' ? 'Mercado Pago' : String(payment.channel || 'verificado').replace('_demo', '')) : 'verificado';
   return ctaMessage(emojis.verified + ' *Anticipo verificado*\nReserva: *' + order.ref + '*\nVisita: '
     + friendlyDate(order.visitAt, now, true) + '\nTotal: ' + money(order.total) + ' · Anticipo: *' + money(payment?.amount || order.deposit)
     + '* (' + method + (payment ? ' · ' + friendlyDate(payment.at, now, true) : '') + ')\nSaldo pendiente: *' + money(balance(order)) + '*.'

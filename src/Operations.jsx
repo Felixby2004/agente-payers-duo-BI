@@ -35,6 +35,7 @@ export function Register({ config, created, notify }) {
   const [product, setProduct] = useState('0');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [forceCapacity, setForceCapacity] = useState(false);
   const results = samples.filter(x => normalize(x.payer + ' ' + x.notes).includes(normalize(query)));
   const set = (name, value) => setForm(current => ({ ...current, [name]: value }));
   const total = form.items.reduce((sum, i) => sum + i.quantity * i.price, 0);
@@ -52,7 +53,7 @@ export function Register({ config, created, notify }) {
     }
     setBusy(true);
     try {
-      const order = await api('orders', { ...form, visitAt: fromLima(form.visit) });
+      const order = await api('orders', { ...form, forceCapacity, visitAt: fromLima(form.visit) });
       notify(order.ref + ' registrada en PAYERS.');
       created(order);
     } catch (e) { setError(e.message); }
@@ -113,6 +114,7 @@ export function Register({ config, created, notify }) {
           <div className="summary-total"><dt>Saldo en el local</dt><dd>{money(Math.max(total - deposit, 0))}</dd></div></dl>
         {form.synthetic && <p className="inline-note">Caso ficticio. Agrega tu propio número autorizado para la prueba por WhatsApp.</p>}
         <label className="check"><input type="checkbox" checked={form.agreed} onChange={e => set('agreed', e.target.checked)} /> El pedido, el total y la visita ya fueron acordados.</label>
+        <label className="check"><input type="checkbox" checked={forceCapacity} onChange={e => setForceCapacity(e.target.checked)} /> Permitir exceder el aforo de esta franja (solo personal)</label>
         {error && <p className="error" role="alert">{error}</p>}
         <button type="button" className="button outline full" onClick={copyTemplate}><Copy size={16} /> Copiar plantilla de reserva</button>
         <button type="submit" className="button primary full" disabled={busy}>{busy ? 'Registrando…' : 'Registrar en PAYERS'} <ArrowRight size={17} /></button>
@@ -144,11 +146,14 @@ export function Detail({ order, config, close, reload, notify }) {
   const [tab, setTab] = useState('gestión');
   const [count, setCount] = useState(order.guests);
   const [channel, setChannel] = useState('cash');
-  const [date, setDate] = useState(localDateInput(order.visitAt));
+  const [rescheduleDay, setRescheduleDay] = useState(localDateInput(order.visitAt).slice(0, 10));
+  const [rescheduleTime, setRescheduleTime] = useState('');
+  const [rescheduleChoices, setRescheduleChoices] = useState([]);
   const [reason, setReason] = useState('');
   const [note, setNote] = useState('');
   const [paymentId, setPaymentId] = useState('');
   const [depositMethod, setDepositMethod] = useState('checkout');
+  const [forceReschedule, setForceReschedule] = useState(false);
   const box = useRef(null);
   useEffect(() => {
     const old = document.activeElement;
@@ -168,6 +173,17 @@ export function Detail({ order, config, close, reload, notify }) {
     document.addEventListener('keydown', key);
     return () => { document.body.style.overflow = previous; document.removeEventListener('keydown', key); old?.focus(); };
   }, [order.id]);
+  useEffect(() => {
+    let alive = true;
+    api('availability?date=' + encodeURIComponent(rescheduleDay) + '&guests=' + order.guests).then(data => {
+      if (!alive) return;
+      const candidates = forceReschedule ? data.slots.filter(slot => !slot.blocked)
+        : data.available || [];
+      setRescheduleChoices(candidates);
+      if (!candidates.some(slot => slot.time === rescheduleTime)) setRescheduleTime(candidates[0]?.time || '');
+    }).catch(() => { if (alive) { setRescheduleChoices([]); setRescheduleTime(''); } });
+    return () => { alive = false; };
+  }, [rescheduleDay, rescheduleTime, forceReschedule, order.guests]);
   const activeLink = order.intents.filter(i => (i.method || 'checkout') === depositMethod && i.status === 'pending' && i.expiresAt === order.deadline
     && (i.mode === 'local' || i.checkoutUrl) && +new Date(i.expiresAt) > Date.now()).at(-1);
   const balanceIntent = order.intents.filter(i => (i.purpose || 'deposit') === 'balance').at(-1);
@@ -251,8 +267,13 @@ export function Detail({ order, config, close, reload, notify }) {
             {pendingIssues.map(issue => <div className="issue-line" key={issue.id}><div><strong>{issue.type}</strong><small>{issue.detail}</small></div>
               <button className="button outline" disabled={Boolean(busy) || note.trim().length < 3} onClick={() => run('resolve', { id: issue.id, note }, 'Incidencia resuelta.')}>Resolver</button></div>)}</section>}
           {beforeVisit && <details className="action-panel"><summary>Reprogramar o cancelar</summary>
-            <div className="action-line"><label>Nueva fecha y hora<input type="datetime-local" value={date} onChange={e => setDate(e.target.value)} /></label>
-              <button className="button outline" disabled={Boolean(busy) || !date} onClick={() => run('reschedule', { visitAt: fromLima(date) }, 'Visita reprogramada.')}>Guardar cambio</button></div>
+            <div className="action-line"><label>Nueva fecha<input type="date" value={rescheduleDay} onChange={e => setRescheduleDay(e.target.value)} /></label>
+              <label>Horario<select value={rescheduleTime} onChange={e => setRescheduleTime(e.target.value)}>
+                {!rescheduleChoices.length && <option value="">Sin franjas posibles</option>}
+                {rescheduleChoices.map(slot => <option key={slot.time} value={slot.time}>{slot.time}{forceReschedule && slot.occupied + order.guests > slot.capacity ? ' · Aforo completo (forzar)' : ''}</option>)}
+              </select></label>
+              <button className="button outline" disabled={Boolean(busy) || !rescheduleTime} onClick={() => run('reschedule', { visitAt: fromLima(rescheduleDay + 'T' + rescheduleTime), forceCapacity: forceReschedule }, 'Visita reprogramada.')}>Guardar cambio</button></div>
+            <label className="check"><input type="checkbox" checked={forceReschedule} onChange={e => setForceReschedule(e.target.checked)} /> Permitir exceder el aforo (solo personal)</label>
             <label>Motivo<input value={reason} onChange={e => setReason(e.target.value)} placeholder="Motivo de cancelación o inasistencia" /></label>
             <div className="button-row"><button className="button outline danger" disabled={Boolean(busy) || reason.trim().length < 3} onClick={() => run('cancel', { reason }, 'Reserva cancelada.')}>Cancelar reserva</button>
               {order.stage === 'confirmed' && +new Date(order.visitAt) + config.graceMinutes * 60000 <= Date.now()

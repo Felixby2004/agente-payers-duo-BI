@@ -7,8 +7,10 @@ import { contactTime, defaults, validateSettings } from './agent-settings.mjs';
 import { balance, depositDue, money, terminal, stageLabels } from '../shared/orders.mjs';
 import { displayText, emojis, friendlyDate, parseAction, reservationFocus, reservationMenu, reservationPrompt, reservationList,
   paymentCta, balancePaymentCta, paymentRejectedCta, receiptCta, confirmationCta, requestMessage, noReservationMessage, reservationHelpMessage,
-  reservationRequest, parseReservation, reservationKey, reservationConfirmation, reservationRepeatedMessage, texts } from './interactive.mjs';
+  reservationRequest, parseReservation, reservationKey, reservationConfirmation, reservationRepeatedMessage, rescheduleDaysMessage,
+  rescheduleTimesMessage, rescheduleConfirmMessage, texts } from './interactive.mjs';
 import { Problem, requireThat, createOrder, addEvent, openIssue, applyPayment, arrive, recordCounterPayment, issueReceipt, reschedule, endReservation, digits } from './domain.mjs';
+import { checkRescheduleEligibility, getAvailableSlots, getDayOccupancy, isSlotBlocked, limaDateKey, limaDateTime, validateSlotInput } from './availability.mjs';
 
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const instant = () => new Date().toISOString();
@@ -89,6 +91,24 @@ export async function makeApi(env, options = {}) {
   const update = (id, apply) => updateOrder(store, id, apply);
   const linkFor = (intent) => config.publicUrl + '/pago/' + intent.id;
   const receiptLink = (receipt) => config.publicUrl + '/comprobante/' + receipt.token;
+  const datePlus = (key, days) => new Date(+new Date(key + 'T12:00:00Z') + days * 86400000).toISOString().slice(0, 10);
+  async function availableDays({ fromDate = limaDateKey(new Date()), toDate, guests = 1, excludeOrderId = null } = {}) {
+    const rule = await settings();
+    const endDate = toDate || datePlus(fromDate, rule.offerWindowDays);
+    const [orders, blocks] = await Promise.all([store.list(), store.availabilityBlocks(fromDate, endDate)]);
+    return { rule, days: getAvailableSlots({ orders, blocks, settings: rule, fromDate, toDate: endDate, guests, excludeOrderId }) };
+  }
+  async function ensureAvailable(visitAt, guests, excludeOrderId = null, rule = null, forceCapacity = false) {
+    const setting = rule || await settings();
+    validateSlotInput(visitAt, setting);
+    const key = limaDateKey(visitAt);
+    const blocks = await store.availabilityBlocks(key, key);
+    requireThat(!isSlotBlocked(blocks, visitAt, setting), 'Ese horario está bloqueado. Elige otra opción.', 409);
+    const { days } = await availableDays({ fromDate: key, toDate: key, guests, excludeOrderId });
+    const exact = days.flatMap(day => day.slots).some(slot => +new Date(slot.visitAt) === +new Date(visitAt));
+    requireThat(exact || forceCapacity, 'Ese horario no tiene cupo suficiente o está bloqueado.', 409);
+    return exact;
+  }
   function lock(id, execute) {
     const previous = locks.get(id) || Promise.resolve();
     const next = previous.catch(() => {}).then(execute);
@@ -298,10 +318,12 @@ export async function makeApi(env, options = {}) {
       order.events = order.events.filter(event => event.title !== 'Pedido recibido de LEADS');
       addEvent(order, 'Pedido recibido por WhatsApp', operator
         ? 'Alta de operador mediante mensaje estructurado.' : 'Alta de cliente mediante mensaje estructurado.',
-      operator ? 'Operador' : 'Cliente');
+          operator ? 'Operador' : 'Cliente');
       addEvent(order, 'Origen: ' + (operator ? 'operador' : 'cliente'), '', operator ? 'Operador' : 'Cliente');
       order.chat.push({ id: messageId, direction: 'in', from: phone, at: new Date(timestamp).toISOString(),
         text: String(text || '').slice(0, 1000) });
+      try { await ensureAvailable(order.visitAt, order.guests, null, rule); }
+      catch (error) { return refuse('No se registró la reserva porque no hay disponibilidad para ese horario.'); }
       await store.insert(order);
 
       let intent = null;
@@ -592,6 +614,76 @@ export async function makeApi(env, options = {}) {
       default: return reservationMenu(order);
     }
   }
+  async function startReschedule(order, action, phone) {
+    const rule = await settings();
+    try { checkRescheduleEligibility(order, rule, phone); }
+    catch (error) {
+      await update(order.id, data => openIssue(data, 'Solicitud de reprogramación', error.message, 'reschedule:' + order.ref));
+      return { response: '📅 No puedo reprogramar esta reserva: ' + error.message + ' Ya avisé al personal.' };
+    }
+    const today = limaDateKey(new Date());
+    const { days } = await availableDays({ fromDate: today, toDate: datePlus(today, rule.offerWindowDays), guests: order.guests, excludeOrderId: order.id });
+    if (!days.length) {
+      await update(order.id, data => openIssue(data, 'Sin disponibilidad para reprogramar', 'No se encontró un horario con cupo dentro de la ventana configurada.', 'reschedule-no-slots'));
+      return { response: 'No hay horarios disponibles dentro de los próximos ' + rule.offerWindowDays + ' días. Ya avisé al personal.' };
+    }
+    return { response: rescheduleDaysMessage(order, days, action?.action === 'rsm' ? action.offset : 0) };
+  }
+
+  async function rescheduleReply(order, action, phone) {
+    const rule = await settings();
+    if (action.action === 'rsx') return { response: reservationMenu(order) };
+    if (action.action === 'rsc') {
+      const proposed = limaDateTime(action.value.slice(0, 10), action.value.slice(11));
+      if (+new Date(order.visitAt) === +new Date(proposed)) return { response: 'La visita ya figura en ese horario.', order };
+    }
+    if (['rsd', 'rsh', 'rst', 'rsc'].includes(action.action)) {
+      const date = action.value.slice(0, 10), today = limaDateKey(new Date());
+      if (date < today || date > datePlus(today, rule.offerWindowDays)) return startReschedule(order, null, phone);
+    }
+    if (action.action === 'chg' || action.action === 'selc') return startReschedule(order, null, phone);
+    try { checkRescheduleEligibility(order, rule, phone); }
+    catch (error) {
+      await update(order.id, data => openIssue(data, 'Solicitud de reprogramación', error.message, 'reschedule:' + order.ref));
+      return { response: '📅 No puedo reprogramar esta reserva: ' + error.message + ' Ya avisé al personal.' };
+    }
+    if (action.action === 'rsm') return startReschedule(order, action, phone);
+    if (action.action === 'rsd') {
+      const { days } = await availableDays({ fromDate: action.value, toDate: action.value, guests: order.guests, excludeOrderId: order.id });
+      if (!days[0]) return startReschedule(order, null, phone);
+      return { response: rescheduleTimesMessage(order, days[0], 0) };
+    }
+    if (action.action === 'rsh') {
+      const { days } = await availableDays({ fromDate: action.value, toDate: action.value, guests: order.guests, excludeOrderId: order.id });
+      const day = days[0];
+      if (!day) return startReschedule(order, null, phone);
+      return { response: rescheduleTimesMessage(order, day, action.offset) };
+    }
+    if (action.action === 'rst') {
+      const visitAt = limaDateTime(action.value.slice(0, 10), action.value.slice(11));
+      const { days } = await availableDays({ fromDate: action.value.slice(0, 10), toDate: action.value.slice(0, 10), guests: order.guests, excludeOrderId: order.id });
+      const slot = days.flatMap(day => day.slots).find(item => +new Date(item.visitAt) === +new Date(visitAt));
+      if (!slot) return startReschedule(order, null, phone);
+      return { response: rescheduleConfirmMessage(order, visitAt) };
+    }
+    if (action.action === 'rsc') {
+      const visitAt = limaDateTime(action.value.slice(0, 10), action.value.slice(11));
+      try {
+        checkRescheduleEligibility(order, rule, phone);
+        await ensureAvailable(visitAt, order.guests, order.id, rule);
+        const saved = await store.rescheduleAtomic(order.id, visitAt, rule, false, 'Cliente', order.visitAt);
+        const moved = saved.data || saved.order?.data || saved.order || saved;
+        return { response: '✅ *Visita reprogramada*\nReserva: *' + moved.ref + '*\nNueva fecha: *'
+          + friendlyDate(moved.visitAt, new Date(), true) + '*', order: moved };
+      } catch (error) {
+        const current = (await store.get(order.id))?.data || order;
+        await update(order.id, data => openIssue(data, 'Reprogramación no completada', error.message, 'reschedule-conflict:' + action.value));
+        return { response: 'Ese horario dejó de estar disponible. Actualizo las opciones para que elijas otro.', next: await startReschedule(current, null, phone) };
+      }
+    }
+    return { response: reservationMenu(order) };
+  }
+
   async function actionReply(order, action) {
     const forced = { pay: { intent: 'link', method: 'checkout' }, yape: { intent: 'link', method: 'yape' },
       plin: { intent: 'link', method: 'plin' }, bal: { intent: 'balance' }, rcp: { intent: 'receipt' },
@@ -708,7 +800,17 @@ export async function makeApi(env, options = {}) {
     let recipient = target || order;
     try {
       let response;
-      if (action?.action === 'payb' || action?.action === 'selb') {
+      const exactChange = new Set(['reprogramar', 'cambiar fecha']).has(command);
+      const inChangeFlow = ['chg', 'selc', 'rsd', 'rsm', 'rsh', 'rst', 'rsc', 'rsx'].includes(action?.action);
+      if ((action?.action === 'chg' || (!action && exactChange)) && active.length > 1) {
+        response = reservationList(active, new Date(), 'selc');
+        recipient = reservationFocus(orders) || order;
+      } else if (inChangeFlow || (!action && exactChange)) {
+        const selected = target || reservationFocus(orders) || order;
+        recipient = selected;
+        const result = await rescheduleReply(selected, action || { action: 'chg' }, phone);
+        response = result.next?.response || result.response;
+      } else if (action?.action === 'payb' || action?.action === 'selb') {
         const selected = target || order;
         recipient = selected;
         await autoPayOrder(selected);
@@ -723,6 +825,9 @@ export async function makeApi(env, options = {}) {
       } else if (action && (action.action === 'menu' || (action.ref && !target))) {
         response = reservationPrompt(orders);
         recipient = reservationFocus(orders) || order;
+      } else if (action?.action === 'selc') {
+        response = target ? (await rescheduleReply(target, { action: 'selc' }, phone)).response : reservationPrompt(orders);
+        recipient = target || reservationFocus(orders) || order;
       } else if (action?.action === 'sel') {
         response = target ? reservationMenu(target) : reservationPrompt(orders);
         recipient = target || reservationFocus(orders) || order;
@@ -1156,6 +1261,43 @@ export async function makeApi(env, options = {}) {
       await store.saveSettings(next);
       return json(res, 200, next);
     }
+    if (path === '/api/availability' && isGet) {
+      const rule = await settings(), date = url.searchParams.get('date') || limaDateKey(new Date());
+      requireThat(/^\d{4}-\d{2}-\d{2}$/.test(date), 'Indica una fecha válida.');
+      const guests = Number(url.searchParams.get('guests') || 1);
+      requireThat(Number.isInteger(guests) && guests >= 1 && guests <= 40, 'La cantidad de personas no es válida.');
+      const [orders, blocks] = await Promise.all([store.list(), store.availabilityBlocks(date, date)]);
+      const occupancy = getDayOccupancy({ orders, blocks, settings: rule, date });
+      return json(res, 200, { ...occupancy, label: limaFormatDay(date), available: getAvailableSlots({ orders, blocks, settings: rule,
+        fromDate: date, toDate: date, guests }).flatMap(day => day.slots) });
+    }
+    if (path === '/api/availability/blocks' && isGet) return json(res, 200, await store.availabilityBlocks());
+    if (path === '/api/availability/blocks' && isPost) {
+      const input = parse(await readBody(req)), reason = String(input.reason || '').trim().slice(0, 240);
+      requireThat(['day', 'range', 'slot'].includes(input.kind) && /^\d{4}-\d{2}-\d{2}$/.test(input.local_date)
+        && reason.length >= 3, 'Completa el tipo, fecha y motivo del bloqueo.');
+      requireThat(limaDateKey(limaDateTime(input.local_date, '12:00')) === input.local_date, 'La fecha del bloqueo no es válida.');
+      let starts_at = null, ends_at = null;
+      if (input.kind !== 'day') {
+        requireThat(/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(input.startTime) && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(input.endTime)
+          && input.endTime > input.startTime, 'Indica un rango horario válido.');
+        starts_at = limaDateTime(input.local_date, input.startTime);
+        ends_at = limaDateTime(input.local_date, input.endTime);
+        if (input.kind === 'slot') {
+          const rule = await settings();
+          requireThat(+new Date(ends_at) - +new Date(starts_at) === rule.slotMinutes * 60000,
+            'El bloqueo de franja debe tener la duración configurada.');
+          validateSlotInput(starts_at, rule);
+        }
+      }
+      const block = await store.addAvailabilityBlock({ kind: input.kind, local_date: input.local_date, starts_at, ends_at, reason });
+      return json(res, 201, block);
+    }
+    const removeBlock = path.match(/^\/api\/availability\/blocks\/([a-f0-9-]+)$/);
+    if (removeBlock && isPost && uuid.test(removeBlock[1])) {
+      requireThat(await store.deleteAvailabilityBlock(removeBlock[1]), 'El bloqueo no existe.', 404);
+      return json(res, 200, { deleted: true });
+    }
     if (path === '/api/agent/activity' && isGet) return json(res, 200, await store.agentStatus());
     if (path === '/api/agent/queries' && isGet) return json(res, 200, await store.queries());
     const handledQuery = path.match(/^\/api\/agent\/queries\/([a-f0-9-]+)\/handled$/);
@@ -1167,7 +1309,10 @@ export async function makeApi(env, options = {}) {
     if (path === '/api/orders' && isGet) return json(res, 200, await store.list());
     if (path === '/api/orders' && isPost) {
       const rule = await settings();
-      return json(res, 201, await store.insert(createOrder(parse(await readBody(req)), { depositPerPerson: rule.depositPerPerson, deadlineMs: rule.deadlineMinutes * 60000 })));
+      const input = parse(await readBody(req)), order = createOrder(input, { depositPerPerson: rule.depositPerPerson, deadlineMs: rule.deadlineMinutes * 60000 });
+      const available = await ensureAvailable(order.visitAt, order.guests, null, rule, input.forceCapacity === true);
+      if (!available && input.forceCapacity) addEvent(order, 'Aforo excedido por personal', 'El operador forzó la reserva para esta franja.', 'Operador');
+      return json(res, 201, await store.insert(order));
     }
     const action = path.match(/^\/api\/orders\/([a-f0-9-]+)\/([a-z-]+)$/);
     if (action && isPost && uuid.test(action[1])) {
@@ -1235,6 +1380,25 @@ export async function makeApi(env, options = {}) {
           addEvent(data, 'Devolución de demostración registrada', payment.ref, 'Caja');
         }));
       }
+      if (kind === 'reschedule') {
+        const row = await store.get(id), order = row?.data;
+        requireThat(order, 'Reserva no encontrada.', 404);
+        const oldVisitAt = order.visitAt, rule = await settings(), force = input.forceCapacity === true;
+        const hasCapacity = await ensureAvailable(input.visitAt, order.guests, id, rule, force);
+        const saved = await store.rescheduleAtomic(id, new Date(input.visitAt).toISOString(), rule, force, 'Operador', oldVisitAt);
+        const moved = saved.data || saved.order?.data || saved.order || saved;
+        if (saved.changed !== false) {
+          const confirmation = '📅 *Visita reprogramada*\nReserva: *' + moved.ref + '*\nNueva fecha: *'
+            + friendlyDate(moved.visitAt, new Date(), true) + '*.';
+          try {
+            if (moved.phone) await send(moved, confirmation, { template: 'reschedule', templateValues: [moved.payer, moved.ref,
+              friendlyDate(oldVisitAt, new Date(), true), friendlyDate(moved.visitAt, new Date(), true)] });
+          } catch (error) {
+            await update(id, data => openIssue(data, 'Confirmación de reprogramación pendiente', error.message, 'reschedule-confirmation:' + moved.visitAt));
+          }
+        }
+        return json(res, 200, { order: (await store.get(id))?.data || moved, result: { changed: saved.changed !== false, forced: force && !hasCapacity } });
+      }
       const receiptToken = randomUUID();
       const rule = await settings();
       const result = await update(id, data => {
@@ -1249,7 +1413,6 @@ export async function makeApi(env, options = {}) {
           return payment;
         }
         if (kind === 'receipt') return issueReceipt(data, 'settlement', receiptToken);
-        if (kind === 'reschedule') return reschedule(data, input.visitAt);
         if (kind === 'renew') {
           requireThat(data.stage === 'awaiting_deposit' && depositDue(data) > 0 && new Date(data.deadline) <= new Date(),
             'Solo se renuevan anticipos pendientes y vencidos.');

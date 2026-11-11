@@ -17,6 +17,7 @@ export async function openStore(config, { memory = false } = {}) {
     const settings = () => client.from('payers_agent_settings');
     const contacts = () => client.from('payers_agent_contacts');
     const queries = () => client.from('payers_agent_queries');
+    const blocks = () => client.from('payers_availability_blocks');
     const check = ({ data, error }) => {
       if (error) throw new Problem('Error de acceso a Supabase. Comprueba las claves y aplica la migración.', 503);
       return data;
@@ -85,6 +86,23 @@ export async function openStore(config, { memory = false } = {}) {
         return Boolean(check(await table().update({ data, version: version + 1, updated_at: new Date().toISOString() })
           .eq('id', data.id).eq('version', version).select('id').maybeSingle()));
       },
+      async availabilityBlocks(fromDate, toDate) {
+        let query = blocks().select('*').order('local_date').order('starts_at');
+        if (fromDate) query = query.gte('local_date', fromDate);
+        if (toDate) query = query.lte('local_date', toDate);
+        return check(await query);
+      },
+      async addAvailabilityBlock(block) { return check(await blocks().insert(block).select('*').single()); },
+      async deleteAvailabilityBlock(id) { return Boolean(check(await blocks().delete().eq('id', id).select('id').maybeSingle())); },
+      async rescheduleAtomic(id, visitAt, settingsData, forceCapacity, actor, expectedVisitAt) {
+        const row = await this.get(id);
+        if (!row) throw new Problem('Reserva no encontrada.', 404);
+        const result = await client.rpc('payers_reschedule_order', { p_order_id: id, p_new_visit_at: visitAt,
+          p_expected_version: row.version, p_expected_visit_at: expectedVisitAt || row.data.visitAt, p_settings: settingsData,
+          p_force_capacity: forceCapacity, p_actor: actor });
+        if (result.error) throw new Problem(result.error.message || 'No se pudo confirmar la disponibilidad.', result.error.code === '40001' ? 409 : 409);
+        return result.data;
+      },
       async find(collection, criteria) {
         return check(await table().select('data').contains('data', { [collection]: [criteria] }).limit(1).maybeSingle())?.data;
       },
@@ -101,6 +119,7 @@ export async function openStore(config, { memory = false } = {}) {
   await db.exec(await readFile(new URL('../supabase/migrations/001_payers.sql', import.meta.url), 'utf8'));
   await db.exec(await readFile(new URL('../supabase/migrations/002_payers_agent.sql', import.meta.url), 'utf8'));
   await db.exec(await readFile(new URL('../supabase/migrations/003_contactos.sql', import.meta.url), 'utf8'));
+  await db.exec(await readFile(new URL('../supabase/migrations/004_payers_availability.sql', import.meta.url), 'utf8'));
   const queryRow = 'id,phone,state,message_count,excerpt,created_at,handled_at';
   async function noteQuery(phone, excerpt, create) {
     const current = (await db.query(`select ${queryRow} from payers_agent_queries where phone = $1 and state = 'open'`, [phone])).rows[0];
@@ -154,6 +173,27 @@ export async function openStore(config, { memory = false } = {}) {
     async save(data, version) {
       return Boolean((await db.query('update payers_orders set data = $1, version = version + 1, updated_at = now() where id = $2 and version = $3 returning id',
         [JSON.stringify(data), data.id, version])).rows.length);
+    },
+    async availabilityBlocks(fromDate, toDate) {
+      const rows = await db.query(`select id,kind,local_date,starts_at,ends_at,reason,created_at from payers_availability_blocks
+        where ($1::date is null or local_date >= $1::date) and ($2::date is null or local_date <= $2::date)
+        order by local_date,starts_at`, [fromDate || null, toDate || null]);
+      return rows.rows;
+    },
+    async addAvailabilityBlock(block) {
+      return (await db.query(`insert into payers_availability_blocks(kind,local_date,starts_at,ends_at,reason)
+        values($1,$2,$3,$4,$5) returning id,kind,local_date,starts_at,ends_at,reason,created_at`,
+      [block.kind, block.local_date, block.starts_at, block.ends_at, block.reason])).rows[0];
+    },
+    async deleteAvailabilityBlock(id) { return Boolean((await db.query('delete from payers_availability_blocks where id=$1 returning id', [id])).rows.length); },
+    async rescheduleAtomic(id, visitAt, settingsData, forceCapacity, actor, expectedVisitAt) {
+      const row = await this.get(id);
+      if (!row) throw new Problem('Reserva no encontrada.', 404);
+      try {
+        const result = await db.query('select payers_reschedule_order($1,$2,$3,$4,$5::jsonb,$6,$7) as result',
+          [id, visitAt, row.version, expectedVisitAt || row.data.visitAt, JSON.stringify(settingsData), forceCapacity, actor]);
+        return result.rows[0].result;
+      } catch (error) { throw new Problem(error.message || 'No se pudo confirmar la disponibilidad.', 409); }
     },
     async find(collection, criteria) {
       return (await db.query('select data from payers_orders where data @> $1::jsonb limit 1', [JSON.stringify({ [collection]: [criteria] })])).rows[0]?.data;

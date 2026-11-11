@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Activity, MessageSquare, Save, Settings2 } from 'lucide-react';
+import { Activity, MessageSquare, Save, Settings2, Trash2, CalendarDays } from 'lucide-react';
 import { api } from './client.mjs';
 import { visitText } from '../shared/orders.mjs';
 
@@ -12,6 +12,11 @@ const numbers = [
   ['counterAlertMinutes', 'Aviso de saldo pendiente en caja (minutos)', 1, 1440],
   ['balanceLinkExpiryMinutes', 'Vencimiento del link de saldo (minutos)', 1, 1440],
   ['maxBalanceLinks', 'Máximo de links de saldo por reserva', 1, 20],
+  ['slotMinutes', 'Duración de cada franja (minutos)', 15, 240],
+  ['capacityPerSlot', 'Aforo por franja (personas)', 1, 1000],
+  ['minRescheduleHours', 'Margen mínimo para reprogramar (horas)', 1, 720],
+  ['maxCustomerReschedules', 'Máximo de cambios iniciados por cliente', 0, 10],
+  ['offerWindowDays', 'Días máximos ofrecidos para reprogramar', 1, 90],
 ];
 const toggles = [
   ['reminders', 'Enviar recordatorios por WhatsApp'],
@@ -21,8 +26,18 @@ const toggles = [
   ['internalAlerts', 'Alertar al personal por vencimiento, retraso o saldo pendiente'],
   ['yapeDemo', 'Ofrecer Yape simulado'],
   ['plinDemo', 'Ofrecer Plin simulado'],
+  ['whatsappRescheduling', 'Permitir reprogramación automática por WhatsApp'],
 ];
 const states = { queued: 'En espera', processing: 'Procesando', done: 'Procesado', failed: 'Requiere revisión' };
+const weekdays = [['mon', 'Lunes'], ['tue', 'Martes'], ['wed', 'Miércoles'], ['thu', 'Jueves'], ['fri', 'Viernes'], ['sat', 'Sábado'], ['sun', 'Domingo']];
+const today = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Lima', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+const plusDate = (key, delta) => new Date(+new Date(key + 'T12:00:00Z') + delta * 86400000).toISOString().slice(0, 10);
+async function refreshAvailability() {
+  const date = today();
+  const [blocks, occupancy] = await Promise.all([api('availability/blocks'), Promise.all(Array.from({ length: 7 }, (_, index) =>
+    api('availability?date=' + plusDate(date, index))))]);
+  return { blocks, occupancy };
+}
 
 export function AgentSettings({ config, onSave }) {
   const [draft, setDraft] = useState(() => ({ ...config, rate: config.depositPerPerson / 100 }));
@@ -32,12 +47,17 @@ export function AgentSettings({ config, onSave }) {
   const [queryError, setQueryError] = useState('');
   const [queryBusy, setQueryBusy] = useState('');
   const [busy, setBusy] = useState(false);
+  const [blocks, setBlocks] = useState([]);
+  const [occupancy, setOccupancy] = useState([]);
+  const [blockForm, setBlockForm] = useState({ kind: 'day', local_date: today(), startTime: '12:00', endTime: '13:00', reason: '' });
+  const [blockError, setBlockError] = useState('');
   const [error, setError] = useState('');
   const change = (key, value) => setDraft(v => ({ ...v, [key]: value }));
   async function refresh() {
     try { setStatus(await api('agent/activity')); setActivityError(''); }
     catch (e) { setActivityError(e.message); }
     await refreshQueries();
+    try { const result = await refreshAvailability(); setBlocks(result.blocks); setOccupancy(result.occupancy); } catch (e) { setBlockError(e.message); }
   }
   async function refreshQueries() {
     try { setQueries(await api('agent/queries')); setQueryError(''); }
@@ -60,6 +80,16 @@ export function AgentSettings({ config, onSave }) {
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
   }
+  async function saveBlock(event) {
+    event.preventDefault(); setBlockError('');
+    try { await api('availability/blocks', blockForm); const result = await refreshAvailability(); setBlocks(result.blocks); setOccupancy(result.occupancy); setBlockForm(v => ({ ...v, reason: '' })); }
+    catch (e) { setBlockError(e.message); }
+  }
+  async function removeBlock(id) {
+    setBlockError('');
+    try { await api('availability/blocks/' + id, {}); const result = await refreshAvailability(); setBlocks(result.blocks); setOccupancy(result.occupancy); }
+    catch (e) { setBlockError(e.message); }
+  }
   return <>
     <section className="panel form-panel">
       <div className="panel-head"><div><h2>Agente y alertas</h2>
@@ -77,11 +107,39 @@ export function AgentSettings({ config, onSave }) {
           {toggles.map(([key, label]) => <label className="check" key={key}><input type="checkbox" checked={draft[key]}
             onChange={e => change(key, e.target.checked)} />{label}</label>)}
         </div>
+        <section className="action-panel"><h3><CalendarDays size={18} /> Horario semanal de atención</h3>
+          <p>El aforo se calcula por franja en personas; la hora se interpreta en Lima.</p>
+          {weekdays.map(([day, label]) => { const hours = draft.weeklySchedule?.[day]; return <div className="action-line" key={day}>
+            <label className="check"><input type="checkbox" checked={Boolean(hours)} onChange={e => change('weeklySchedule', { ...draft.weeklySchedule, [day]: e.target.checked ? { open: '00:00', close: '23:59' } : null })} />{label}</label>
+            {hours && <><label>Apertura<input type="time" value={hours.open} onChange={e => change('weeklySchedule', { ...draft.weeklySchedule, [day]: { ...hours, open: e.target.value } })} /></label>
+              <label>Cierre<input type="time" value={hours.close} onChange={e => change('weeklySchedule', { ...draft.weeklySchedule, [day]: { ...hours, close: e.target.value } })} /></label></>}
+          </div>; })}
+        </section>
         <div className="config-footer">
           {error && <p className="error" role="alert">{error}</p>}
           <button className="button primary" disabled={busy}><Save size={16} />{busy ? 'Guardando…' : 'Guardar configuración del agente'}</button>
         </div>
       </form>
+    </section>
+    <section className="panel">
+      <div className="panel-head"><div><h2>Disponibilidad</h2><p>Bloqueos excepcionales y ocupación de hoy, calculada con las reservas activas.</p></div></div>
+      <form className="form-grid" onSubmit={saveBlock}>
+        <label>Tipo<select value={blockForm.kind} onChange={e => setBlockForm(v => ({ ...v, kind: e.target.value }))}><option value="day">Día completo</option><option value="range">Rango horario</option><option value="slot">Franja concreta</option></select></label>
+        <label>Fecha<input type="date" required value={blockForm.local_date} onChange={e => setBlockForm(v => ({ ...v, local_date: e.target.value }))} /></label>
+        {blockForm.kind !== 'day' && <><label>Desde<input type="time" required value={blockForm.startTime} onChange={e => setBlockForm(v => ({ ...v, startTime: e.target.value }))} /></label>
+          <label>Hasta<input type="time" required value={blockForm.endTime} onChange={e => setBlockForm(v => ({ ...v, endTime: e.target.value }))} /></label></>}
+        <label>Motivo<input required minLength="3" maxLength="240" value={blockForm.reason} onChange={e => setBlockForm(v => ({ ...v, reason: e.target.value }))} /></label>
+        <button className="button outline"><Save size={15} /> Crear bloqueo</button>
+      </form>
+      {blockError && <p className="error" role="alert">{blockError}</p>}
+      {occupancy.length > 0 && <div className="table-scroll"><h3>Ocupación · próximos 7 días</h3><table><thead><tr><th>Fecha</th><th>Franja</th><th>Personas</th><th>Aforo</th><th>Estado</th></tr></thead><tbody>
+        {occupancy.flatMap(day => day.closed ? [{ date: day.date, label: day.label, closed: true }] : day.slots.map(slot => ({ ...slot, date: day.date, label: day.label }))).map((slot, index) => <tr key={slot.date + ':' + (slot.time || index)}>
+          <td>{slot.label}</td><td>{slot.closed ? '—' : slot.time}</td><td>{slot.closed ? '—' : slot.occupied}</td><td>{slot.closed ? '—' : slot.capacity}</td>
+          <td>{slot.closed ? 'Cerrado' : slot.blocked ? 'Bloqueada' : slot.occupied >= slot.capacity ? 'Completa' : 'Disponible'}</td></tr>)}</tbody></table></div>}
+      <div className="table-scroll"><h3>Bloqueos registrados</h3>{!blocks.length ? <p>No hay bloqueos.</p> : <table><thead><tr><th>Fecha</th><th>Tipo</th><th>Horario</th><th>Motivo</th><th /></tr></thead><tbody>
+        {blocks.map(block => <tr key={block.id}><td>{String(block.local_date).slice(0, 10)}</td><td>{block.kind === 'day' ? 'Día' : block.kind === 'range' ? 'Rango' : 'Franja'}</td>
+          <td>{block.starts_at ? visitText(block.starts_at) + ' – ' + visitText(block.ends_at) : 'Todo el día'}</td><td>{block.reason}</td>
+          <td><button className="icon-button" aria-label="Eliminar bloqueo" onClick={() => removeBlock(block.id)}><Trash2 size={16} /></button></td></tr>)}</tbody></table>}</div>
     </section>
     <section className="panel">
       <div className="panel-head"><div><h2>Actividad de WhatsApp</h2><p>{config.ai ? 'Lectura de imágenes y audios configurada' : 'Lectura de imágenes y audios pendiente de configurar'}</p></div>
