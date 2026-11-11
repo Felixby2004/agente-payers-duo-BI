@@ -40,7 +40,8 @@ export function OrdersTable({ orders, open, brief = false }) {
     <td className="nowrap">{visitText(order.visitAt)}</td>
     {!brief && <td className="nowrap">{money(order.total)}</td>}
     <td className="nowrap amount">{money(terminal(order) && order.stage !== 'closed' ? 0 : balance(order))}</td>
-    <td><Badge stage={order.stage} /></td>
+    <td>{order.stage === 'confirmed' && order.attendance?.state === 'pending'
+      ? <span className="badge awaiting_deposit"><i />Por verificar</span> : <Badge stage={order.stage} />}</td>
     <td><button className="icon-button" aria-label={'Abrir ' + order.ref} onClick={() => open(order.id)}><ArrowRight size={17} /></button></td>
   </tr>)}</tbody></table></div>;
 }

@@ -3,6 +3,9 @@ import { readConfig } from './config.mjs';
 import { openStore, updateOrder } from './store.mjs';
 import { providers, hmac, matches } from './providers.mjs';
 import { agentAI } from './agent-ai.mjs';
+import { createPortal } from './portal.mjs';
+import { isArrivalReport, paymentPromise, wantsPortal } from './customer-intents.mjs';
+import { reportKinds, reportPdf } from './reports.mjs';
 import { completeSettings, contactTime, defaults, validateSettings } from './agent-settings.mjs';
 import { balance, depositDue, money, terminal, stageLabels } from '../shared/orders.mjs';
 import { displayText, emojis, friendlyDate, parseAction, reservationFocus, reservationMenu, reservationPrompt, reservationList,
@@ -44,6 +47,9 @@ export async function makeApi(env, options = {}) {
   const config = readConfig(env);
   const store = options.store || await openStore(config, options);
   const service = providers(config);
+  const portal = config.portalEnabled ? createPortal(config, store, service, options) : null;
+  const portalUrl = config.publicUrl + '/cliente';
+  const portalText = 'Consulta tus pedidos, reservas, carta y comprobantes en el portal de El Establo: ' + portalUrl;
   const ai = agentAI(config, service);
   const initialSettings = defaults(config);
   const settings = async () => {
@@ -96,7 +102,7 @@ export async function makeApi(env, options = {}) {
   const attempts = new Map();
   const update = (id, apply) => updateOrder(store, id, apply);
   const linkFor = (intent) => config.publicUrl + '/pago/' + intent.id;
-  const receiptLink = (receipt) => config.publicUrl + '/comprobante/' + receipt.token;
+  const receiptLink = (receipt) => portal ? portalUrl : config.publicUrl + '/comprobante/' + receipt.token;
   const datePlus = (key, days) => new Date(+new Date(key + 'T12:00:00Z') + days * 86400000).toISOString().slice(0, 10);
   async function availableDays({ fromDate = limaDateKey(new Date()), toDate, guests = 1, excludeOrderId = null } = {}) {
     const rule = await settings();
@@ -122,10 +128,11 @@ export async function makeApi(env, options = {}) {
     locks.set(id, next);
     return next.finally(() => { if (locks.get(id) === next) locks.delete(id); });
   }
-  async function checkout(id, method = 'checkout', purpose = 'deposit', forceNew = false) {
+  async function checkout(id, method = 'checkout', purpose = 'deposit', forceNew = false, staff = null) {
     requireThat(['checkout', 'yape', 'plin'].includes(method), 'Elige un medio de anticipo válido.');
     const rule = await settings();
     requireThat(method === 'checkout' || rule[method + 'Demo'], 'Ese medio de demostración está desactivado.', 409);
+    if (portal) method = 'checkout';
     const mode = method === 'checkout' ? config.paymentMode : 'local';
     return lock(id, async () => {
       const intentId = randomUUID();
@@ -133,21 +140,34 @@ export async function makeApi(env, options = {}) {
         const amount = purpose === 'deposit' ? depositDue(data) : balance(data);
         requireThat(purpose === 'deposit' ? data.stage === 'awaiting_deposit' && amount > 0
           : data.stage === 'arrived' && amount > 0, purpose === 'deposit' ? 'La reserva no tiene anticipo pendiente.' : 'El saldo solo se habilita después de registrar la llegada.', 409);
-        const expiresAt = purpose === 'deposit' ? data.deadline : new Date(Date.now() + rule.balanceLinkExpiryMinutes * 60000).toISOString();
+        const expiresAt = purpose === 'deposit'
+          ? portal ? new Date(Math.min(+new Date(data.deadline), Date.now() + rule.depositLinkExpiryMinutes * 60000)).toISOString() : data.deadline
+          : new Date(Date.now() + rule.balanceLinkExpiryMinutes * 60000).toISOString();
         requireThat(purpose !== 'deposit' || new Date(data.deadline) > new Date(), 'El plazo del anticipo venció. Revisa la reserva.', 409);
         for (const old of data.intents) if ((old.purpose || 'deposit') === purpose && old.status === 'pending'
           && new Date(old.expiresAt) <= new Date()) old.status = 'expired';
         const reusable = data.intents.find(i => (i.purpose || 'deposit') === purpose && i.mode === mode
           && (i.method || 'checkout') === method && i.amount === amount
-          && i.status === 'pending' && (purpose === 'deposit' ? i.expiresAt === expiresAt : new Date(i.expiresAt) > new Date())
+          && i.status === 'pending' && (purpose === 'deposit' && !portal ? i.expiresAt === expiresAt : new Date(i.expiresAt) > new Date())
           && (mode !== 'mercado_pago' || isMercadoPagoInitPoint(i.checkoutUrl)));
         if (reusable) return reusable;
+        const previous = data.intents.filter(i => (i.purpose || 'deposit') === purpose);
+        if (portal) {
+          const maximum = Math.min(3, purpose === 'deposit' ? rule.maxDepositLinks : rule.maxBalanceLinks);
+          requireThat(previous.length < maximum, 'Se alcanzó el máximo de enlaces de ' + (purpose === 'deposit' ? 'anticipo' : 'saldo') + '.', 409);
+          const last = previous.at(-1);
+          if (last) {
+            const since = +new Date(last.status === 'expired' ? last.expiresAt : last.updatedAt || last.createdAt || 0);
+            requireThat(Date.now() - since >= rule.paymentRetryMinutes * 60000, 'Espera el intervalo configurado para emitir otro enlace.', 409);
+          }
+        }
         if (purpose === 'balance') {
           const issued = data.intents.filter(i => (i.purpose || 'deposit') === 'balance').length;
           requireThat(issued < rule.maxBalanceLinks, 'Se alcanzó el máximo de enlaces de saldo. El personal se acercará para ayudarte.', 409);
           for (const old of data.intents) if ((old.purpose || 'deposit') === 'balance' && old.status === 'pending') old.status = 'expired';
         }
-        const row = { id: intentId, purpose, amount, expiresAt, status: 'pending', mode, method };
+        const row = { id: intentId, purpose, amount, expiresAt, status: 'pending', mode, method,
+          createdAt: instant(), number: previous.length + 1, ...(staff ? { staffId: staff.id } : {}) };
         data.intents.push(row);
         addEvent(data, purpose === 'deposit' ? 'Enlace de anticipo solicitado' : 'Enlace de saldo solicitado', money(amount));
         return row;
@@ -243,7 +263,7 @@ export async function makeApi(env, options = {}) {
         });
       } else {
         const result = await send(order, message, { template: receipt.purpose === 'deposit' ? 'confirmation' : 'settlement',
-          receiptToken: receipt.token, templateValues: receipt.purpose === 'deposit'
+          receiptToken: portal ? 'portal' : receipt.token, templateValues: receipt.purpose === 'deposit'
             ? [order.payer, order.ref, friendlyDate(order.visitAt, new Date(), true), money(receipt.amount), summary]
             : [order.payer, order.ref, money(order.total), amount] });
         const outbound = result.chat.at(-1);
@@ -395,16 +415,18 @@ export async function makeApi(env, options = {}) {
     const receipt = order.receipts.find(r => r.purpose === 'deposit');
     if (receipt) await deliverReceipt(order, receipt);
   }
-  async function sendBalanceLink(order, { forceNew = false, reply = false } = {}) {
+  async function sendBalanceLink(order, { forceNew = false, reply = false, staff = null } = {}) {
     try {
       if (!reply && (!order.consent || !config.isPhoneAllowed(order.phone) || config.isPhoneBlocked(order.phone) || await optedOut(order.phone))) {
         throw new Problem('No se envió el link automático: falta consentimiento o el teléfono no admite mensajes iniciados por el restaurante.', 409);
       }
-      const intent = await checkout(order.id, 'checkout', 'balance', forceNew);
+      const intent = await checkout(order.id, 'checkout', 'balance', forceNew, staff);
       const current = (await store.get(order.id))?.data || order;
       const text = balancePaymentCta(current, intent, linkFor(intent));
-      return await send(current, text, { template: 'balance', intent, reply,
+      const result = await send(current, text, { template: 'balance', intent, reply,
         templateValues: [current.payer, current.ref, money(intent.amount)] });
+      if (staff) return (await update(result.id, data => addEvent(data, 'Enlace de saldo enviado por caja', intent.id, staff.name))).order;
+      return result;
     } catch (error) {
       if (/máximo de enlaces/i.test(error.message)) await update(order.id, data => openIssue(data,
         'Máximo de enlaces de saldo alcanzado', 'No se generó otro enlace; el personal debe acercarse.', 'balance-link-limit'));
@@ -412,7 +434,10 @@ export async function makeApi(env, options = {}) {
     }
   }
   async function autoPayOrder(order) {
-    if (order.stage === 'arrived' && balance(order) > 0) return sendBalanceLink(order, { reply: true });
+    if (order.stage === 'arrived' && balance(order) > 0) {
+      if (portal) return sendReply(order, 'El saldo es ' + money(balance(order)) + '. Pide a caja que te envíe el enlace de pago.');
+      return sendBalanceLink(order, { reply: true });
+    }
     if (order.stage === 'awaiting_deposit' && depositDue(order) > 0) {
       if (new Date(order.deadline) <= new Date()) return sendReply(order, reservationMenu(order));
       const intent = await checkout(order.id);
@@ -420,10 +445,20 @@ export async function makeApi(env, options = {}) {
     }
     if (order.stage === 'confirmed') return send(order, 'El saldo se habilita cuando recepción registre tu llegada. Por ahora no generaré un enlace de saldo.', { reply: true });
     const receipt = order.receipts.find(item => item.purpose === 'settlement') || order.receipts.at(-1);
-    if (['paid', 'closed'].includes(order.stage) && receipt) return send(order, receiptCta(order, receiptLink(receipt)), { reply: true });
+    if (['paid', 'closed'].includes(order.stage) && receipt) {
+      return send(order, portal ? portalText : receiptCta(order, receiptLink(receipt)), { reply: true });
+    }
     return send(order, reservationMenu(order), { reply: true });
   }
   async function notifyRejectedPayment(order, rejectedIntent) {
+    if (portal) {
+      if (await sessionOpen(order.phone)) {
+        await sendReply(order, rejectedIntent.purpose === 'balance'
+          ? 'El pago fue rechazado. Pide a caja otro enlace si necesitas reintentar.'
+          : 'El pago fue rechazado. Escribe «anticipo» si quieres solicitar un nuevo enlace.');
+      }
+      return;
+    }
     if (config.waMode !== 'cloud' || !order.consent || !config.isPhoneAllowed(order.phone)
       || config.isPhoneBlocked(order.phone) || await optedOut(order.phone)) return;
     const activeSession = await sessionOpen(order.phone);
@@ -478,13 +513,15 @@ export async function makeApi(env, options = {}) {
         return false;
       }
       let changed = false;
-      if (p.status === 'approved' && purpose === 'balance'
-        && (intent.status === 'superseded' || balance(data) === 0 || data.stage !== 'arrived'
-          || new Date(p.date_approved || instant()) > new Date(intent.expiresAt))) {
+      if (p.status === 'approved' && !data.payments.some(payment => payment.ref === ref)
+        && ((purpose === 'deposit' && portal && (intent.status === 'superseded' || depositDue(data) !== amount
+          || data.stage !== 'awaiting_deposit' || new Date(p.date_approved || instant()) > new Date(intent.expiresAt)))
+        || (purpose === 'balance' && (intent.status === 'superseded' || balance(data) === 0 || data.stage !== 'arrived'
+          || new Date(p.date_approved || instant()) > new Date(intent.expiresAt))))) {
         if (!data.unappliedPayments?.some(item => item.ref === ref)) {
           data.unappliedPayments ||= [];
-          data.unappliedPayments.push({ ref, intentId: intent.id, amount, purpose, at: p.date_approved || instant(), reason: 'El saldo ya se cobró en caja, venció el link o cambió el estado.' });
-          openIssue(data, 'Pago por revisar', 'Mercado Pago aprobó un pago de saldo que ya no puede aplicarse. Operación: ' + ref, ref);
+          data.unappliedPayments.push({ ref, intentId: intent.id, amount, purpose, at: p.date_approved || instant(), reason: 'El pago ya no corresponde al importe, estado o plazo de la reserva.' });
+          openIssue(data, 'Pago por revisar', 'Mercado Pago aprobó un pago que ya no puede aplicarse. Operación: ' + ref, ref);
           addEvent(data, 'Pago tardío no aplicado', ref + ' · ' + money(amount));
           intent.status = 'late_approved';
           changed = true;
@@ -511,6 +548,7 @@ export async function makeApi(env, options = {}) {
       } else if (['rejected', 'cancelled'].includes(p.status)) {
         if (intent.status === 'pending') {
           intent.status = 'rejected';
+          intent.updatedAt = instant();
           rejectedIntent = structuredClone(intent);
         }
         openIssue(data, 'Intento rechazado', 'Mercado Pago informó un intento fallido de ' + purpose + '.', ref);
@@ -528,6 +566,10 @@ export async function makeApi(env, options = {}) {
     if (rejectedIntent) await notifyRejectedPayment(order, rejectedIntent);
     return { order, changed: result };
   }
+  const mpRecheck = intent => intent.mode === 'mercado_pago' && (intent.status === 'pending'
+    || (portal && intent.status === 'expired' && !intent.verifiedExpiredAt && intent.checkoutUrl));
+  const depositNeedsReview = order => order.intents.some(intent => (intent.purpose || 'deposit') === 'deposit' && mpRecheck(intent))
+    || order.incidents.some(incident => !incident.resolvedAt && ['Pago informado por el cliente', 'Pago por revisar'].includes(incident.type));
   let paymentReconciliationRunning = false;
   async function reconcilePendingPayments() {
     if (config.paymentMode !== 'mercado_pago' || paymentReconciliationRunning) return { checked: 0, updated: 0 };
@@ -537,7 +579,7 @@ export async function makeApi(env, options = {}) {
       const now = Date.now();
       const orders = await store.list();
       const pending = orders.flatMap(order => (order.intents || [])
-        .filter(intent => intent.mode === 'mercado_pago' && intent.status === 'pending'
+        .filter(intent => mpRecheck(intent)
           && intent.expiresAt && now <= +new Date(intent.expiresAt) + 7 * 86400000
           && now - +new Date(intent.lastMpCheckAt || 0) >= 120000)
         .map(intent => ({ order, intent })))
@@ -546,7 +588,7 @@ export async function makeApi(env, options = {}) {
         const stamp = instant();
         const { result: claimed } = await update(order.id, data => {
           const row = data.intents.find(item => item.id === intent.id);
-          if (!row || row.status !== 'pending' || Date.now() - +new Date(row.lastMpCheckAt || 0) < 120000) return false;
+          if (!row || !mpRecheck(row) || Date.now() - +new Date(row.lastMpCheckAt || 0) < 120000) return false;
           row.lastMpCheckAt = stamp;
           return true;
         });
@@ -558,6 +600,13 @@ export async function makeApi(env, options = {}) {
           const candidate = candidates.find(item => item.status === 'approved')
             || candidates.sort((a, b) => +new Date(b.date_created || 0) - +new Date(a.date_created || 0))
               .find(item => ['rejected', 'cancelled', 'refunded', 'charged_back'].includes(item.status));
+          const unsettled = candidates.some(item => !['approved','rejected','cancelled','refunded','charged_back'].includes(item.status));
+          if (portal && !unsettled && !candidates.some(item => item.status === 'approved') && +new Date(intent.expiresAt) <= Date.now()) {
+            await update(order.id, data => {
+              const row = data.intents.find(item => item.id === intent.id);
+              if (row && mpRecheck(row)) { row.status = 'expired'; row.verifiedExpiredAt = instant(); }
+            });
+          }
           if (!candidate) continue;
           const payment = await service.payment(String(candidate.id));
           if (String(payment.external_reference) !== intent.id) continue;
@@ -583,7 +632,7 @@ export async function makeApi(env, options = {}) {
         const rule = await settings();
         if (method !== 'checkout' && !rule[method + 'Demo']) return 'Ese medio de demostración está desactivado. Puedes escribir «tarjeta» para abrir el checkout disponible.';
         const intent = await checkout(order.id, method);
-        return paymentCta(order, intent, method, linkFor(intent), rule);
+        return paymentCta(order, intent, portal ? 'checkout' : method, linkFor(intent), rule);
       }
       case 'paid': {
         if (depositDue(order) === 0) return summary + ' El anticipo figura verificado.';
@@ -602,6 +651,7 @@ export async function makeApi(env, options = {}) {
         return requestMessage(order, intentType);
       }
       case 'receipt': {
+        if (portal) return portalText;
         const receipt = order.receipts.at(-1);
         return receipt ? receiptCta(order, receiptLink(receipt)) : 'El comprobante se habilitará tras verificar el pago correspondiente.';
       }
@@ -698,6 +748,29 @@ export async function makeApi(env, options = {}) {
       chg: 'reprogramar', hum: 'ayuda' }[action];
     return replyTo(order, phrase || '', undefined, forced);
   }
+  async function reportArrival(phone, orders, ref, timestamp, messageId, text) {
+    const eligible = orders.filter(order => ['confirmed', 'arrived', 'paid', 'closed'].includes(order.stage)
+      && limaDateKey(order.visitAt) === limaDateKey(new Date(timestamp)) && (!ref || ref === order.ref));
+    if (!eligible.length) return service.sendWhatsAppReply(phone, 'No encontré una reserva confirmada para hoy. Si ya estás en el local, consulta con caja.');
+    if (eligible.length > 1) return service.sendWhatsAppReply(phone, reservationList(eligible, new Date(), 'sela'));
+    const order = eligible[0];
+    const result = await update(order.id, data => {
+      if (!data.chat.some(item => item.id === messageId)) data.chat.push({ id: messageId, from: phone, direction: 'in',
+        at: new Date(timestamp).toISOString(), text });
+      if (data.attendance?.at) return 'confirmed';
+      if (data.stage !== 'confirmed' || data.visitAt !== order.visitAt) return 'changed';
+      if (!data.attendance?.reportedAt) {
+        data.attendance = { state: 'pending', reportedAt: new Date(timestamp).toISOString() };
+        addEvent(data, 'Llegada reportada por WhatsApp', 'Pendiente de confirmación en caja.', 'Pagador');
+      }
+      return 'pending';
+    });
+    const message = result.result === 'confirmed' ? 'Caja ya confirmó tu llegada.'
+      : result.result === 'changed' ? 'La reserva cambió. Confirma la referencia con caja.'
+        : 'Avisé a caja de tu llegada para ' + order.ref + '. Acércate para que verifiquen tu asistencia.';
+    return sendReply(order, message);
+  }
+
   async function incoming(message) {
     const phone = digits(message.from);
     if (!message.id || config.isPhoneBlocked(phone) || !config.isPhoneAllowed(phone)) return;
@@ -753,6 +826,9 @@ export async function makeApi(env, options = {}) {
     // inicia el restaurante exigen order.consent y un número no dado de baja.
     const orders = await store.phone(phone);
     const ref = text.match(/\bEST-[a-f0-9]{8}\b/i)?.[0]?.toUpperCase();
+    if (portal && (action?.action === 'rcp' || wantsPortal(text) || /^(?:comprobante|constancia|portal|carta)$/.test(command))) {
+      return service.sendWhatsAppReply(phone, portalText);
+    }
     const ownsRef = !ref || orders.some(order => order.ref === ref);
     if (!orders.length || !ownsRef) {
       await replyWithoutReservation(phone, text, action);
@@ -778,6 +854,31 @@ export async function makeApi(env, options = {}) {
         proof = result.proof;
         if (proof) proof.messageId = message.id;
       } catch (error) { mediaError = error.message; }
+    }
+
+    if (portal && (action?.action === 'sela' || isArrivalReport(text))) {
+      return reportArrival(phone, orders, action?.ref || ref, timestamp, message.id, text);
+    }
+    if (portal && attachment && !proof && wantsPortal(text)) return service.sendWhatsAppReply(phone, portalText);
+    const promise = portal && !proof && !action ? paymentPromise(text, new Date(timestamp)) : null;
+    if (promise) {
+      const unpaid = candidates.filter(item => item.stage === 'awaiting_deposit' && depositDue(item) > 0);
+      if (unpaid.length > 1) return service.sendWhatsAppReply(phone, 'Indica la referencia de la reserva y repite la hora en el mismo mensaje.');
+      if (!unpaid.length) return service.sendWhatsAppReply(phone, 'No encontré un anticipo pendiente para esa reserva.');
+      if (promise.ambiguous) return service.sendWhatsAppReply(phone, 'Dime el día y la hora con a. m. o p. m. Por ejemplo: hoy a las 7 p. m.');
+      const selected = unpaid[0];
+      const { result } = await update(selected.id, data => {
+        if (data.stage !== 'awaiting_deposit' || depositDue(data) <= 0
+          || +new Date(promise.at) <= Date.now() || +new Date(promise.at) >= +new Date(data.deadline)) return false;
+        if (data.depositPromise?.messageId === message.id) return true;
+        data.chat.push({ id: message.id, from: phone, direction: 'in', at: new Date(timestamp).toISOString(), text });
+        data.depositPromise = { ...promise, messageId: message.id };
+        addEvent(data, 'Hora de anticipo acordada', friendlyDate(promise.at, new Date(), true), 'Pagador');
+        return true;
+      });
+      return service.sendWhatsAppReply(phone, result
+        ? 'Te recordaré el anticipo ' + friendlyDate(promise.at, new Date(), true) + '. El plazo de pago sigue siendo ' + friendlyDate(selected.deadline, new Date(), true) + '.'
+        : 'La hora debe ser futura y anterior al vencimiento del anticipo. Dime otra hora.');
     }
 
     const { order, result: isNew } = await update(candidates[0].id, data => {
@@ -943,6 +1044,16 @@ export async function makeApi(env, options = {}) {
         : order.stage === 'confirmed' && before <= -rule.graceMinutes * 60000 ? ['Verificar llegada', 'Pasó la tolerancia. Recepción debe verificar si asistió.', 'arrival:' + order.visitAt]
           : order.stage === 'arrived' && balance(order) > 0 && now - +new Date(order.attendance.at) >= rule.counterAlertMinutes * 60000
             ? ['Saldo por verificar', 'El cliente ya llegó y caja aún no confirmó el saldo.', 'counter:' + order.attendance.at] : null;
+      if (portal && issue?.[0] === 'Anticipo vencido' && rule.cancelExpiredDeposits !== false
+        && depositDue(order) > 0 && !depositNeedsReview(order)) {
+        const result = await update(order.id, data => {
+          if (data.stage !== 'awaiting_deposit' || +new Date(data.deadline) > now
+            || depositDue(data) <= 0 || depositNeedsReview(data)) return false;
+          endReservation(data, 'cancelled', 'Venció el plazo del anticipo.', 0);
+          return true;
+        });
+        if (result.result) { escalated++; continue; }
+      }
       if (rule.internalAlerts && issue && !order.incidents.some(i => i.key === issue[2])) {
         const { result: created } = await update(order.id, data => {
           if (data.stage === order.stage && data.deadline === order.deadline && data.visitAt === order.visitAt && !data.incidents.some(i => i.key === issue[2])) {
@@ -963,7 +1074,8 @@ export async function makeApi(env, options = {}) {
       if (hasPendingDelivery) await deliverPendingReceipts((await store.get(order.id))?.data || order);
     }
 
-    if (config.waMode !== 'cloud' || !rule.reminders || !contactTime(rule, new Date(now))) return { sent, escalated };
+    if (config.waMode !== 'cloud' || !rule.reminders) return { sent, escalated };
+    const withinHours = contactTime(rule, new Date(now));
 
     const groups = new Map();
     for (const order of orders) {
@@ -976,19 +1088,24 @@ export async function makeApi(env, options = {}) {
       if (attempted >= 4) break;
       if (!config.isPhoneAllowed(phone) || config.isPhoneBlocked(phone) || await optedOut(phone)) continue;
       const plans = [];
+      const promisedDay = portal && group.some(order => order.stage === 'awaiting_deposit'
+        && depositDue(order) > 0 && +new Date(order.deadline) > now && +new Date(order.depositPromise?.muteUntil) > now);
       for (const order of group) {
         if (!order.consent) continue;
         const before = +new Date(order.visitAt) - now;
         const needsDeposit = order.stage === 'awaiting_deposit' && depositDue(order) > 0 && now < +new Date(order.deadline);
         const initialKey = 'initial:' + order.deadline;
         const latestLink = [...order.chat].reverse().find(m => m.direction === 'out' && (m.paymentLink || m.text.includes('/pago/')));
-        const initial = rule.initialRequest && needsDeposit && !latestLink && !order.reminders[initialKey];
+        const promise = portal && order.depositPromise;
+        const promised = needsDeposit && promise && +new Date(promise.at) <= now && +new Date(promise.muteUntil) > now;
+        const muted = promisedDay;
+        const initial = withinHours && !muted && rule.initialRequest && needsDeposit && !latestLink && !order.reminders[initialKey];
         const sinceRequest = now - +new Date(latestLink?.at || order.reminders[initialKey]?.at || order.createdAt);
-        const deposit = rule.depositReminder && needsDeposit && sinceRequest >= rule.depositReminderMinutes * 60000;
-        const visit = rule.visitReminder && order.stage === 'confirmed' && before > 0 && before <= rule.firstVisitHours * 3600000;
-        const key = initial ? initialKey : deposit ? 'deposit:' + order.deadline
+        const deposit = withinHours && !muted && rule.depositReminder && needsDeposit && sinceRequest >= rule.depositReminderMinutes * 60000;
+        const visit = withinHours && rule.visitReminder && !order.attendance?.reportedAt && order.stage === 'confirmed' && before > 0 && before <= rule.firstVisitHours * 3600000;
+        const key = promised ? 'promise:' + promise.messageId : initial ? initialKey : deposit ? 'deposit:' + order.deadline
           : visit ? 'visit:' + order.visitAt + ':' + (before <= rule.lastVisitHours * 3600000 ? 'last' : 'first') : null;
-        if (key && !order.reminders[key]) plans.push({ order, key, kind: initial || deposit ? 'deposit' : 'visit' });
+        if (key && !order.reminders[key]) plans.push({ order, key, kind: promised || initial || deposit ? 'deposit' : 'visit', promised });
       }
       if (!plans.length) continue;
 
@@ -997,12 +1114,14 @@ export async function makeApi(env, options = {}) {
       const visits = plans.filter(plan => plan.kind === 'visit')
         .sort((a, b) => +new Date(a.order.visitAt) - +new Date(b.order.visitAt));
       const paymentAlert = deposits.length > 0;
-      const chosenPlans = paymentAlert ? deposits : visits;
+      const priority = deposits.find(plan => plan.promised);
+      const chosenPlans = priority ? [priority] : paymentAlert ? deposits : visits;
       const claimed = [];
       for (const plan of chosenPlans) {
         const { result: didClaim } = await update(plan.order.id, data => {
           if (data.reminders[plan.key] || data.stage !== plan.order.stage || data.visitAt !== plan.order.visitAt
-            || data.deadline !== plan.order.deadline) return false;
+            || data.deadline !== plan.order.deadline || (plan.promised && data.depositPromise?.messageId !== plan.order.depositPromise?.messageId)
+            || (!plan.promised && plan.kind === 'deposit' && +new Date(data.depositPromise?.muteUntil) > now)) return false;
           data.reminders[plan.key] = { at: instant(), status: 'pending' };
           return true;
         });
@@ -1017,7 +1136,7 @@ export async function makeApi(env, options = {}) {
         const pendingPayments = group.filter(order => order.consent && order.stage === 'awaiting_deposit'
           && depositDue(order) > 0 && now < +new Date(order.deadline));
 
-        if (paymentAlert && activeSession && pendingPayments.length > 1) {
+        if (paymentAlert && !messagePlan.promised && activeSession && pendingPayments.length > 1) {
           const freshOrders = await store.phone(phone);
           const currentPayments = freshOrders.filter(order => order.consent && order.stage === 'awaiting_deposit'
             && depositDue(order) > 0 && now < +new Date(order.deadline));
@@ -1033,9 +1152,16 @@ export async function makeApi(env, options = {}) {
         }
 
         if (paymentAlert) {
-          const intent = await checkout(current.id);
-          current = (await store.get(current.id))?.data;
-          await send(current, paymentCta(current, intent, 'checkout', linkFor(intent), rule), { template: 'deposit', intent });
+          let intent;
+          try { intent = await checkout(current.id); }
+          catch (error) {
+            if (!messagePlan.promised || !activeSession || error.status !== 409) throw error;
+            await send(current, 'Es la hora acordada para revisar el anticipo de ' + current.ref + '. Si necesitas otro enlace, comunícate con caja.');
+          }
+          if (intent) {
+            current = (await store.get(current.id))?.data;
+            await send(current, paymentCta(current, intent, 'checkout', linkFor(intent), rule), { template: 'deposit', intent });
+          }
         } else {
           const visit = emojis.visit + ' *Próxima visita*\nReserva: *' + current.ref + '*\n'
             + friendlyDate(current.visitAt, new Date(now), true) + '\nSaldo en el local: *' + money(balance(current)) + '*';
@@ -1088,11 +1214,28 @@ export async function makeApi(env, options = {}) {
     if (path.startsWith('/api/internal/agent/')) {
       requireThat(config.orchestration === 'n8n' && matches(req.headers.authorization, 'Bearer ' + config.env.N8N_AGENT_TOKEN), 'Credencial del agente inválida.', 401);
       if (isPost && path.endsWith('/inbox')) return json(res, 200, await drainInbox());
-      if (isPost && path.endsWith('/alerts')) return json(res, 200, await reminderTick());
+      if (isPost && path.endsWith('/alerts')) {
+        if (portal) await reconcilePendingPayments();
+        return json(res, 200, await reminderTick());
+      }
       return json(res, 404, { error: 'Ruta no encontrada.' });
     }
-    if (path === '/api/session' && isGet) return json(res, 200, { authenticated: authenticated(req), protected: Boolean(config.adminPassword) });
+    if (path === '/api/session' && isGet) {
+      if (!portal) return json(res, 200, { authenticated: authenticated(req), protected: Boolean(config.adminPassword), role: authenticated(req) ? 'admin' : null });
+      const identity = await portal.session(req);
+      return json(res, 200, { authenticated: Boolean(identity), protected: true, portalEnabled: true, role: identity?.role, name: identity?.name });
+    }
+    if (portal && path.startsWith('/api/customer/')) {
+      if (isPost && path === '/api/customer/otp') return json(res, 202, await portal.issue(req, parse(await readBody(req))));
+      if (isPost && path === '/api/customer/verify') return json(res, 200, await portal.verify(req, res, parse(await readBody(req))));
+      const customer = await portal.session(req);
+      requireThat(customer?.role === 'client', 'Verifica tu celular para entrar.', 401);
+      if (isGet && path === '/api/customer/orders') return json(res, 200, { name: customer.name, menuUrl: config.menuUrl,
+        orders: await portal.customerOrders(customer) });
+      return json(res, 404, { error: 'Ruta no encontrada.' });
+    }
     if (path === '/api/login' && isPost) {
+      if (portal) return json(res, 200, await portal.login(req, res, parse(await readBody(req))));
       const host = req.socket.remoteAddress;
       const state = attempts.get(host);
       if (state?.count >= 10 && state.expiry > Date.now()) throw new Problem('Espera antes de volver a intentar el ingreso.', 429);
@@ -1107,7 +1250,8 @@ export async function makeApi(env, options = {}) {
       return json(res, 200, { authenticated: true });
     }
     if (path === '/api/logout' && isPost) {
-      res.setHeader('Set-Cookie', cookie('', 0));
+      if (portal) portal.logout(res);
+      else res.setHeader('Set-Cookie', cookie('', 0));
       return json(res, 200, { authenticated: false });
     }
     if (path === '/api/webhooks/whatsapp' && config.waMode === 'cloud') {
@@ -1184,7 +1328,8 @@ export async function makeApi(env, options = {}) {
       }
       const method = intent.method || 'checkout';
       const purpose = intent.purpose || 'deposit';
-      const methodEnabled = method === 'checkout' || (await settings())[method + 'Demo'];
+      const ruleForPayment = await settings();
+      const methodEnabled = method === 'checkout' || ruleForPayment[method + 'Demo'];
       if (isGet) {
         const expected = purpose === 'deposit' ? depositDue(target) : balance(target);
         const rightStage = purpose === 'deposit' ? target.stage === 'awaiting_deposit' && new Date(target.deadline) > new Date()
@@ -1199,11 +1344,16 @@ export async function makeApi(env, options = {}) {
               ? 'expired' : !rightStage ? 'reservation_changed' : null;
         return json(res, 200, { ref: target.ref, amount: intent.amount, status: intent.status, mode: intent.mode, purpose,
           stage: target.stage, requiresReview, unusableReason,
-          method, usable: usable && safeCheckout, checkoutUrl: usable && safeCheckout ? intent.checkoutUrl : null });
+          method, options: portal && usable && method === 'checkout' ? ['checkout', ...['yape','plin'].filter(key => methodEnabled && ruleForPayment[key + 'Demo'])] : undefined,
+          usable: usable && safeCheckout, checkoutUrl: usable && safeCheckout ? intent.checkoutUrl : null });
       }
       if (isPost) {
-        requireThat(methodEnabled && intent.mode === 'local' && (method !== 'checkout' || config.paymentMode === 'local'), 'Este pago se confirma desde el medio autorizado.', 409);
         const input = parse(await readBody(req));
+        if (portal && input.method !== undefined) requireThat(['checkout','yape','plin'].includes(input.method), 'Selecciona un medio de pago digital.');
+        const selected = portal && method === 'checkout' && ['yape', 'plin'].includes(input.method) ? input.method : method;
+        const demoMethod = portal && selected !== 'checkout' && ruleForPayment[selected + 'Demo'];
+        requireThat(demoMethod || (methodEnabled && intent.mode === 'local' && (method !== 'checkout' || config.paymentMode === 'local')),
+          'Este pago se confirma desde el medio autorizado.', 409);
         const token = randomUUID();
         const { order, result } = await update(target.id, data => {
           const row = data.intents.find(i => i.id === intent.id);
@@ -1215,11 +1365,12 @@ export async function makeApi(env, options = {}) {
             && new Date(row.expiresAt) > new Date(), 'El enlace ya no está disponible.', 409);
           if (input.outcome === 'rejected') {
             row.status = 'rejected';
+            row.updatedAt = instant();
             openIssue(data, 'Intento rechazado', 'El checkout local simuló un rechazo.', row.id);
           } else {
             requireThat(input.outcome === 'approved', 'Resultado de prueba inválido.');
             row.status = 'approved';
-            const payment = { ref: 'SIM-' + row.id, amount: row.amount, purpose, channel: method === 'checkout' ? 'simulation' : method + '_demo', intentId: row.id };
+            const payment = { ref: 'SIM-' + row.id, amount: row.amount, purpose, channel: selected === 'checkout' ? 'simulation' : selected + '_demo', intentId: row.id };
             if (purpose === 'deposit') finishDeposit(data, payment, token); else finishBalance(data, payment, token);
           }
           return { status: row.status, confirmed: row.status === 'approved' && data.stage === 'confirmed' };
@@ -1231,8 +1382,10 @@ export async function makeApi(env, options = {}) {
     }
     const publicReceipt = path.match(/^\/api\/receipt\/([a-f0-9-]+)$/);
     if (publicReceipt && isGet && uuid.test(publicReceipt[1])) {
+      const user = portal ? await portal.session(req) : null;
+      if (portal) requireThat(user, 'Inicia sesión para ver la constancia.', 401);
       const order = await store.find('receipts', { token: publicReceipt[1] });
-      requireThat(order, 'Comprobante no encontrado.', 404);
+      requireThat(order && (user?.role !== 'client' || user.phone === order.phone), 'Comprobante no encontrado.', 404);
       const receipt = order.receipts.find(r => r.token === publicReceipt[1]);
       const payment = order.payments.filter(item => item.channel === 'mercadopago' && item.purpose === receipt.purpose
         && item.amount === receipt.amount && /^MP-\d+$/.test(String(item.ref || '')))
@@ -1254,7 +1407,29 @@ export async function makeApi(env, options = {}) {
           at: item.at, channel: item.channel, ref: item.ref })), mercadoPagoReceipts,
         ...(operationId ? { mercadoPagoOperationId: operationId, mercadoPagoReceiptUrl } : {}) });
     }
-    requireThat(authenticated(req), 'Inicia sesión para acceder al panel.', 401);
+    const staff = portal ? await portal.session(req) : authenticated(req) ? { role: 'admin' } : null;
+    requireThat(staff, 'Inicia sesión para acceder al panel.', 401);
+    requireThat(staff.role !== 'client', 'Esta operación pertenece al panel de personal.', 403);
+    if (staff.role === 'cashier') {
+      const allowed = path.startsWith('/api/orders') || (isGet && ['/api/config', '/api/availability'].includes(path));
+      requireThat(allowed && !path.endsWith('/refund'), 'Esta operación requiere acceso de administrador.', 403);
+    }
+    if (portal && path === '/api/staff') {
+      if (isGet) return json(res, 200, await portal.call('staff_list'));
+      if (isPost) return json(res, 200, await portal.saveStaff(parse(await readBody(req)), staff));
+    }
+    if (isGet && path === '/api/reports/pdf') {
+      const measure = url.searchParams.get('measure');
+      const from = url.searchParams.get('from'), to = url.searchParams.get('to');
+      const validDay = day => /^\d{4}-\d{2}-\d{2}$/.test(day || '') && Number.isFinite(Date.parse(day))
+        && new Date(day).toISOString().slice(0, 10) === day;
+      requireThat(Object.hasOwn(reportKinds, measure) && validDay(from) && validDay(to) && from <= to
+        && (Date.parse(to) - Date.parse(from)) / 86400000 <= 92, 'Selecciona una medida y un período válido de hasta 93 días.');
+      const pdf = reportPdf(measure, from, to, await store.report(measure, from, to));
+      res.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Length': pdf.length,
+        'Content-Disposition': 'attachment; filename="PAYERS-' + measure + '-' + from + '.pdf"', 'Cache-Control': 'private, no-store' });
+      return res.end(pdf);
+    }
     const attachment = path.match(/^\/api\/orders\/([a-f0-9-]+)\/media\/([^/]+)$/);
     if (attachment && isGet && uuid.test(attachment[1])) {
       const order = (await store.get(attachment[1]))?.data;
@@ -1270,6 +1445,7 @@ export async function makeApi(env, options = {}) {
     }
     if (path === '/api/config' && isGet) return json(res, 200, {
       database: store.label, paymentMode: config.paymentMode, whatsapp: config.waMode, protected: Boolean(config.adminPassword),
+      role: staff.role, portalEnabled: Boolean(portal),
       agent: config.orchestration, ai: ai.enabled, ...await settings(),
     });
     if (path === '/api/agent/settings' && isPost) {
@@ -1326,8 +1502,9 @@ export async function makeApi(env, options = {}) {
     if (path === '/api/orders' && isPost) {
       const rule = await settings();
       const input = parse(await readBody(req)), order = createOrder(input, { depositPerPerson: rule.depositPerPerson, deadlineMs: rule.deadlineMinutes * 60000 });
-      const available = await ensureAvailable(order.visitAt, order.guests, null, rule, input.forceCapacity === true);
-      if (!available && input.forceCapacity) addEvent(order, 'Aforo excedido por personal', 'El operador forzó la reserva para esta franja.', 'Operador');
+      const force = staff.role === 'admin' && input.forceCapacity === true;
+      const available = await ensureAvailable(order.visitAt, order.guests, null, rule, force);
+      if (!available && force) addEvent(order, 'Aforo excedido por personal', 'El operador forzó la reserva para esta franja.', 'Operador');
       return json(res, 201, await store.insert(order));
     }
     const action = path.match(/^\/api\/orders\/([a-f0-9-]+)\/([a-z-]+)$/);
@@ -1335,11 +1512,11 @@ export async function makeApi(env, options = {}) {
       const [, id, kind] = action;
       const input = parse(await readBody(req));
       if (kind === 'link') {
-        const intent = await checkout(id, input.method);
+        const intent = await checkout(id, input.method, 'deposit', false, staff.id ? staff : null);
         return json(res, 200, { intent, url: linkFor(intent), order: (await store.get(id)).data });
       }
       if (kind === 'message') {
-        requireThat(config.waMode === 'cloud', 'Activa WhatsApp Cloud API en la configuración.', 409);
+        requireThat(portal || config.waMode === 'cloud', 'Activa WhatsApp Cloud API en la configuración.', 409);
         let order = (await store.get(id))?.data;
         requireThat(order, 'Reserva no encontrada.', 404);
         // Un envío manual solo sale sin plantilla si la baja no está activa o hay sesión abierta.
@@ -1350,7 +1527,7 @@ export async function makeApi(env, options = {}) {
           const intent = await checkout(id, input.method);
           order = await send(order, paymentCta(order, intent, input.method || 'checkout', linkFor(intent), await settings()), { template: 'deposit', intent });
         } else if (input.type === 'balance') {
-          order = await sendBalanceLink(order, { forceNew: Boolean(input.newLink) });
+          order = await sendBalanceLink(order, { forceNew: Boolean(input.newLink), staff: staff.id ? staff : null });
         } else if (input.type === 'visit') {
           requireThat(order.stage === 'confirmed', 'La visita debe estar confirmada.', 409);
           order = await send(order, emojis.visit + ' *Próxima visita*\nReserva: *' + order.ref + '*\n'
@@ -1399,7 +1576,7 @@ export async function makeApi(env, options = {}) {
       if (kind === 'reschedule') {
         const row = await store.get(id), order = row?.data;
         requireThat(order, 'Reserva no encontrada.', 404);
-        const oldVisitAt = order.visitAt, rule = await settings(), force = input.forceCapacity === true;
+        const oldVisitAt = order.visitAt, rule = await settings(), force = staff.role === 'admin' && input.forceCapacity === true;
         const hasCapacity = await ensureAvailable(input.visitAt, order.guests, id, rule, force);
         const saved = await store.rescheduleAtomic(id, new Date(input.visitAt).toISOString(), rule, force, 'Operador', oldVisitAt);
         const moved = saved.data || saved.order?.data || saved.order || saved;
@@ -1418,9 +1595,16 @@ export async function makeApi(env, options = {}) {
       const receiptToken = randomUUID();
       const rule = await settings();
       const result = await update(id, data => {
-        if (kind === 'arrive') return arrive(data, Number(input.count));
+        if (kind === 'arrive') {
+          if (portal) requireThat(limaDateKey(data.visitAt) === limaDateKey(new Date()) && typeof input.titularPresente === 'boolean',
+            'Verifica la presencia del titular el día de su visita.', 409);
+          arrive(data, Number(input.count), { staff: staff.id ? staff : null, titularPresente: input.titularPresente });
+          if (portal && data.stage === 'paid' && !openPaymentIssue(data)) issueReceipt(data, 'settlement', receiptToken);
+          return;
+        }
         if (kind === 'counter') {
-          recordCounterPayment(data, input.channel);
+          if (portal) requireThat(input.channel === 'cash', 'Los pagos digitales se verifican desde su enlace.');
+          recordCounterPayment(data, input.channel, staff.id ? staff : null);
           const payment = data.payments.at(-1);
           if (balance(data) === 0) {
             issueReceipt(data, 'balance', receiptToken, payment);
@@ -1467,14 +1651,14 @@ export async function makeApi(env, options = {}) {
         }
         throw new Problem('Acción no disponible.', 404);
       });
-      if (kind === 'arrive' && result.order.stage === 'arrived' && balance(result.order) > 0) {
+      if (!portal && kind === 'arrive' && result.order.stage === 'arrived' && balance(result.order) > 0) {
         try { await sendBalanceLink(result.order); }
         catch (error) { await update(id, data => openIssue(data, 'Envío del link de saldo pendiente', error.message, 'balance-link:' + result.order.attendance.at)); }
       }
-      if (kind === 'counter' && balance(result.order) === 0) await deliverPendingReceipts(result.order);
+      if (['counter', 'arrive'].includes(kind) && balance(result.order) === 0) await deliverPendingReceipts(result.order);
       if (kind === 'resolve') {
         await deliverPendingReceipts(result.order);
-        if (result.order.stage === 'arrived' && balance(result.order) > 0) {
+        if (!portal && result.order.stage === 'arrived' && balance(result.order) > 0) {
           try { await sendBalanceLink(result.order); }
           catch (error) { await update(id, data => openIssue(data, 'Envío del link de saldo pendiente', error.message, 'balance-link-retry')); }
         }

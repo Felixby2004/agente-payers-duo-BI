@@ -42,6 +42,20 @@ export async function openStore(config, { memory = false } = {}) {
     }
     return {
       label: 'Supabase',
+      async portal(action, data) {
+        const result = await client.rpc('payers_portal', { p_action: action, p_data: data });
+        if (result.error?.code === '23505') throw new Problem('Ese usuario ya existe.', 409);
+        return check(result);
+      },
+      async report(measure, from, to) {
+        const rows = [];
+        for (let start = 0; ; start += 500) {
+          const page = check(await client.from('payers_report_rows').select('date,ref,label,value')
+            .eq('measure', measure).gte('date', from).lte('date', to).order('date').order('ref').range(start, start + 499));
+          rows.push(...page);
+          if (page.length < 500) return rows;
+        }
+      },
       async settings() { return check(await settings().select('data').eq('id', 1).maybeSingle())?.data; },
       async saveSettings(data) { check(await settings().upsert({ id: 1, data, updated_at: new Date().toISOString() })); },
       async contact(phone) { return check(await contacts().select('phone,opted_out,opted_out_at').eq('phone', phone).maybeSingle()); },
@@ -121,6 +135,9 @@ export async function openStore(config, { memory = false } = {}) {
   await db.exec(await readFile(new URL('../supabase/migrations/003_contactos.sql', import.meta.url), 'utf8'));
   await db.exec(await readFile(new URL('../supabase/migrations/004_payers_availability.sql', import.meta.url), 'utf8'));
   await db.exec(await readFile(new URL('../supabase/migrations/005_availability_unconfigured.sql', import.meta.url), 'utf8'));
+  for (const migration of ['006_payers_portal.sql', '007_payers_reporting.sql', '008_payers_dimensional.sql', '009_payers_reprogramacion.sql']) {
+    await db.exec(await readFile(new URL('../supabase/migrations/' + migration, import.meta.url), 'utf8'));
+  }
   const queryRow = 'id,phone,state,message_count,excerpt,created_at,handled_at';
   async function noteQuery(phone, excerpt, create) {
     const current = (await db.query(`select ${queryRow} from payers_agent_queries where phone = $1 and state = 'open'`, [phone])).rows[0];
@@ -136,6 +153,18 @@ export async function openStore(config, { memory = false } = {}) {
   }
   return {
     label: 'PostgreSQL local',
+    async portal(action, data) {
+      try {
+        return (await db.query('select payers_portal($1,$2::jsonb) as result', [action, JSON.stringify(data)])).rows[0].result;
+      } catch (error) {
+        if (error.code === '23505') throw new Problem('Ese usuario ya existe.', 409);
+        throw error;
+      }
+    },
+    async report(measure, from, to) {
+      return (await db.query('select date::text,ref,label,value from payers_report_rows where measure=$1 and date between $2 and $3 order by date,ref',
+        [measure, from, to])).rows;
+    },
     async settings() { return (await db.query('select data from payers_agent_settings where id = 1')).rows[0]?.data; },
     async saveSettings(data) { await db.query('insert into payers_agent_settings (id,data) values (1,$1) on conflict (id) do update set data = excluded.data, updated_at = now()', [JSON.stringify(data)]); },
     async contact(phone) {

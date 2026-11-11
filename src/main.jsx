@@ -6,6 +6,7 @@ import { Detail, Register, Reservations } from './Operations.jsx';
 import { api } from './client.mjs';
 import { AgentSettings } from './AgentSettings.jsx';
 import { Availability } from './Availability.jsx';
+import { CustomerPortal, StaffAccounts, PdfReports } from './Portal.jsx';
 import { money, paymentLabels, visitText } from '../shared/orders.mjs';
 import './styles.css';
 
@@ -16,6 +17,7 @@ const nav = [
   { key: 'registro', label: 'Registrar pedido', icon: ClipboardPlus },
   { key: 'reportes', label: 'Reportes', icon: ReceiptText },
   { key: 'conexiones', label: 'Conexiones', icon: Settings2 },
+  { key: 'personal', label: 'Personal', icon: ShieldCheck },
 ];
 const current = () => nav.some(n => n.key === location.hash.slice(1)) ? location.hash.slice(1) : 'inicio';
 
@@ -47,19 +49,21 @@ function Config({ config, onSettings }) {
   </>;
 }
 
-function Login({ onSuccess }) {
+function Login({ onSuccess, portalEnabled }) {
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   return <div className="public-shell"><section className="public-card login">
-    <Brand /><span className="eyebrow">OPERACIONES PAYERS</span><h1>Acceso al panel</h1><p>Ingresa la contraseña de administración.</p>
+    <Brand /><span className="eyebrow">OPERACIONES PAYERS</span><h1>Acceso al panel</h1><p>{portalEnabled ? 'Ingresa con tu cuenta de personal.' : 'Ingresa la contraseña de administración.'}</p>
     <form onSubmit={async e => {
       e.preventDefault(); setBusy(true); setError('');
-      try { await api('login', { password }); await onSuccess(); }
+      try { await api('login', { username, password }); await onSuccess(); }
       catch (e) { setError(e.message); } finally { setBusy(false); }
-    }}><label>Contraseña<input required type="password" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} /></label>
+    }}>{portalEnabled && <label>Usuario<input required autoComplete="username" value={username} onChange={e => setUsername(e.target.value)} /></label>}<label>Contraseña<input required type="password" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} /></label>
       {error && <p className="error" role="alert">{error}</p>}
       <button className="button primary full" disabled={busy}>{busy ? 'Ingresando…' : 'Ingresar'} <ArrowRight size={17} /></button></form>
+    {portalEnabled && <a className="button outline full" href="/cliente">Ingresar como cliente</a>}
   </section></div>;
 }
 
@@ -67,6 +71,7 @@ function PublicPage({ type, token }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [digitalMethod, setDigitalMethod] = useState('checkout');
   const [returnPaymentId, setReturnPaymentId] = useState(() => {
     if (type !== 'payment') return '';
     const query = new URLSearchParams(location.search);
@@ -95,15 +100,16 @@ function PublicPage({ type, token }) {
       return () => clearInterval(id);
     }
   }, [refresh, type]);
-  async function simulate(outcome) {
+  async function simulate(outcome, method) {
     setBusy(true);
-    try { await api(path, { outcome }); await refresh(); }
+    try { await api(path, { outcome, method }); await refresh(); }
     catch (e) { setError(e.message); } finally { setBusy(false); }
   }
   return <div className="public-shell"><main className="public-card">
     <Brand />
-    <div className="public-head"><span className="eyebrow">DEMOSTRACIÓN · {data?.ref || 'PAYERS'}</span><h1>{type === 'payment' ? 'Anticipo de reserva' : 'Constancia de pago'}</h1></div>
+    <div className="public-head"><span className="eyebrow">DEMOSTRACIÓN · {data?.ref || 'PAYERS'}</span><h1>{type === 'payment' ? (data?.purpose === 'balance' ? 'Saldo de la reserva' : 'Anticipo de reserva') : 'Constancia de pago'}</h1></div>
     {error && <p className="error" role="alert">{error}</p>}
+    {type === 'receipt' && error && <a className="button outline" href="/cliente">Ir al portal del cliente</a>}
     {!data && !error && <p role="status">Consultando el estado…</p>}
     {data && type === 'payment' && <>
       <div className="public-amount"><small>{data.purpose === 'balance' ? 'IMPORTE DEL SALDO' : 'IMPORTE DEL ANTICIPO'}</small><strong>{money(data.amount)}</strong></div>
@@ -115,7 +121,17 @@ function PublicPage({ type, token }) {
           ? 'Este pago ya figura registrado. No necesitas volver a pagar; puedes cerrar esta página.'
           : data.unusableReason === 'reservation_changed' ? 'La reserva cambió y este enlace dejó de estar activo. Consulta el estado actualizado en WhatsApp.'
             : 'Este enlace de pago venció. Solicita uno nuevo si todavía tienes un importe pendiente.'}</p>
-        : data.mode === 'local' ? <>
+        : data.options ? <>
+          <label>Medio de pago<select value={digitalMethod} onChange={event => setDigitalMethod(event.target.value)}>
+            <option value="checkout">{data.mode === 'mercado_pago' ? 'Tarjeta · Mercado Pago de prueba' : 'Tarjeta de demostración'}</option>
+            {data.options.includes('yape') && <option value="yape">Yape simulado</option>}
+            {data.options.includes('plin') && <option value="plin">Plin simulado</option>}
+          </select></label>
+          {digitalMethod === 'checkout' && data.mode === 'mercado_pago' ? (data.checkoutUrl &&
+            <a className="button primary full" href={data.checkoutUrl} rel="noreferrer">Ir a Mercado Pago <ExternalLink size={17} /></a>)
+            : <div className="button-row"><button className="button primary" disabled={busy} onClick={() => simulate('approved', digitalMethod)}>Aprobar pago de prueba</button>
+              <button className="button outline" disabled={busy} onClick={() => simulate('rejected', digitalMethod)}>Simular rechazo</button></div>}
+        </> : data.mode === 'local' ? <>
           <p>{data.method === 'plin' ? 'Plin simulado' : data.method === 'yape' ? 'Yape simulado' : 'Tarjeta de demostración'}. Elige el resultado para ensayar la confirmación del anticipo.</p>
           <div className="button-row"><button className="button primary" disabled={busy} onClick={() => simulate('approved')}>Aprobar pago de prueba</button>
             <button className="button outline" disabled={busy} onClick={() => simulate('rejected')}>Simular rechazo</button></div>
@@ -146,7 +162,8 @@ function PublicPage({ type, token }) {
 }
 
 function App() {
-  const [page, setPage] = useState(current);
+  const [selectedPage, setPage] = useState(current);
+  const [portalEnabled, setPortalEnabled] = useState(false);
   const [config, setConfig] = useState(null);
   const [orders, setOrders] = useState([]);
   const [orderId, setOrderId] = useState(null);
@@ -163,6 +180,8 @@ function App() {
   const load = useCallback(async () => {
     try {
       const session = await api('session');
+      setPortalEnabled(Boolean(session.portalEnabled));
+      if (session.role === 'client') { location.replace('/cliente'); return; }
       if (!session.authenticated) { setLocked(true); setLoadError(''); return; }
       const [cfg, list] = await Promise.all([api('config'), api('orders')]);
       setConfig(cfg); setOrders(list); setLocked(false); setLoadError('');
@@ -186,21 +205,24 @@ function App() {
     const timer = setTimeout(() => setToast(null), 4600);
     return () => clearTimeout(timer);
   }, [toast]);
-  if (locked) return <Login onSuccess={load} />;
+  if (locked) return <Login onSuccess={load} portalEnabled={portalEnabled} />;
   if (!config) return <div className="public-shell"><div className="public-card"><Brand /><h1>El Establo</h1>
     {loadError ? <><p role="alert" className="error">{loadError}</p><button className="button primary" onClick={load}>Reintentar</button></> : <p role="status">Cargando el panel…</p>}</div></div>;
+  const navigation = nav.filter(item => (config.portalEnabled || item.key !== 'personal')
+    && (config.role !== 'cashier' || ['reservas','registro'].includes(item.key)));
+  const page = navigation.some(item => item.key === selectedPage) ? selectedPage : navigation[0].key;
   const opened = orders.find(o => o.id === orderId);
   return <div className="shell">
     <aside className="sidebar">
-      <button className="brand-button" onClick={() => go('inicio')}><Brand /></button>
+      <button className="brand-button" onClick={() => go(navigation[0].key)}><Brand /></button>
       <span className="nav-label">ESPACIO DE TRABAJO</span>
-      <nav aria-label="Principal">{nav.map(({ key, label, icon: Icon }) => <button className={page === key ? 'nav-item active' : 'nav-item'}
+      <nav aria-label="Principal">{navigation.map(({ key, label, icon: Icon }) => <button className={page === key ? 'nav-item active' : 'nav-item'}
         key={key} aria-current={page === key ? 'page' : undefined} onClick={() => go(key)}><Icon size={18} /><span>{label}</span>{page === key && <ChevronRight className="nav-arrow" size={15} />}</button>)}</nav>
       <div className="sidebar-foot"><div><i />{config.database}</div><small>Parrilladas El Establo</small></div>
     </aside>
     <div className="workspace">
-      <header className="topbar"><div className="crumb"><PanelTop size={16} /><span>Operaciones</span><ChevronRight size={13} /><strong>{nav.find(n => n.key === page).label}</strong></div>
-        <div className="top-actions"><span className="demo"><i /> Demostración</span><button className="icon-button" aria-label="Actualizar datos" disabled={refreshing} onClick={async () => {
+      <header className="topbar"><div className="crumb"><PanelTop size={16} /><span>Operaciones</span><ChevronRight size={13} /><strong>{navigation.find(n => n.key === page).label}</strong></div>
+        <div className="top-actions"><span className="demo"><i /> {config.role === 'cashier' ? 'Caja' : 'Administración'}</span><button className="icon-button" aria-label="Actualizar datos" disabled={refreshing} onClick={async () => {
           setRefreshing(true); await reload(); setRefreshing(false);
         }}><RefreshCw size={17} /></button>
           {config.protected ? <button className="icon-button" aria-label="Cerrar sesión" onClick={async () => {
@@ -214,7 +236,8 @@ function App() {
         {page === 'registro' && <Register config={config} notify={notify} created={order => { setOrders(list => [order, ...list.filter(o => o.id !== order.id)]); go('reservas'); setOrderId(order.id); }} />}
         {page === 'reservas' && <Reservations orders={orders} open={setOrderId} go={go} />}
         {page === 'disponibilidad' && <Availability />}
-        {page === 'reportes' && <Reports orders={orders} />}
+        {page === 'reportes' && <><Reports orders={orders} /><PdfReports /></>}
+        {page === 'personal' && <StaffAccounts />}
         {page === 'conexiones' && <Config config={config} onSettings={next => {
           setConfig(current => ({ ...current, ...next })); notify('Configuración guardada. El agente usará los nuevos valores.');
         }} />}
@@ -226,7 +249,8 @@ function App() {
   </div>;
 }
 const parts = location.pathname.split('/');
+if (parts[1] === 'comprobante' && parts[2] === 'portal') location.replace('/cliente');
 const publicType = parts[1] === 'pago' ? 'payment' : parts[1] === 'comprobante' ? 'receipt' : '';
 createRoot(document.getElementById('root')).render(<StrictMode>
-  {publicType ? <PublicPage type={publicType} token={encodeURIComponent(parts[2] || '')} /> : <App />}
+  {parts[1] === 'cliente' ? <CustomerPortal Brand={Brand} /> : publicType ? <PublicPage type={publicType} token={encodeURIComponent(parts[2] || '')} /> : <App />}
 </StrictMode>);

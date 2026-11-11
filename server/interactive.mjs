@@ -98,7 +98,7 @@ export function parseAction(value) {
   const page = id.match(/^(rsm|rsh):(EST-[A-F0-9]{8}):(\d{4}-\d{2}-\d{2}|\d{1,4})(?::(\d{1,4}))?$/i);
   if (page) return { action: page[1].toLowerCase(), ref: page[2].toUpperCase(), value: page[3], offset: Number(page[4] || (page[1].toLowerCase() === 'rsm' ? page[3] : 0)) };
   const match = id.match(/^([a-z]+):(EST-[A-F0-9]{8})$/i);
-  if (!match || !['pay', 'payb', 'yape', 'plin', 'bal', 'rcp', 'chg', 'hum', 'sel', 'selb', 'selc', 'rsx'].includes(match[1].toLowerCase())) return null;
+  if (!match || !['pay', 'payb', 'yape', 'plin', 'bal', 'rcp', 'chg', 'hum', 'sel', 'sela', 'selb', 'selc', 'rsx'].includes(match[1].toLowerCase())) return null;
   return { action: match[1].toLowerCase(), ref: match[2].toUpperCase() };
 }
 

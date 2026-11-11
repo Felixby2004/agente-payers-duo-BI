@@ -9,8 +9,14 @@ export function readConfig(env) {
   const waMode = env.WHATSAPP_MODE || 'off';
   const orchestration = env.AGENT_ORCHESTRATION || 'server';
   const remote = Boolean(publicUrl || paymentMode === 'mercado_pago' || waMode === 'cloud');
+  const portalEnabled = env.PAYERS_PORTAL === 'true';
+  const menuUrl = env.PUBLIC_MENU_IMAGE_URL || '';
+  if (menuUrl && !/^https:\/\/res\.cloudinary\.com\/[^\s]+$/i.test(menuUrl)) {
+    throw new Error('PUBLIC_MENU_IMAGE_URL debe ser un enlace HTTPS público de res.cloudinary.com.');
+  }
   const required = [];
   if (remote) required.push('PUBLIC_URL', 'ADMIN_PASSWORD', 'SESSION_SECRET');
+  else if (portalEnabled) required.push('ADMIN_PASSWORD');
   // WA_ALLOWED_PHONES es opcional: vacía significa modo abierto para cualquier remitente.
   if (waMode === 'cloud') required.push('WA_GRAPH_VERSION', 'WA_PHONE_NUMBER_ID', 'WA_ACCESS_TOKEN', 'WA_VERIFY_TOKEN', 'WA_APP_SECRET');
   if (orchestration === 'n8n') required.push('N8N_AGENT_TOKEN');
@@ -23,6 +29,7 @@ export function readConfig(env) {
   if (!['server', 'n8n'].includes(orchestration) || (orchestration === 'n8n' && env.N8N_AGENT_TOKEN.length < 32)) throw new Error('Configura el modo de agente y un token n8n de al menos 32 caracteres.');
   if (publicUrl && (!/^https:\/\//.test(publicUrl) || new URL(publicUrl).origin !== publicUrl)) throw new Error('PUBLIC_URL debe ser el origen HTTPS público, sin ruta.');
   if (env.N8N_WAKE_URL && new URL(env.N8N_WAKE_URL).protocol !== 'https:') throw new Error('N8N_WAKE_URL debe usar HTTPS.');
+  if (portalEnabled && env.ADMIN_PASSWORD.length < 12) throw new Error('ADMIN_PASSWORD debe tener al menos 12 caracteres.');
   if (remote && (env.ADMIN_PASSWORD.length < 12 || env.SESSION_SECRET.length < 32)) throw new Error('Configura ADMIN_PASSWORD con 12 caracteres y SESSION_SECRET con 32 como mínimo.');
   const rate = Number(env.DEPOSIT_PER_PERSON || 20);
   const deadline = Number(env.DEPOSIT_DEADLINE_MINUTES || 120);
@@ -40,7 +47,7 @@ export function readConfig(env) {
   if (!['off', 'staff', 'open'].includes(reservationMode)) throw new Error('Revisa WA_RESERVATION_MODE.');
   const reservationStaff = new Set((env.WA_RESERVATION_STAFF || '').split(',').map(phone).filter(Boolean));
   return {
-    env, publicUrl, paymentMode, waMode, orchestration, depositPerPerson: Math.round(rate * 100),
+    env, publicUrl, paymentMode, waMode, orchestration, portalEnabled, menuUrl, depositPerPerson: Math.round(rate * 100),
     deadlineMs: deadline * 60000, graceMs: grace * 60000,
     adminPassword: env.ADMIN_PASSWORD || '', sessionSecret: env.SESSION_SECRET || randomBytes(32).toString('hex'),
     reminderEnabled: waMode === 'cloud' && env.ENABLE_REMINDERS === 'true',

@@ -55,11 +55,11 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [570, -96],
-      "notes": "El servidor descarga imágenes y audios desde Meta, aplica IA y contesta en WhatsApp. n8n recibe solo conteos."
+      "notes": "El servidor atiende mensajes, adjuntos y llegadas. El portal gestiona los códigos y los comprobantes. n8n recibe solo conteos."
     },
     {
       "parameters": {
-        "jsCode": "return $input.all().filter(item => item.json.evaluateAlerts);"
+        "jsCode": "const settings = $('API del restaurante').first().json;\nreturn settings.evaluateAlerts ? [{ json: { apiUrl: settings.apiUrl } }] : [];"
       },
       "id": "05be3d70-8bfc-4ec7-8a13-4252bd401d96",
       "name": "Solo horario o prueba manual",
@@ -80,17 +80,15 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [820, 128],
-      "notes": "Lee la configuración vigente de Supabase, revisa la reserva y envía recordatorios o genera incidencias."
+      "notes": "Reconcilia Mercado Pago y aplica plazos, hora acordada con el pagador, avisos de visita e incidencias de caja en hora de Lima."
     }
   ],
   "connections": {
     "Cada minuto": { "main": [[{ "node": "API del restaurante", "type": "main", "index": 0 }]] },
     "Ejecutar prueba manual": { "main": [[{ "node": "API del restaurante", "type": "main", "index": 0 }]] },
     "Despertar por WhatsApp": { "main": [[{ "node": "API del restaurante", "type": "main", "index": 0 }]] },
-    "API del restaurante": { "main": [[
-      { "node": "Procesar mensajes y adjuntos", "type": "main", "index": 0 },
-      { "node": "Solo horario o prueba manual", "type": "main", "index": 0 }
-    ]] },
+    "API del restaurante": { "main": [[{ "node": "Procesar mensajes y adjuntos", "type": "main", "index": 0 }]] },
+    "Procesar mensajes y adjuntos": { "main": [[{ "node": "Solo horario o prueba manual", "type": "main", "index": 0 }]] },
     "Solo horario o prueba manual": { "main": [[{ "node": "Evaluar alertas configuradas", "type": "main", "index": 0 }]] }
   },
   "active": false,

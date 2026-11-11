@@ -119,3 +119,24 @@ powershell -ExecutionPolicy Bypass -File .\scripts\stop-demo.ps1
 El inicio levanta el servidor y los túneles temporales y actualiza `PUBLIC_URL`. Las respuestas a mensajes se procesan directamente al llegar el webhook de Meta; n8n conserva las alertas programadas y la revisión de respaldo de la cola. Después de cada inicio debes actualizar en Meta la URL de devolución de WhatsApp y en Mercado Pago la URL de prueba de pagos. Ambas direcciones se muestran en la salida del comando. Los registros y la lista de procesos se guardan en `.demo/`.
 
 Si ya hay una instancia n8n saludable en `N8N_PORT` y tiene registrado el webhook de producción del workflow, el script la reutiliza en lugar de iniciar otra; `stop-demo.ps1` no detiene esa instancia preexistente. Si el puerto 5173 sigue ocupado después de detener los procesos registrados, el inicio falla antes de levantar n8n o los túneles.
+
+## Actualización PAYERS con portal y caja
+
+### Crear la base y activar el portal
+
+- **Supabase nuevo.** Ejecuta [01_supabase_creacion.sql](sql/01_supabase_creacion.sql) en el SQL Editor. Crea el almacenamiento operativo, las vistas de consulta y el esquema dimensional vacío.
+- **Supabase de la demo existente.** Aplica las migraciones pendientes en orden. Si ya aplicaste la 005, empieza con la [006](supabase/migrations/006_payers_portal.sql) y sigue con la [007](supabase/migrations/007_payers_reporting.sql), la [008](supabase/migrations/008_payers_dimensional.sql) y la [009](supabase/migrations/009_payers_reprogramacion.sql).
+- **SSMS.** Ejecuta [02_ssms_2022_creacion.sql](sql/02_ssms_2022_creacion.sql) en SQL Server 2022. Crea las bases vacías **ElEstablo_PAYERS_Transaccional** y **ElEstablo_PAYERS_Dimensional**. SQL Server guarda los archivos de datos en la ubicación predeterminada de la instancia. Abre **Database Diagrams** en cada base para mostrar las tablas y sus relaciones.
+
+En el archivo .env existente agrega PAYERS_PORTAL=true y ADMIN_USERNAME=admin (o el usuario que prefieras). Conserva ADMIN_PASSWORD, SESSION_SECRET y las credenciales ya configuradas. El usuario inicial se habilita con esas variables. En **Personal**, un administrador puede crear las cuentas individuales de los cajeros. Si tienes la imagen de la carta, configura PUBLIC_MENU_IMAGE_URL con su enlace público HTTPS de res.cloudinary.com.
+
+Para entrar a **/cliente**, registra un pedido con el celular que usará el pagador. La pantalla de acceso solicita un código enviado al mismo número. Configura WA_TEMPLATE_OTP con una plantilla aprobada de categoría **Autenticación** y botón **Copiar código**. En WA_TEMPLATE_OTP_LANGUAGE pon el idioma exacto de la plantilla de Meta. El código vence en cinco minutos, admite cinco comprobaciones fallidas y se consume al verificarlo. La demo con WhatsApp usa los destinatarios autorizados en Meta. El enlace de constancias que recibe el pagador lleva al portal.
+
+### Cobranza y alertas con el portal activo
+
+1. Desde el panel o WhatsApp se emite un enlace de anticipo. Se reutiliza mientras esté vigente. Desde **Conexiones** se ajustan la vigencia, la espera para reemitir y el máximo de hasta tres enlaces por finalidad. Si el pagador indica una hora futura antes del vencimiento, el agente programa ese aviso y pausa los demás recordatorios de anticipo hasta terminar el día acordado, en hora de Lima.
+2. En el día de la visita, **Ya llegué** deja la asistencia **Por verificar**. El cajero confirma presencialmente, registra el número de asistentes e indica si está presente el titular.
+3. En caja se confirma el efectivo o se envía el enlace de saldo. La página de pago ofrece Mercado Pago de prueba y las simulaciones Yape/Plin habilitadas. El efectivo se registra en caja. El anticipo aplicado y el saldo aplicado se concilian con el total del pedido para emitir la constancia de liquidación.
+4. En **Reportes**, el administrador puede descargar M5, M1 o M3 en PDF. Mientras el esquema dimensional físico espera su carga, los PDF consultan las vistas de hechos construidas sobre la operación vigente. Los registros históricos de asistencia sin confirmación explícita de la presencia del titular no cuentan para M3.
+
+El workflow [Establo-PAYERS.json](n8n/Establo-PAYERS.json) procesa la cola antes de evaluar los plazos y avisos en los ciclos programados. Reimporta y configura el workflow según [la guía de activación](n8n/Activacion.md). Los códigos de acceso se envían desde el servidor con Meta, y n8n recibe los conteos de procesamiento.

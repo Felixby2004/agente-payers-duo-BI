@@ -17,6 +17,12 @@ El panel, la API y n8n comparten las reservas a través del servidor PAYERS. En 
 4. En otra ventana de PowerShell, desde la carpeta `el-establo-payers`, ejecuta `npm.cmd ci` si faltan dependencias, luego `npm.cmd run build` y `npm.cmd start`. Abre la URL del túnel y verifica que el panel pida la contraseña de administración.
 5. Configura Meta con ese origen más `/api/webhooks/whatsapp` y Mercado Pago con ese origen más `/api/webhooks/mercado-pago`. Mantén abiertas las dos ventanas durante la prueba. Si el túnel cambia de dirección, actualiza `PUBLIC_URL`, n8n y los dos webhooks. [Guía oficial de túneles temporales](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
 
+## Portal y caja
+
+Aplica las migraciones pendientes de PAYERS y activa PAYERS_PORTAL=true en el servidor. En Meta, configura WA_TEMPLATE_OTP con la plantilla de autenticación aprobada. El enlace de las plantillas de anticipo y liquidación que apunta a /comprobante/ usa el sufijo portal en el nuevo flujo y abre /cliente. El webhook de WhatsApp conserva su ruta.
+
+El workflow programado procesa primero la cola y luego concilia los plazos y avisos. El disparador de WhatsApp procesa solo la cola. El servidor conserva las reglas, permisos y comprobaciones de pago.
+
 ## 2. Importar el workflow
 
 1. En n8n, importa [Establo-PAYERS.json](Establo-PAYERS.json) desde archivo.

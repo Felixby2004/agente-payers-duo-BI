@@ -38,7 +38,7 @@ export function Register({ config, created, notify }) {
   const [forceCapacity, setForceCapacity] = useState(false);
   const results = samples.filter(x => normalize(x.payer + ' ' + x.notes).includes(normalize(query)));
   const set = (name, value) => setForm(current => ({ ...current, [name]: value }));
-  const total = form.items.reduce((sum, i) => sum + i.quantity * i.price, 0);
+  const total = form.items.reduce((sum, i) => sum + i.quantity * i.price - (i.discount || 0), 0);
   const deposit = form.guests * config.depositPerPerson;
   function changeItem(index, field, value) {
     setForm(current => ({ ...current, items: current.items.map((item, j) => index === j ? { ...item, [field]: value } : item) }));
@@ -61,6 +61,10 @@ export function Register({ config, created, notify }) {
   }
   async function copyTemplate() {
     setError('');
+    if (form.items.some(item => item.discount > 0)) {
+      setError('Registra los pedidos con descuento desde este formulario para conservar el importe pactado.');
+      return;
+    }
     try {
       await navigator.clipboard.writeText(reservationTemplate(form));
       notify('Plantilla de reserva copiada.');
@@ -99,10 +103,13 @@ export function Register({ config, created, notify }) {
           </select><button type="button" className="button outline" onClick={() => set('items', [...form.items, { ...menu[Number(product)], quantity: 1 }])}><Plus size={16} /> Añadir</button>
           <button type="button" className="text-button" onClick={() => set('items', [...form.items, { name: '', price: 0, quantity: 1 }])}>Otro producto</button></div>
           {!form.items.length ? <Empty icon={ClipboardList} title="Agrega el primer producto" detail="Los importes se calcularán a partir de las líneas del pedido." /> :
-            <div className="item-rows">{form.items.map((item, i) => <div className="item-row" key={i}>
+            <div className="item-rows with-discount">{form.items.map((item, i) => <div className="item-row" key={i}>
               <label>Producto<input required value={item.name} onChange={e => changeItem(i, 'name', e.target.value)} /></label>
               <label>Cantidad<input aria-label={'Cantidad de línea ' + (i + 1)} required type="number" min="1" max="100" value={item.quantity} onChange={e => changeItem(i, 'quantity', e.target.value === '' ? '' : Number(e.target.value))} /></label>
               <label>Precio S/<input aria-label={'Precio de línea ' + (i + 1)} required type="number" min="0" max="10000" step="0.01" value={item.price === '' ? '' : item.price / 100} onChange={e => changeItem(i, 'price', e.target.value === '' ? '' : Math.round(Number(e.target.value) * 100))} /></label>
+              <label>Descuento S/<input aria-label={'Descuento total de línea ' + (i + 1)} type="number" min="0"
+                max={(Number(item.price || 0) * Number(item.quantity || 0)) / 100} step="0.01" value={item.discount == null ? '' : item.discount / 100}
+                onChange={e => changeItem(i, 'discount', e.target.value === '' ? undefined : Math.round(Number(e.target.value) * 100))} /></label>
               <button type="button" className="icon-button" aria-label={'Quitar línea ' + (i + 1)} onClick={() => set('items', form.items.filter((_, j) => j !== i))}><Trash2 size={16} /></button>
             </div>)}</div>}
         </section>
@@ -114,7 +121,7 @@ export function Register({ config, created, notify }) {
           <div className="summary-total"><dt>Saldo en el local</dt><dd>{money(Math.max(total - deposit, 0))}</dd></div></dl>
         {form.synthetic && <p className="inline-note">Caso ficticio. Agrega tu propio número autorizado para la prueba por WhatsApp.</p>}
         <label className="check"><input type="checkbox" checked={form.agreed} onChange={e => set('agreed', e.target.checked)} /> El pedido, el total y la visita ya fueron acordados.</label>
-        <label className="check"><input type="checkbox" checked={forceCapacity} onChange={e => setForceCapacity(e.target.checked)} /> Permitir exceder el aforo de esta franja (solo personal)</label>
+        {config.role !== 'cashier' && <label className="check"><input type="checkbox" checked={forceCapacity} onChange={e => setForceCapacity(e.target.checked)} /> Permitir exceder el aforo de esta franja</label>}
         {error && <p className="error" role="alert">{error}</p>}
         <button type="button" className="button outline full" onClick={copyTemplate}><Copy size={16} /> Copiar plantilla de reserva</button>
         <button type="submit" className="button primary full" disabled={busy}>{busy ? 'Registrando…' : 'Registrar en PAYERS'} <ArrowRight size={17} /></button>
@@ -126,14 +133,14 @@ export function Register({ config, created, notify }) {
 export function Reservations({ orders, open, go }) {
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('');
-  const matches = orders.filter(o => (!filter || o.stage === filter) && normalize(o.payer + ' ' + o.ref + ' ' + o.phone).includes(normalize(query)));
+  const matches = orders.filter(o => (!filter || (filter === 'arrival_pending' ? o.stage === 'confirmed' && o.attendance?.state === 'pending' : o.stage === filter)) && normalize(o.payer + ' ' + o.ref + ' ' + o.phone).includes(normalize(query)));
   return <>
     <div className="page-head"><div><span className="eyebrow">OPERACIONES</span><h1>Reservas</h1><p>Control de anticipos, visitas y saldos en el local.</p></div>
       <button className="button primary" onClick={() => go('registro')}><Plus size={17} /> Registrar pedido</button></div>
     <section className="panel">
       <div className="panel-head"><div><h2>Pedidos registrados</h2><p>{matches.length} {matches.length === 1 ? 'reserva' : 'reservas'}</p></div>
         <div className="button-row"><label className="search"><Search size={17} /><input aria-label="Buscar reserva" value={query} onChange={e => setQuery(e.target.value)} placeholder="Nombre o referencia" /></label>
-          <select aria-label="Filtrar por estado" value={filter} onChange={e => setFilter(e.target.value)}><option value="">Todos los estados</option>
+          <select aria-label="Filtrar por estado" value={filter} onChange={e => setFilter(e.target.value)}><option value="">Todos los estados</option><option value="arrival_pending">Asistencia por verificar</option>
             {Object.entries(stageLabels).map(([stage, label]) => <option key={stage} value={stage}>{label}</option>)}</select></div></div>
       <OrdersTable orders={matches} open={open} />
     </section>
@@ -145,6 +152,7 @@ export function Detail({ order, config, close, reload, notify }) {
   const [error, setError] = useState('');
   const [tab, setTab] = useState('gestión');
   const [count, setCount] = useState(order.guests);
+  const [titularPresente, setTitularPresente] = useState('');
   const [channel, setChannel] = useState('cash');
   const [rescheduleDay, setRescheduleDay] = useState(localDateInput(order.visitAt).slice(0, 10));
   const [rescheduleTime, setRescheduleTime] = useState('');
@@ -236,19 +244,24 @@ export function Detail({ order, config, close, reload, notify }) {
             {config.paymentMode === 'mercado_pago' && <div className="action-line"><input aria-label="Número de operación de Mercado Pago" value={paymentId} onChange={e => setPaymentId(e.target.value)} placeholder="N.º de operación" />
               <button className="button outline" disabled={Boolean(busy) || !paymentId} onClick={() => run('sync', { paymentId }, 'Consulta de pago completada.')}>Consultar pago</button></div>}
           </section>}
-          {order.stage === 'confirmed' && <section className="action-panel"><h3><Users size={18} /> Recepción en el local</h3><p>Registra a las personas que llegaron al restaurante.</p>
+          {order.stage === 'confirmed' && <section className="action-panel"><h3><Users size={18} /> Asistencia en el local</h3>
+            {order.attendance?.reportedAt ? <p className="inline-note"><strong>Por verificar</strong> · Aviso de WhatsApp a las {visitText(order.attendance.reportedAt)}</p>
+              : <p>Registra a las personas que llegaron al restaurante.</p>}
             <div className="action-line"><label>Asistentes<input type="number" min="1" max={order.guests} value={count} onChange={e => setCount(e.target.value)} /></label>
-              <button className="button primary" disabled={Boolean(busy)} onClick={() => run('arrive', { count }, 'Llegada verificada.')}>Confirmar llegada</button>
+              {config.portalEnabled && <label>¿Está el titular?<select required value={titularPresente} onChange={e => setTitularPresente(e.target.value)}>
+                <option value="">Selecciona</option><option value="yes">Sí</option><option value="no">No</option></select></label>}
+              <button className="button primary" disabled={Boolean(busy) || (config.portalEnabled && !titularPresente)}
+                onClick={() => run('arrive', { count, titularPresente: titularPresente ? titularPresente === 'yes' : undefined }, 'Llegada verificada.')}>Confirmar asistencia</button>
               {config.whatsapp === 'cloud' && <button className="button outline" disabled={Boolean(busy)} onClick={() => run('message', { type: 'visit' }, 'WhatsApp aceptó el recordatorio.')}>Recordar visita</button>}</div>
           </section>}
           {order.stage === 'arrived' && <section className="action-panel"><h3><ReceiptText size={18} /> Cobro en caja</h3><p>Registra el pago de demostración del saldo de {money(balance(order))}.</p>
             <p>Link de saldo: <strong>{balanceIntent?.status === 'pending' && +new Date(balanceIntent.expiresAt) > Date.now() ? 'pendiente' : balanceIntent?.status === 'superseded' ? 'superado por caja' : balanceIntent ? 'vencido' : 'no creado'}</strong></p>
             <div className="action-line"><select aria-label="Medio de pago en caja" value={channel} onChange={e => setChannel(e.target.value)}>
-              <option value="cash">Efectivo de demostración</option><option value="pos">POS de demostración</option><option value="wallet">Billetera de demostración</option></select>
+              <option value="cash">Efectivo de demostración</option>{!config.portalEnabled && <><option value="pos">POS de demostración</option><option value="wallet">Billetera de demostración</option></>}</select>
               <button className="button primary" disabled={Boolean(busy) || balance(order) <= 0} onClick={() => run('counter', { channel }, 'Saldo registrado en caja.')}>Confirmar cobro</button></div>
-            {config.whatsapp === 'cloud' && <div className="button-row">
-              <button className="button outline" disabled={Boolean(busy) || balance(order) <= 0} onClick={() => run('message', { type: 'balance' }, 'Envío de link solicitado como respaldo.')}>Enviar link de pago por WhatsApp</button>
-              <button className="button outline" disabled={Boolean(busy) || balance(order) <= 0} onClick={() => run('message', { type: 'balance', newLink: true }, 'Link de saldo reenviado como respaldo.')}>Reenviar nuevo link</button>
+            {(config.whatsapp === 'cloud' || config.portalEnabled) && <div className="button-row">
+              <button className="button outline" disabled={Boolean(busy) || balance(order) <= 0} onClick={() => run('message', { type: 'balance' }, config.whatsapp === 'cloud' ? 'Enlace solicitado por WhatsApp.' : 'Enlace de saldo preparado.')}>Enviar enlace de saldo</button>
+              {balanceIntent?.status === 'pending' && <a className="button outline" href={'/pago/' + balanceIntent.id} target="_blank" rel="noreferrer">Abrir enlace</a>}
             </div>}
           </section>}
           {order.stage === 'paid' && <section className="action-panel"><h3><FileCheck2 size={18} /> Pago completo</h3><p>El saldo se verificó. PAYERS está preparando y enviando la constancia automáticamente.</p></section>}
@@ -273,13 +286,13 @@ export function Detail({ order, config, close, reload, notify }) {
                 {rescheduleChoices.map(slot => <option key={slot.time} value={slot.time}>{slot.time}{forceReschedule && slot.occupied + order.guests > slot.capacity ? ' · Aforo completo (forzar)' : ''}</option>)}
               </select></label>
               <button className="button outline" disabled={Boolean(busy) || !rescheduleTime} onClick={() => run('reschedule', { visitAt: fromLima(rescheduleDay + 'T' + rescheduleTime), forceCapacity: forceReschedule }, 'Visita reprogramada.')}>Guardar cambio</button></div>
-            <label className="check"><input type="checkbox" checked={forceReschedule} onChange={e => setForceReschedule(e.target.checked)} /> Permitir exceder el aforo (solo personal)</label>
+            {config.role !== 'cashier' && <label className="check"><input type="checkbox" checked={forceReschedule} onChange={e => setForceReschedule(e.target.checked)} /> Permitir exceder el aforo</label>}
             <label>Motivo<input value={reason} onChange={e => setReason(e.target.value)} placeholder="Motivo de cancelación o inasistencia" /></label>
             <div className="button-row"><button className="button outline danger" disabled={Boolean(busy) || reason.trim().length < 3} onClick={() => run('cancel', { reason }, 'Reserva cancelada.')}>Cancelar reserva</button>
               {order.stage === 'confirmed' && +new Date(order.visitAt) + config.graceMinutes * 60000 <= Date.now()
                 && <button className="button outline" disabled={Boolean(busy) || reason.trim().length < 3} onClick={() => run('no-show', { reason }, 'Inasistencia registrada.')}>Registrar inasistencia</button>}</div>
           </details>}
-          {order.payments.filter(p => p.amount > 0 && p.purpose === 'deposit'
+          {config.role !== 'cashier' && order.payments.filter(p => p.amount > 0 && p.purpose === 'deposit'
             && (['cancelled', 'no_show'].includes(order.stage) || pendingIssues.some(i => i.key === p.ref))
             && !order.payments.some(q => q.original === p.ref)).map(p => <section className="action-panel" key={p.ref}>
             <h3>Devolución del anticipo</h3><p>{money(p.amount)} · {paymentLabels[p.channel]}</p>
@@ -288,7 +301,7 @@ export function Detail({ order, config, close, reload, notify }) {
             }}>Procesar devolución autorizada</button></section>)}
         </>}
         {tab === 'pedido' && <><section className="action-panel"><h3><ClipboardList size={18} /> Productos acordados</h3>
-          <ul className="detail-list">{order.items.map((item, i) => <li key={i}><span>{item.quantity} × {item.name}</span><strong>{money(item.price * item.quantity)}</strong></li>)}</ul>
+          <ul className="detail-list">{order.items.map((item, i) => <li key={i}><span>{item.quantity} × {item.name}</span><strong>{money(item.price * item.quantity - (item.discount || 0))}</strong></li>)}</ul>
           {order.notes && <p>{order.notes}</p>}</section>
           <section className="action-panel"><h3><ReceiptText size={18} /> Movimientos verificados</h3>
             {!order.payments.length ? <p>Todavía no hay pagos confirmados.</p> : <ul className="detail-list">{order.payments.map(p => <li key={p.ref}>

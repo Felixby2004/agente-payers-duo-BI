@@ -174,6 +174,14 @@ export function providers(config) {
           || order.receipts.at(-1)?.token }] });
       return submit(order.phone, { type: 'template', template: { name, language: { code: e.WA_TEMPLATE_LANGUAGE || 'es_PE' }, components } });
     },
+    async sendOtp(phone, code) {
+      requireThat(config.waMode === 'cloud' && e.WA_TEMPLATE_OTP && config.isPhoneAllowed(phone)
+        && !config.isPhoneBlocked(phone), 'El envío del código aún no está configurado.', 503);
+      const parameters = [{ type: 'text', text: code }];
+      return submit(phone, { type: 'template', template: { name: e.WA_TEMPLATE_OTP,
+        language: { code: e.WA_TEMPLATE_OTP_LANGUAGE || e.WA_TEMPLATE_LANGUAGE || 'es_PE' },
+        components: [{ type: 'body', parameters }, { type: 'button', sub_type: 'url', index: '0', parameters }] } });
+    },
     // Solo para responder a un mensaje entrante reciente. Nunca inicia una conversación.
     async sendWhatsAppReply(phone, text) {
       requireThat(config.waMode === 'cloud', 'Conecta WhatsApp Cloud API para enviar mensajes.', 409);

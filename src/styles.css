@@ -321,3 +321,12 @@ dd { margin: 0; font-weight: 760; color: var(--dark-wine); text-align: right; }
   .public-card { width: 100%; max-width: none; box-shadow: none; border: 0; }
   .print-hide { display: none !important; }
 }
+
+.customer-card { width: min(100%, 760px); }
+.customer-card h2 { margin: 22px 0 8px; }
+.customer-card .action-panel { margin-top: 13px; }
+.customer-menu { display: block; max-width: 100%; max-height: 80vh; width: auto; margin: 12px auto 0; object-fit: contain; }
+.staff-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 175px), 1fr)); gap: 12px; align-items: end; margin: 14px 0; }
+.login > a.button { margin-top: 12px; }
+.with-discount .item-row { grid-template-columns: minmax(120px, 1.8fr) repeat(3, minmax(64px, 1fr)) auto; }
+@media (max-width: 620px) { .with-discount .item-row { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

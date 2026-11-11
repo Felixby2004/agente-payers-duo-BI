@@ -9,13 +9,17 @@ export function requireThat(condition, message, status) {
 }
 const now = () => new Date().toISOString();
 export const digits = (value = '') => String(value).replace(/\D/g, '');
+export function whatsappPhone(value) {
+  const phone = digits(value);
+  return /^9\d{8}$/.test(phone) ? '51' + phone : phone;
+}
 export function addEvent(order, title, detail = '', actor = 'Sistema') {
   order.events.push({ id: randomUUID(), at: now(), title, detail, actor });
 }
 export function createOrder(input, config) {
   requireThat(input?.agreed === true, 'Confirma que el pedido y la visita ya fueron acordados.');
   const payer = String(input.payer || '').trim().slice(0, 100);
-  const phone = digits(input.phone);
+  const phone = whatsappPhone(input.phone);
   const guests = Number(input.guests);
   const visitAt = new Date(input.visitAt);
   requireThat(payer.length >= 2, 'Escribe el nombre del pagador.');
@@ -29,9 +33,11 @@ export function createOrder(input, config) {
     const price = Number(item.price), quantity = Number(item.quantity);
     requireThat(name && Number.isInteger(price) && price >= 0 && price <= 1000000, 'Revisa los nombres y precios del pedido.');
     requireThat(Number.isInteger(quantity) && quantity >= 1 && quantity <= 100, 'Revisa las cantidades del pedido.');
-    return { name, price, quantity };
+    const discount = Number(item.discount ?? 0);
+    requireThat(Number.isInteger(discount) && discount >= 0 && discount <= price * quantity, 'Revisa el descuento pactado.');
+    return { name, price, quantity, ...(discount ? { discount } : {}) };
   });
-  const total = items.reduce((sum, item) => sum + item.quantity * item.price, 0);
+  const total = items.reduce((sum, item) => sum + item.quantity * item.price - (item.discount || 0), 0);
   const deposit = config.depositPerPerson * guests;
   requireThat(total >= deposit && deposit > 0, 'El total del pedido debe cubrir el anticipo por persona.');
   const id = randomUUID();
@@ -79,15 +85,17 @@ export function applyPayment(order, payment) {
   return true;
 }
 
-export function arrive(order, count) {
+export function arrive(order, count, { staff, titularPresente } = {}) {
   requireThat(order.stage === 'confirmed', 'Primero confirma el anticipo de la reserva.', 409);
   requireThat(Number.isInteger(count) && count >= 1 && count <= order.guests, 'La asistencia debe estar entre 1 y la cantidad reservada.');
-  order.attendance = { count, at: now() };
+  order.attendance = { ...order.attendance, count, at: now(), state: 'confirmed',
+    ...(staff ? { staffId: staff.id, staffName: staff.name } : {}),
+    ...(typeof titularPresente === 'boolean' ? { titularPresente } : {}) };
   order.stage = balance(order) === 0 ? 'paid' : 'arrived';
-  addEvent(order, 'Llegada verificada', count + ' de ' + order.guests + ' personas.', 'Recepción');
+  addEvent(order, 'Llegada verificada', count + ' de ' + order.guests + ' personas.', staff?.name || 'Recepción');
 }
 
-export function recordCounterPayment(order, channel) {
+export function recordCounterPayment(order, channel, staff) {
   requireThat(order.stage === 'arrived' && balance(order) > 0, 'No hay un saldo por cobrar en caja.', 409);
   requireThat(['cash', 'pos', 'wallet'].includes(channel), 'Selecciona un medio de demostración.');
   const amount = balance(order);
@@ -95,7 +103,7 @@ export function recordCounterPayment(order, channel) {
     intent.status = 'superseded';
     intent.supersededAt = now();
   }
-  applyPayment(order, { ref: 'CAJA-' + randomUUID(), amount, purpose: 'balance', channel, actor: 'Personal de caja' });
+  applyPayment(order, { ref: 'CAJA-' + randomUUID(), amount, purpose: 'balance', channel, actor: staff?.name || 'Personal de caja', staffId: staff?.id });
 }
 
 export function issueReceipt(order, purpose, token, sourcePayment = null) {
