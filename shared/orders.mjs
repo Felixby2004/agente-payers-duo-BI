@@ -5,7 +5,7 @@ export const stageLabels = {
   awaiting_deposit: 'Anticipo pendiente',
   confirmed: 'Reserva confirmada',
   arrived: 'Saldo pendiente',
-  paid: 'Por emitir comprobante',
+  paid: 'Pago completo',
   closed: 'Cobranza cerrada',
   cancelled: 'Cancelada',
   no_show: 'Inasistencia',

@@ -57,14 +57,14 @@ test('De formulario a cierre de caja, con rechazos, confirmación duplicada y de
     const arrived = await call(p + 'arrive', { count: 3 });
     assert.equal(arrived.order.attendance.count, 3);
     const settled = await call(p + 'counter', { channel: 'cash' });
-    assert.equal(settled.order.stage, 'paid');
+    assert.equal(settled.order.stage, 'closed');
     assert.equal(balance(settled.order), 0);
     await call(p + 'counter', { channel: 'cash' }, 409);
     const closed = await call(p + 'receipt', {});
     assert.equal(closed.order.stage, 'closed');
     const repeated = await call(p + 'receipt', {});
     assert.equal(repeated.result.token, closed.result.token);
-    assert.equal(repeated.order.receipts.length, 2);
+    assert.equal(repeated.order.receipts.length, 3);
     const publicReceipt = await call('receipt/' + closed.result.token);
     assert.equal(publicReceipt.appliedDeposit, 8000);
     assert.equal(publicReceipt.amount, 24000);
@@ -99,6 +99,55 @@ test('De formulario a cierre de caja, con rechazos, confirmación duplicada y de
   }
 });
 
+test('El link de saldo aparece al registrar llegada; caja supersede el intento y el pago en línea cierra automáticamente', async () => {
+  const api = await makeApi({}, { memory: true });
+  const server = createServer((req, res) => api.middleware(req, res, () => res.end()));
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const root = 'http://127.0.0.1:' + server.address().port + '/api/';
+  async function call(path, body, expected = 200) {
+    const res = await fetch(root + path, body === undefined ? {} : { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' } });
+    const result = await res.json();
+    assert.equal(res.status, expected, JSON.stringify(result));
+    return result;
+  }
+  const seed = { agreed: true, payer: 'Cliente de prueba', phone: '51911111111', consent: true, guests: 1,
+    visitAt: new Date(Date.now() + 86400000).toISOString(), items: [{ name: 'Parrilla', price: 6000, quantity: 1 }] };
+  try {
+    const order = await call('orders', seed, 201), prefix = 'orders/' + order.id + '/';
+    const deposit = await call(prefix + 'link', {});
+    await call('payment/' + deposit.intent.id, { outcome: 'approved' });
+    const arrived = await call(prefix + 'arrive', { count: 1 });
+    const balanceIntent = arrived.order.intents.find(item => item.purpose === 'balance');
+    assert.ok(balanceIntent);
+    assert.equal(balanceIntent.amount, 4000);
+    assert.ok(+new Date(balanceIntent.expiresAt) > Date.now());
+    const settledAtCounter = await call(prefix + 'counter', { channel: 'cash' });
+    assert.equal(settledAtCounter.order.intents.find(item => item.id === balanceIntent.id).status, 'superseded');
+    assert.equal(settledAtCounter.order.stage, 'closed');
+    assert.equal(settledAtCounter.order.receipts.filter(item => ['balance', 'settlement'].includes(item.purpose)).length, 2);
+    await call('payment/' + balanceIntent.id, { outcome: 'approved' }, 409);
+    assert.equal((await call('orders')).find(item => item.id === order.id).payments.filter(item => item.purpose === 'balance').length, 1);
+
+    const online = await call('orders', seed, 201), onlinePrefix = 'orders/' + online.id + '/';
+    const dep2 = await call(onlinePrefix + 'link', {});
+    await call('payment/' + dep2.intent.id, { outcome: 'approved' });
+    const arrival2 = await call(onlinePrefix + 'arrive', { count: 1 });
+    const bal2 = arrival2.order.intents.find(item => item.purpose === 'balance');
+    const paidOnline = await call('payment/' + bal2.id, { outcome: 'approved' });
+    assert.equal(paidOnline.status, 'approved');
+    const finished = (await call('orders')).find(item => item.id === online.id);
+    assert.equal(finished.stage, 'closed');
+    assert.deepEqual(finished.payments.map(item => item.purpose), ['deposit', 'balance']);
+    assert.ok(finished.receipts.some(item => item.purpose === 'balance'));
+    assert.ok(finished.receipts.some(item => item.purpose === 'settlement'));
+    assert.ok(Object.values(finished.receiptDeliveries).some(item => item.status === 'simulated'));
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    await api.close();
+  }
+});
+
 test('El agente distingue las intenciones principales sin inferir confirmaciones', () => {
   assert.equal(classify('Ya pagué mi anticipo'), 'paid');
   assert.equal(classify('Necesito cambiar la fecha de mi reserva'), 'change');
@@ -108,4 +157,6 @@ test('El agente distingue las intenciones principales sin inferir confirmaciones
   assert.equal(classify('buenos días'), 'menu');
   assert.equal(classify('ayuda'), 'menu');
   assert.equal(classify('🧩'), 'unknown');
+  for (const phrase of ['pagar', 'cuenta', 'pagar comida', 'saldo', 'pagar saldo']) assert.equal(classify(phrase), 'payBalance');
+  assert.equal(classify('quiero saber qué pasa con la cuenta de mi reserva'), 'unknown');
 });

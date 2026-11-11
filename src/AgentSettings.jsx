@@ -10,6 +10,8 @@ const numbers = [
   ['lastVisitHours', 'Segundo aviso antes de la visita (horas)', 1, 168],
   ['graceMinutes', 'Tolerancia de llegada (minutos)', 0, 1440],
   ['counterAlertMinutes', 'Aviso de saldo pendiente en caja (minutos)', 1, 1440],
+  ['balanceLinkExpiryMinutes', 'Vencimiento del link de saldo (minutos)', 1, 1440],
+  ['maxBalanceLinks', 'Máximo de links de saldo por reserva', 1, 20],
 ];
 const toggles = [
   ['reminders', 'Enviar recordatorios por WhatsApp'],
@@ -17,7 +19,6 @@ const toggles = [
   ['depositReminder', 'Recordar el anticipo pendiente'],
   ['visitReminder', 'Recordar las visitas confirmadas'],
   ['internalAlerts', 'Alertar al personal por vencimiento, retraso o saldo pendiente'],
-  ['automaticConfirmation', 'Enviar confirmaciones y constancia al cerrar'],
   ['yapeDemo', 'Ofrecer Yape simulado'],
   ['plinDemo', 'Ofrecer Plin simulado'],
 ];
@@ -62,7 +63,7 @@ export function AgentSettings({ config, onSave }) {
   return <>
     <section className="panel form-panel">
       <div className="panel-head"><div><h2>Agente y alertas</h2>
-        <p>Los avisos consultan estas reglas al ejecutarse. El importe pactado de cada pedido se conserva.</p></div>
+        <p>Los avisos consultan estas reglas al ejecutarse. Links de saldo y constancias se automatizan según el estado del pedido.</p></div>
         <span className="label-chip"><Settings2 size={14} /> {config.agent === 'n8n' ? 'Orquestación n8n' : 'Modo servidor'}</span></div>
       <form onSubmit={save}>
         <div className="form-grid">

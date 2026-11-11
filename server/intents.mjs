@@ -28,6 +28,7 @@ export function classify(message) {
   const plain = String(message || '').normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase()
     .replace(/\bEST-[a-f0-9]{8}\b/gi, '').replace(/[^a-z]+/g, ' ').trim();
   if (/^(hola|buenas|buenos dias|buenas tardes|buenas noches|menu|inicio)$/.test(plain)) return 'menu';
+  if (/^(pagar|cuenta|pagar comida|saldo|pagar saldo)$/.test(plain)) return 'payBalance';
   const words = tokens(message);
   if (words.length === 1) {
     const shortcuts = { anticipo: 'link', enlace: 'link', saldo: 'balance', pague: 'paid', comprobante: 'receipt',

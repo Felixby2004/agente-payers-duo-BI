@@ -87,7 +87,7 @@ export function parseAction(value) {
   // Acción sin referencia para quien escribe sin una reserva registrada.
   if (id === 'staff') return { action: 'staff', ref: null };
   const match = id.match(/^([a-z]+):(EST-[A-F0-9]{8})$/i);
-  if (!match || !['pay', 'yape', 'plin', 'bal', 'rcp', 'chg', 'hum', 'sel'].includes(match[1].toLowerCase())) return null;
+  if (!match || !['pay', 'payb', 'yape', 'plin', 'bal', 'rcp', 'chg', 'hum', 'sel', 'selb'].includes(match[1].toLowerCase())) return null;
   return { action: match[1].toLowerCase(), ref: match[2].toUpperCase() };
 }
 
@@ -344,6 +344,8 @@ export function reservationMenu(order, now = new Date()) {
     return buttonsMessage(text, [receiptButton(order, receipt), button('chg:' + order.ref, 'Cambiar fecha'),
       button('hum:' + order.ref, 'Hablar con alguien')]);
   }
+  if (order.stage === 'arrived' && balance(order) > 0) return buttonsMessage(text,
+    [button('payb:' + order.ref, 'Pagar saldo en línea'), button('bal:' + order.ref, 'Ver saldo'), button('hum:' + order.ref, 'Hablar con alguien')]);
   return buttonsMessage(text, [receiptButton(order, receipt), button('hum:' + order.ref, 'Hablar con alguien')]);
 }
 
@@ -390,12 +392,12 @@ function descriptionOf(order, section, now) {
   return normalized(full).length <= limits.rowDescription ? full : clip(base, limits.rowDescription);
 }
 
-function rowOf(order, section, now) {
-  return { id: 'sel:' + order.ref, title: friendlyDate(order.visitAt, now),
+function rowOf(order, section, now, selector = 'sel') {
+  return { id: selector + ':' + order.ref, title: friendlyDate(order.visitAt, now),
     description: descriptionOf(order, section, now) };
 }
 
-export function reservationList(orders, now = new Date()) {
+export function reservationList(orders, now = new Date(), selector = 'sel') {
   const all = [...(orders || [])];
   const activeCount = all.filter(order => !terminal(order)).length;
   const buckets = new Map(sectionDefinitions.map(section => [section.key, []]));
@@ -409,7 +411,7 @@ export function reservationList(orders, now = new Date()) {
   let remaining = limits.rows;
   for (const definition of sectionDefinitions) {
     if (remaining <= 0) break;
-    const rows = buckets.get(definition.key).slice(0, remaining).map(order => rowOf(order, definition.key, now));
+    const rows = buckets.get(definition.key).slice(0, remaining).map(order => rowOf(order, definition.key, now, selector));
     if (!rows.length) continue;
     remaining -= rows.length;
     sections.push({ title: definition.title, rows });
@@ -450,14 +452,24 @@ export function paymentCta(order, intent, method, url, options = {}) {
   return ctaMessage(text, clip(label, limits.ctaText), url);
 }
 
-export function receiptCta(order, url) {
-  return ctaMessage(emojis.receipt + ' *Constancia interna de reserva*\nReferencia: *' + order.ref
-    + '*\nEste documento es de El Establo y no reemplaza el comprobante oficial de Mercado Pago.', 'Ver constancia', url);
+export function balancePaymentCta(order, intent, url) {
+  return ctaMessage(emojis.payment + ' *Saldo listo para pagar*\nReserva: *' + order.ref + '*\nImporte: *'
+    + money(intent.amount) + '*\nPaga de forma segura con Mercado Pago.', 'Pagar saldo', url);
 }
 
-export function confirmationCta(order, url, now = new Date()) {
+export function receiptCta(order, url, summary = '') {
+  return ctaMessage(emojis.receipt + ' *Constancia interna de reserva*\nReferencia: *' + order.ref
+    + '*' + (summary ? '\n' + summary : '')
+    + '\nEste documento es de El Establo y no reemplaza el comprobante oficial de Mercado Pago.', 'Ver constancia', url);
+}
+
+export function confirmationCta(order, url, now = new Date(), additional = '') {
+  const payment = [...(order.payments || [])].reverse().find(item => (item.purpose || 'deposit') === 'deposit' && item.amount > 0);
+  const method = payment ? (payment.channel === 'mercadopago' ? 'Mercado Pago' : payment.channel.replace('_demo', '')) : 'verificado';
   return ctaMessage(emojis.verified + ' *Anticipo verificado*\nReserva: *' + order.ref + '*\nVisita: '
-    + friendlyDate(order.visitAt, now, true) + '\nSaldo en el local: *' + money(balance(order)) + '*.',
+    + friendlyDate(order.visitAt, now, true) + '\nTotal: ' + money(order.total) + ' · Anticipo: *' + money(payment?.amount || order.deposit)
+    + '* (' + method + (payment ? ' · ' + friendlyDate(payment.at, now, true) : '') + ')\nSaldo pendiente: *' + money(balance(order)) + '*.'
+    + (additional ? '\n' + additional : ''),
   'Ver constancia', url);
 }
 

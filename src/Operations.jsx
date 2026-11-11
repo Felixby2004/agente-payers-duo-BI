@@ -170,6 +170,7 @@ export function Detail({ order, config, close, reload, notify }) {
   }, [order.id]);
   const activeLink = order.intents.filter(i => (i.method || 'checkout') === depositMethod && i.status === 'pending' && i.expiresAt === order.deadline
     && (i.mode === 'local' || i.checkoutUrl) && +new Date(i.expiresAt) > Date.now()).at(-1);
+  const balanceIntent = order.intents.filter(i => (i.purpose || 'deposit') === 'balance').at(-1);
   const beforeVisit = ['awaiting_deposit', 'confirmed'].includes(order.stage);
   const pendingIssues = order.incidents.filter(i => !i.resolvedAt);
   const expired = +new Date(order.deadline) <= Date.now();
@@ -225,17 +226,25 @@ export function Detail({ order, config, close, reload, notify }) {
               {config.whatsapp === 'cloud' && <button className="button outline" disabled={Boolean(busy)} onClick={() => run('message', { type: 'visit' }, 'WhatsApp aceptó el recordatorio.')}>Recordar visita</button>}</div>
           </section>}
           {order.stage === 'arrived' && <section className="action-panel"><h3><ReceiptText size={18} /> Cobro en caja</h3><p>Registra el pago de demostración del saldo de {money(balance(order))}.</p>
+            <p>Link de saldo: <strong>{balanceIntent?.status === 'pending' && +new Date(balanceIntent.expiresAt) > Date.now() ? 'pendiente' : balanceIntent?.status === 'superseded' ? 'superado por caja' : balanceIntent ? 'vencido' : 'no creado'}</strong></p>
             <div className="action-line"><select aria-label="Medio de pago en caja" value={channel} onChange={e => setChannel(e.target.value)}>
               <option value="cash">Efectivo de demostración</option><option value="pos">POS de demostración</option><option value="wallet">Billetera de demostración</option></select>
-              <button className="button primary" disabled={Boolean(busy)} onClick={() => run('counter', { channel }, 'Saldo registrado en caja.')}>Confirmar cobro</button></div>
+              <button className="button primary" disabled={Boolean(busy) || balance(order) <= 0} onClick={() => run('counter', { channel }, 'Saldo registrado en caja.')}>Confirmar cobro</button></div>
+            {config.whatsapp === 'cloud' && <div className="button-row">
+              <button className="button outline" disabled={Boolean(busy) || balance(order) <= 0} onClick={() => run('message', { type: 'balance' }, 'Envío de link solicitado como respaldo.')}>Enviar link de pago por WhatsApp</button>
+              <button className="button outline" disabled={Boolean(busy) || balance(order) <= 0} onClick={() => run('message', { type: 'balance', newLink: true }, 'Link de saldo reenviado como respaldo.')}>Reenviar nuevo link</button>
+            </div>}
           </section>}
-          {order.stage === 'paid' && <section className="action-panel"><h3><FileCheck2 size={18} /> Cierre de cobranza</h3><p>Se verificaron la llegada y el pago completo. Emite la constancia de demostración.</p>
-            <button className="button primary" disabled={Boolean(busy)} onClick={() => run('receipt', {}, 'Comprobante emitido y cobranza cerrada.')}>Emitir y cerrar</button></section>}
+          {order.stage === 'paid' && <section className="action-panel"><h3><FileCheck2 size={18} /> Pago completo</h3><p>El saldo se verificó. PAYERS está preparando y enviando la constancia automáticamente.</p></section>}
           {order.stage === 'closed' && <div className="closed-note"><Check size={19} /><span><strong>Cobranza completada</strong><small>Asistencia verificada · saldo liquidado · comprobante emitido</small></span></div>}
           {order.receipts.length > 0 && <section className="action-panel"><h3><ReceiptText size={17} /> Comprobantes de demostración</h3>
-            <div className="button-row">{order.receipts.map(receipt => <a className="button outline" key={receipt.token} href={'/comprobante/' + receipt.token} target="_blank" rel="noreferrer">
-              {receipt.purpose === 'deposit' ? 'Anticipo' : 'Liquidación'} <ExternalLink size={14} /></a>)}
-              {config.whatsapp === 'cloud' && <button className="button outline" disabled={Boolean(busy)} onClick={() => run('message', { type: 'receipt' }, 'WhatsApp aceptó el comprobante.')}>Enviar último</button>}</div>
+            {order.receipts.map(receipt => { const delivery = order.receiptDeliveries?.[receipt.token + ':' + receipt.purpose]; return <div className="issue-line" key={receipt.token}>
+              <div><strong>{receipt.purpose === 'deposit' ? 'Anticipo' : receipt.purpose === 'balance' ? 'Saldo' : 'Liquidación'}</strong>
+                <small>{delivery?.status === 'sent' ? 'Enviado · ' + visitText(delivery.at) : delivery?.status === 'simulated' ? 'Registrado en modo simulado'
+                  : delivery?.status === 'failed' ? 'Falló el envío: ' + delivery.error : delivery?.status === 'suppressed' ? delivery.reason : 'En espera de envío automático'}</small></div>
+              <div className="button-row"><a className="button outline" href={'/comprobante/' + receipt.token} target="_blank" rel="noreferrer">Ver constancia <ExternalLink size={14} /></a>
+              {config.whatsapp === 'cloud' && !receipt.reversedAt && <button className="button outline" disabled={Boolean(busy)} onClick={() => run('message', { type: 'receipt', receiptToken: receipt.token }, 'Reenvío solicitado.')}>Reenviar</button>}</div>
+            </div>; })}
           </section>}
           {pendingIssues.length > 0 && <section className="action-panel"><h3><TriangleAlert size={18} /> Incidencias abiertas</h3>
             <label>Nota de resolución<input value={note} maxLength={300} onChange={e => setNote(e.target.value)} placeholder="Resultado de la revisión" /></label>

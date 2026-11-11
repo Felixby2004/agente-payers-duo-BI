@@ -12,7 +12,7 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     SUPABASE_URL: 'https://db.example', SUPABASE_SECRET_KEY: 'clave-ficticia',
     WHATSAPP_MODE: 'cloud', WA_GRAPH_VERSION: 'v25.0', WA_PHONE_NUMBER_ID: '456',
     WA_ACCESS_TOKEN: 'wa-ficticio', WA_VERIFY_TOKEN: 'verificacion-ficticia',
-    WA_APP_SECRET: 'firma-wa-ficticia', WA_ALLOWED_PHONES: '51999999999',
+    WA_APP_SECRET: 'firma-wa-ficticia', WA_ALLOWED_PHONES: '51999999999,51988888888,51977777777',
     PAYMENT_MODE: 'mercado_pago', MP_TEST_ACCESS_TOKEN: 'mp-ficticio', MP_TEST_SELLER_ID: '123', MP_TEST_BUYER_ID: '3829653747',
     MP_WEBHOOK_SECRET: 'firma-mp-ficticia',
     AGENT_ORCHESTRATION: 'n8n', N8N_AGENT_TOKEN: 'token-interno-de-prueba-para-n8n-2026',
@@ -25,7 +25,7 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
   const origin = 'http://127.0.0.1:' + server.address().port;
   const realFetch = globalThis.fetch;
   const sent = [];
-  let preference, currency = 'USD';
+  let preference, currency = 'USD', amountOverride = null;
   globalThis.fetch = async (url, options) => {
     url = String(url);
     if (url === 'https://api.mercadolibre.com/users/me') return Response.json({ id: 123, tags: ['test_user'] });
@@ -34,10 +34,11 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
       return Response.json({ id: 'preferencia-1', init_point: 'https://www.mercadopago.com.pe/checkout/live',
         sandbox_init_point: 'https://sandbox.mercadopago.com.pe/checkout/test' });
     }
-    if (url === 'https://api.mercadopago.com/v1/payments/987') {
-      return Response.json({ id: 987, status: 'approved', collector_id: 123, payer: { id: '3829653747' }, live_mode: true,
+    if (/^https:\/\/api\.mercadopago\.com\/v1\/payments\/\d+$/.test(url)) {
+      const paymentId = url.split('/').at(-1);
+      return Response.json({ id: paymentId, status: 'approved', collector_id: 123, payer: { id: '3829653747' }, live_mode: true,
         currency_id: currency, external_reference: preference.external_reference,
-        transaction_amount: preference.items[0].unit_price, date_approved: new Date().toISOString() });
+        transaction_amount: amountOverride ?? preference.items[0].unit_price, date_approved: new Date().toISOString() });
     }
     if (url === 'https://graph.facebook.com/v25.0/456/messages') {
       sent.push(JSON.parse(options.body));
@@ -172,6 +173,96 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     await call('payment/' + demoLink.intent.id, JSON.stringify({ outcome: 'approved' }), 200);
     const { data: all } = await call('orders', undefined, 200);
     assert.equal(all.find(o => o.id === demo.id).payments[0].channel, 'plin_demo');
+
+    const { data: balanceOrder } = await call('orders', JSON.stringify({
+      agreed: true, payer: 'Saldo Mercado Pago', phone: '+51999999999', consent: true, guests: 1,
+      visitAt: new Date(Date.now() + 3 * 3600000).toISOString(), items: [{ name: 'Parrilla familiar', price: 14900, quantity: 1 }],
+    }), 201);
+    const balancePrefix = 'orders/' + balanceOrder.id + '/';
+    const { data: depositLink } = await call(balancePrefix + 'link', JSON.stringify({ method: 'checkout' }), 200);
+    preference = { ...preference, external_reference: depositLink.intent.id };
+    await call('webhooks/mercado-pago?data.id=989', JSON.stringify({ type: 'payment', data: { id: '989' } }), 200, {
+      'x-request-id': 'saldo-deposit-989', 'x-signature': 'ts=123,v1=' + hmac(e.MP_WEBHOOK_SECRET,
+        'id:989;request-id:saldo-deposit-989;ts:123;'),
+    });
+    const { data: arrivedOrder } = await call(balancePrefix + 'arrive', JSON.stringify({ count: 1 }), 200);
+    const balancePaymentIntent = arrivedOrder.order.intents.find(item => item.purpose === 'balance');
+    assert.ok(balancePaymentIntent);
+    assert.equal(balancePaymentIntent.amount, 12900);
+    assert.equal(preference.items[0].title, 'Saldo de pedido · ' + balanceOrder.ref);
+    const balanceWebhook = { 'x-request-id': 'saldo-mp-990', 'x-signature': 'ts=123,v1=' + hmac(e.MP_WEBHOOK_SECRET,
+      'id:990;request-id:saldo-mp-990;ts=123;') };
+    const beforeBalanceWebhook = sent.length;
+    await call('webhooks/mercado-pago?data.id=990', JSON.stringify({ type: 'payment', data: { id: '990' } }), 200, balanceWebhook);
+    await call('webhooks/mercado-pago?data.id=990', JSON.stringify({ type: 'payment', data: { id: '990' } }), 200, balanceWebhook);
+    assert.equal(sent.length, beforeBalanceWebhook + 1);
+    const { data: afterBalance } = await call('orders', undefined, 200);
+    const final = afterBalance.find(item => item.id === balanceOrder.id);
+    assert.equal(final.stage, 'closed');
+    assert.equal(final.payments.filter(item => item.purpose === 'balance').length, 1);
+    assert.ok(final.receipts.some(item => item.purpose === 'balance'));
+    assert.ok(final.receipts.some(item => item.purpose === 'settlement'));
+    assert.equal(Object.values(final.receiptDeliveries).filter(item => item.status === 'sent').length, 3);
+    assert.match(sent.at(-1).interactive.body.text, /ccap\/file-viewer\/receipt/);
+    const finalReceipt = final.receipts.find(item => item.purpose === 'settlement');
+    const { data: publicFinal } = await call('receipt/' + finalReceipt.token, undefined, 200);
+    assert.deepEqual(publicFinal.mercadoPagoReceipts.map(item => item.purpose), ['deposit', 'balance']);
+
+    const { data: shortcutOrder } = await call('orders', JSON.stringify({
+      agreed: true, payer: 'Atajo de pago', phone: '+51988888888', consent: true, guests: 1,
+      visitAt: new Date(Date.now() + 3 * 3600000).toISOString(), items: [{ name: 'Parrilla familiar', price: 14900, quantity: 1 }],
+    }), 201);
+    const shortcutPrefix = 'orders/' + shortcutOrder.id + '/';
+    const shortcutSession = { ...message, id: 'wamid.in-shortcut-session', from: '51988888888',
+      timestamp: String(Math.floor(Date.now() / 1000)), text: { body: 'hola' } };
+    await receive(shortcutSession); await drain();
+    const { data: shortcutDeposit } = await call(shortcutPrefix + 'link', JSON.stringify({ method: 'checkout' }), 200);
+    const shortcutDepositNotice = { 'x-request-id': 'shortcut-deposit-992', 'x-signature': 'ts=123,v1=' + hmac(e.MP_WEBHOOK_SECRET,
+      'id:992;request-id:shortcut-deposit-992;ts:123;') };
+    await call('webhooks/mercado-pago?data.id=992', JSON.stringify({ type: 'payment', data: { id: '992' } }), 200, shortcutDepositNotice);
+    const { data: shortcutArrived } = await call(shortcutPrefix + 'arrive', JSON.stringify({ count: 1 }), 200);
+    const autoLink = shortcutArrived.order.intents.find(item => item.purpose === 'balance');
+    const preferenceIdBeforeShortcut = preference.external_reference;
+    assert.equal(preferenceIdBeforeShortcut, autoLink.id);
+    const beforeShortcut = sent.length;
+    await receive({ ...shortcutSession, id: 'wamid.in-pay-shortcut', text: { body: 'pagar saldo' } }); await drain();
+    assert.equal(sent.length, beforeShortcut + 1);
+    assert.match(sent.at(-1).interactive.action.parameters.url, new RegExp('/pago/' + autoLink.id + '$'));
+    assert.equal(preference.external_reference, autoLink.id);
+    const badAmountNotice = { 'x-request-id': 'bad-balance-997', 'x-signature': 'ts=123,v1=' + hmac(e.MP_WEBHOOK_SECRET,
+      'id:997;request-id:bad-balance-997;ts=123;') };
+    amountOverride = 0.01;
+    await call('webhooks/mercado-pago?data.id=997', JSON.stringify({ type: 'payment', data: { id: '997' } }), 200, badAmountNotice);
+    await call('webhooks/mercado-pago?data.id=997', JSON.stringify({ type: 'payment', data: { id: '997' } }), 200, badAmountNotice);
+    amountOverride = null;
+    const { data: afterBadAmount } = await call('orders', undefined, 200);
+    const wrongBalance = afterBadAmount.find(item => item.id === shortcutOrder.id);
+    assert.equal(wrongBalance.payments.filter(item => item.purpose === 'balance').length, 0);
+    assert.equal(wrongBalance.incidents.filter(item => item.type === 'Pago por revisar').length, 1);
+
+    const { data: raceOrder } = await call('orders', JSON.stringify({
+      agreed: true, payer: 'Carrera caja y online', phone: '+51977777777', consent: true, guests: 1,
+      visitAt: new Date(Date.now() + 3 * 3600000).toISOString(), items: [{ name: 'Parrilla familiar', price: 14900, quantity: 1 }],
+    }), 201);
+    const racePrefix = 'orders/' + raceOrder.id + '/';
+    const raceDeposit = await call(racePrefix + 'link', JSON.stringify({ method: 'checkout' }), 200);
+    const raceDepositNotice = { 'x-request-id': 'race-deposit-995', 'x-signature': 'ts=123,v1=' + hmac(e.MP_WEBHOOK_SECRET,
+      'id:995;request-id:race-deposit-995;ts:123;') };
+    await call('webhooks/mercado-pago?data.id=995', JSON.stringify({ type: 'payment', data: { id: '995' } }), 200, raceDepositNotice);
+    const raceArrival = await call(racePrefix + 'arrive', JSON.stringify({ count: 1 }), 200);
+    const raceIntent = raceArrival.data?.order?.intents?.find(item => item.purpose === 'balance')
+      || raceArrival.order.intents.find(item => item.purpose === 'balance');
+    await call(racePrefix + 'counter', JSON.stringify({ channel: 'cash' }), 200);
+    const lateNotice = { 'x-request-id': 'race-late-996', 'x-signature': 'ts=123,v1=' + hmac(e.MP_WEBHOOK_SECRET,
+      'id:996;request-id:race-late-996;ts=123;') };
+    await call('webhooks/mercado-pago?data.id=996', JSON.stringify({ type: 'payment', data: { id: '996' } }), 200, lateNotice);
+    const { data: afterRace } = await call('orders', undefined, 200);
+    const raced = afterRace.find(item => item.id === raceOrder.id);
+    assert.equal(raced.intents.find(item => item.id === raceIntent.id).status, 'superseded');
+    assert.equal(raced.payments.filter(item => item.purpose === 'balance').length, 1);
+    assert.equal(raced.payments.find(item => item.purpose === 'balance').channel, 'cash');
+    assert.ok(raced.unappliedPayments.some(item => item.intentId === raceIntent.id));
+    assert.ok(raced.incidents.some(item => item.type === 'Pago por revisar'));
   } finally {
     globalThis.fetch = realFetch;
     await new Promise(resolve => server.close(resolve));

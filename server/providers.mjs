@@ -101,7 +101,8 @@ export function providers(config) {
       const returnUrl = config.publicUrl + '/pago/' + intent.id;
       const buyerEmail = e.MP_TEST_BUYER_EMAIL?.trim();
       const result = await requestJson(mp + '/checkout/preferences', post({
-        items: [{ id: intent.id, title: 'Anticipo de prueba · ' + order.ref, quantity: 1, currency_id: 'PEN', unit_price: intent.amount / 100 }],
+        items: [{ id: intent.id, title: (intent.purpose === 'balance' ? 'Saldo de pedido · ' : 'Anticipo de prueba · ')
+          + order.ref, quantity: 1, currency_id: 'PEN', unit_price: intent.amount / 100 }],
         ...(buyerEmail ? { payer: { email: buyerEmail } } : {}),
         external_reference: intent.id,
         notification_url: config.publicUrl + '/api/webhooks/mercado-pago?source_news=webhooks',
@@ -149,7 +150,7 @@ export function providers(config) {
       const expected = hmac(e.MP_WEBHOOK_SECRET, 'id:' + id + ';request-id:' + requestId + ';ts:' + fields.ts + ';');
       return matches(expected, fields.v1) ? id : null;
     },
-    async sendWhatsApp(order, text, { template, intent, session: open, reply = false } = {}) {
+    async sendWhatsApp(order, text, { template, intent, session: open, reply = false, templateValues, receiptToken } = {}) {
       requireThat(config.waMode === 'cloud', 'Conecta WhatsApp Cloud API para enviar mensajes.', 409);
       // Responder a quien escribe no exige consentimiento; iniciar un mensaje sí.
       requireThat((reply || order.consent) && config.isPhoneAllowed(order.phone) && !config.isPhoneBlocked(order.phone),
@@ -159,16 +160,17 @@ export function providers(config) {
           && Date.now() - +new Date(m.at) < 24 * 3600000);
       if (session) return deliver(order.phone, text);
       const name = { deposit: e.WA_TEMPLATE_DEPOSIT, paymentRejected: e.WA_TEMPLATE_PAYMENT_REJECTED,
-        visit: e.WA_TEMPLATE_VISIT, confirmation: e.WA_TEMPLATE_CONFIRMATION,
+        visit: e.WA_TEMPLATE_VISIT, balance: e.WA_TEMPLATE_BALANCE, confirmation: e.WA_TEMPLATE_CONFIRMATION,
         settlement: e.WA_TEMPLATE_SETTLEMENT }[template];
       requireThat(name, 'Pide al pagador que escriba al número de WhatsApp o configura una plantilla aprobada.', 409);
-      const values = ['deposit', 'paymentRejected'].includes(template) ? [order.payer, order.ref, money(intent.amount)]
+      const values = templateValues || (['deposit', 'paymentRejected', 'balance'].includes(template) ? [order.payer, order.ref, money(intent.amount)]
         : template === 'settlement' ? [order.payer, order.ref, money(order.total)]
-          : [order.payer, order.ref, visitText(order.visitAt), money(balance(order))];
+          : [order.payer, order.ref, visitText(order.visitAt), money(balance(order))]);
       const components = [{ type: 'body', parameters: values.map(value => ({ type: 'text', text: value })) }];
-      if (['deposit', 'paymentRejected'].includes(template)) components.push({ type: 'button', sub_type: 'url', index: '0', parameters: [{ type: 'text', text: intent.id }] });
-      if (template === 'settlement') components.push({ type: 'button', sub_type: 'url', index: '0',
-        parameters: [{ type: 'text', text: order.receipts.find(r => r.purpose === 'settlement').token }] });
+      if (['deposit', 'paymentRejected', 'balance'].includes(template)) components.push({ type: 'button', sub_type: 'url', index: '0', parameters: [{ type: 'text', text: intent.id }] });
+      if (['settlement', 'confirmation'].includes(template)) components.push({ type: 'button', sub_type: 'url', index: '0',
+        parameters: [{ type: 'text', text: receiptToken || order.receipts.find(r => r.purpose === template)?.token
+          || order.receipts.at(-1)?.token }] });
       return submit(order.phone, { type: 'template', template: { name, language: { code: e.WA_TEMPLATE_LANGUAGE || 'es_PE' }, components } });
     },
     // Solo para responder a un mensaje entrante reciente. Nunca inicia una conversación.

@@ -13,6 +13,8 @@ export function defaults(config) {
     firstVisitHours: 24,
     lastVisitHours: 3,
     counterAlertMinutes: 2,
+    balanceLinkExpiryMinutes: 30,
+    maxBalanceLinks: 3,
     internalAlerts: true,
     contactStart: '08:00',
     contactEnd: '22:00',
@@ -25,7 +27,8 @@ export function defaults(config) {
 export function validateSettings(input, initial) {
   const data = {};
   const ranges = { depositPerPerson: [1, 100000], deadlineMinutes: [1, 43200], graceMinutes: [0, 1440],
-    depositReminderMinutes: [1, 43200], firstVisitHours: [1, 168], lastVisitHours: [1, 168], counterAlertMinutes: [1, 1440] };
+    depositReminderMinutes: [1, 43200], firstVisitHours: [1, 168], lastVisitHours: [1, 168], counterAlertMinutes: [1, 1440],
+    balanceLinkExpiryMinutes: [1, 1440], maxBalanceLinks: [1, 20] };
   for (const [name, [min, max]] of Object.entries(ranges)) {
     const value = input?.[name];
     requireThat(Number.isInteger(value) && value >= min && value <= max, 'Revisa los importes y plazos de la configuración.');

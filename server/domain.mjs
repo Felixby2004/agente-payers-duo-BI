@@ -56,12 +56,14 @@ export function openIssue(order, type, detail, key = type) {
 
 export function applyPayment(order, payment) {
   if (order.payments.some(p => p.ref === payment.ref)) return false;
-  const due = payment.purpose === 'deposit' ? depositDue(order) : balance(order);
-  const exceptions = payment.review || terminal(order) || (payment.purpose === 'deposit' && (
+  const purpose = payment.purpose || 'deposit';
+  const due = purpose === 'deposit' ? depositDue(order) : balance(order);
+  const exceptions = payment.review || terminal(order) || (purpose === 'deposit' && (
     new Date(payment.at || now()) > new Date(order.deadline) || order.stage !== 'awaiting_deposit'
-  ));
-  order.payments.push({ ...payment, at: payment.at || now() });
-  addEvent(order, 'Pago verificado', payment.ref);
+  )) || (purpose === 'balance' && order.stage !== 'arrived');
+  order.payments.push({ ...payment, purpose, at: payment.at || now() });
+  addEvent(order, 'Pago verificado', payment.ref + ' · ' + (purpose === 'deposit' ? 'anticipo' : 'saldo') + ' · ' + payment.amount,
+    payment.actor || 'Sistema');
   if (payment.amount > due || exceptions) {
     openIssue(order, 'Pago por revisar', 'El pago llegó fuera del flujo esperado o supera el importe pendiente.', payment.ref);
   }
@@ -87,22 +89,38 @@ export function arrive(order, count) {
 export function recordCounterPayment(order, channel) {
   requireThat(order.stage === 'arrived' && balance(order) > 0, 'No hay un saldo por cobrar en caja.', 409);
   requireThat(['cash', 'pos', 'wallet'].includes(channel), 'Selecciona un medio de demostración.');
-  applyPayment(order, { ref: 'CAJA-' + randomUUID(), amount: balance(order), purpose: 'balance', channel });
+  const amount = balance(order);
+  for (const intent of order.intents || []) if ((intent.purpose || 'deposit') === 'balance' && intent.status === 'pending') {
+    intent.status = 'superseded';
+    intent.supersededAt = now();
+  }
+  applyPayment(order, { ref: 'CAJA-' + randomUUID(), amount, purpose: 'balance', channel, actor: 'Personal de caja' });
 }
 
-export function issueReceipt(order, purpose, token) {
-  requireThat(['deposit', 'settlement'].includes(purpose), 'Selecciona un tipo de comprobante.');
-  const existing = order.receipts.find(r => r.purpose === purpose);
+export function issueReceipt(order, purpose, token, sourcePayment = null) {
+  requireThat(['deposit', 'balance', 'settlement'].includes(purpose), 'Selecciona un tipo de comprobante.');
+  const existing = purpose === 'settlement' ? order.receipts.find(r => r.purpose === purpose && !r.reversedAt)
+    : purpose === 'deposit' ? order.receipts.find(r => r.purpose === purpose)
+      : order.receipts.find(r => r.purpose === purpose && r.paymentRef === sourcePayment?.ref);
   if (existing) return existing;
   if (purpose === 'deposit') requireThat(deposited(order) >= order.deposit, 'El anticipo debe estar verificado.');
+  else if (purpose === 'balance') requireThat(order.attendance && ['arrived', 'paid', 'closed'].includes(order.stage)
+    && balance(order) === 0 && sourcePayment?.purpose === 'balance', 'El saldo debe estar pagado antes de emitir.');
   else {
     requireThat(order.attendance && order.stage === 'paid' && paid(order) === order.total, 'Verifica la llegada y concilia el importe exacto del pedido antes de emitir.');
     requireThat(!order.incidents.some(i => !i.resolvedAt && ['Pago por revisar', 'Reverso por revisar'].includes(i.type)), 'Resuelve las incidencias de pago antes de cerrar.', 409);
   }
-  const receipt = { purpose, token, at: now(), number: 'DEMO-' + order.ref.slice(4) + (purpose === 'deposit' ? '-A' : '-L'),
-    amount: purpose === 'deposit' ? order.deposit : order.total, appliedDeposit: purpose === 'settlement' ? deposited(order) : 0 };
+  const receipt = { purpose, token, at: now(), number: 'DEMO-' + order.ref.slice(4)
+    + (purpose === 'deposit' ? '-A' : purpose === 'balance' ? '-S' : '-L'),
+    amount: purpose === 'deposit' ? order.deposit : purpose === 'balance' ? sourcePayment.amount : order.total,
+    appliedDeposit: purpose === 'settlement' ? deposited(order) : 0,
+    ...(sourcePayment ? { paymentRef: sourcePayment.ref, intentId: sourcePayment.intentId || null } : {}) };
+  if (purpose === 'settlement') receipt.paymentBreakdown = order.payments.filter(payment => payment.amount > 0
+    && !order.payments.some(adjustment => adjustment.original === payment.ref && adjustment.amount < 0))
+    .map(payment => ({ purpose: payment.purpose || 'deposit', amount: payment.amount, at: payment.at,
+      channel: payment.channel, ref: payment.ref, intentId: payment.intentId || null }));
   order.receipts.push(receipt);
-  addEvent(order, 'Comprobante de demostración emitido', receipt.number, 'Caja');
+  addEvent(order, 'Comprobante de demostración emitido', receipt.number, 'Sistema');
   if (purpose === 'settlement') {
     order.stage = 'closed';
     order.closedAt = now();

@@ -6,7 +6,7 @@ import { agentAI } from './agent-ai.mjs';
 import { contactTime, defaults, validateSettings } from './agent-settings.mjs';
 import { balance, depositDue, money, terminal, stageLabels } from '../shared/orders.mjs';
 import { displayText, emojis, friendlyDate, parseAction, reservationFocus, reservationMenu, reservationPrompt, reservationList,
-  paymentCta, paymentRejectedCta, receiptCta, confirmationCta, requestMessage, noReservationMessage, reservationHelpMessage,
+  paymentCta, balancePaymentCta, paymentRejectedCta, receiptCta, confirmationCta, requestMessage, noReservationMessage, reservationHelpMessage,
   reservationRequest, parseReservation, reservationKey, reservationConfirmation, reservationRepeatedMessage, texts } from './interactive.mjs';
 import { Problem, requireThat, createOrder, addEvent, openIssue, applyPayment, arrive, recordCounterPayment, issueReceipt, reschedule, endReservation, digits } from './domain.mjs';
 
@@ -95,7 +95,7 @@ export async function makeApi(env, options = {}) {
     locks.set(id, next);
     return next.finally(() => { if (locks.get(id) === next) locks.delete(id); });
   }
-  async function checkout(id, method = 'checkout') {
+  async function checkout(id, method = 'checkout', purpose = 'deposit', forceNew = false) {
     requireThat(['checkout', 'yape', 'plin'].includes(method), 'Elige un medio de anticipo válido.');
     const rule = await settings();
     requireThat(method === 'checkout' || rule[method + 'Demo'], 'Ese medio de demostración está desactivado.', 409);
@@ -103,15 +103,26 @@ export async function makeApi(env, options = {}) {
     return lock(id, async () => {
       const intentId = randomUUID();
       const { order, result: intent } = await update(id, data => {
-        requireThat(data.stage === 'awaiting_deposit' && depositDue(data) > 0, 'La reserva no tiene anticipo pendiente.', 409);
-        requireThat(new Date(data.deadline) > new Date(), 'El plazo del anticipo venció. Revisa la reserva.', 409);
-        const reusable = data.intents.find(i => i.mode === mode && (i.method || 'checkout') === method && i.amount === depositDue(data)
-          && i.status === 'pending' && i.expiresAt === data.deadline
+        const amount = purpose === 'deposit' ? depositDue(data) : balance(data);
+        requireThat(purpose === 'deposit' ? data.stage === 'awaiting_deposit' && amount > 0
+          : data.stage === 'arrived' && amount > 0, purpose === 'deposit' ? 'La reserva no tiene anticipo pendiente.' : 'El saldo solo se habilita después de registrar la llegada.', 409);
+        const expiresAt = purpose === 'deposit' ? data.deadline : new Date(Date.now() + rule.balanceLinkExpiryMinutes * 60000).toISOString();
+        requireThat(purpose !== 'deposit' || new Date(data.deadline) > new Date(), 'El plazo del anticipo venció. Revisa la reserva.', 409);
+        for (const old of data.intents) if ((old.purpose || 'deposit') === purpose && old.status === 'pending'
+          && new Date(old.expiresAt) <= new Date()) old.status = 'expired';
+        const reusable = data.intents.find(i => (i.purpose || 'deposit') === purpose && i.mode === mode
+          && (i.method || 'checkout') === method && i.amount === amount
+          && i.status === 'pending' && (purpose === 'deposit' ? i.expiresAt === expiresAt : new Date(i.expiresAt) > new Date())
           && (mode !== 'mercado_pago' || isMercadoPagoInitPoint(i.checkoutUrl)));
         if (reusable) return reusable;
-        const row = { id: intentId, amount: depositDue(data), expiresAt: data.deadline, status: 'pending', mode, method };
+        if (purpose === 'balance') {
+          const issued = data.intents.filter(i => (i.purpose || 'deposit') === 'balance').length;
+          requireThat(issued < rule.maxBalanceLinks, 'Se alcanzó el máximo de enlaces de saldo. El personal se acercará para ayudarte.', 409);
+          for (const old of data.intents) if ((old.purpose || 'deposit') === 'balance' && old.status === 'pending') old.status = 'expired';
+        }
+        const row = { id: intentId, purpose, amount, expiresAt, status: 'pending', mode, method };
         data.intents.push(row);
-        addEvent(data, 'Enlace de anticipo solicitado');
+        addEvent(data, purpose === 'deposit' ? 'Enlace de anticipo solicitado' : 'Enlace de saldo solicitado', money(amount));
         return row;
       });
       if (intent.mode === 'local' || intent.checkoutUrl) return intent;
@@ -119,7 +130,7 @@ export async function makeApi(env, options = {}) {
       return (await update(id, data => {
         const row = data.intents.find(i => i.id === intent.id);
         Object.assign(row, external);
-        addEvent(data, 'Enlace de Mercado Pago de prueba creado');
+        addEvent(data, 'Enlace de Mercado Pago de prueba creado', purpose + ' · ' + money(intent.amount));
         return row;
       })).result;
     });
@@ -130,6 +141,16 @@ export async function makeApi(env, options = {}) {
       && Date.now() - +new Date(message.at) < 24 * 3600000));
   }
   async function send(order, text, params = {}) {
+    if (config.waMode !== 'cloud') {
+      if (!params.reply && (!order.consent || !config.isPhoneAllowed(order.phone) || config.isPhoneBlocked(order.phone) || await optedOut(order.phone))) return order;
+      const shown = displayText(text);
+      return (await update(order.id, data => {
+        const id = 'SIM-' + randomUUID();
+        data.chat.push({ id, at: instant(), text: shown, direction: 'out', status: 'simulated',
+          ...(text?.kind === 'cta' && String(text.cta?.url || '').includes('/pago/') ? { paymentLink: true } : {}) });
+        addEvent(data, 'Mensaje simulado registrado', id);
+      })).order;
+    }
     const id = await service.sendWhatsApp(order, text, { ...params, reply: Boolean(params.reply), session: await sessionOpen(order.phone) });
     const shown = displayText(text);
     return (await update(order.id, data => {
@@ -140,6 +161,99 @@ export async function makeApi(env, options = {}) {
   }
   async function sendReply(order, reply) {
     for (const message of Array.isArray(reply) ? reply : [reply]) if (message) await send(order, message, { reply: true });
+  }
+  function paymentReceiptUrl(payment) {
+    if (!payment || payment.channel !== 'mercadopago' || !/^MP-\d+$/.test(String(payment.ref || ''))) return null;
+    return 'https://www.mercadopago.com.pe/ccap/file-viewer/receipt?' + new URLSearchParams({
+      flow: 'cow_payment_receipts', origin: 'feedback-screen', payment_id: payment.ref.slice(3) });
+  }
+  const openPaymentIssue = order => order.incidents.some(item => !item.resolvedAt
+    && ['Pago por revisar', 'Reverso por revisar'].includes(item.type));
+  async function deliverReceipt(order, receipt, { force = false, related = [] } = {}) {
+    const receipts = [receipt, ...related].filter(Boolean);
+    const keyList = receipts.map(item => item.token + ':' + item.purpose);
+    const stamp = instant();
+    const { result: claimed } = await update(order.id, data => {
+      data.receiptDeliveries ||= {};
+      if (!force && keyList.every(key => ['sent', 'simulated', 'suppressed'].includes(data.receiptDeliveries[key]?.status))) return false;
+      if (!force && keyList.some(key => data.receiptDeliveries[key]?.status === 'failed'
+        && Date.now() - +new Date(data.receiptDeliveries[key].at) < 60000)) return false;
+      if (keyList.some(key => data.receiptDeliveries[key]?.status === 'sending'
+        && Date.now() - +new Date(data.receiptDeliveries[key].at) < 5 * 60000)) return false;
+      for (const key of keyList) data.receiptDeliveries[key] = { status: 'sending', at: stamp,
+        attempts: (data.receiptDeliveries[key]?.attempts || 0) + 1 };
+      return true;
+    });
+    if (!claimed) return;
+    const permitted = order.phone && order.consent && config.isPhoneAllowed(order.phone)
+      && !config.isPhoneBlocked(order.phone) && !(await optedOut(order.phone));
+    if (!permitted) {
+      await update(order.id, data => { for (const key of keyList) Object.assign(data.receiptDeliveries[key],
+        { status: 'suppressed', reason: 'Sin consentimiento o contacto habilitado', at: instant() }); });
+      return;
+    }
+    const allPayments = order.payments.filter(item => item.amount > 0 && !order.payments.some(adjustment => adjustment.original === item.ref && adjustment.amount < 0));
+    const mpUrls = allPayments.filter(item => ['deposit', 'balance'].includes(item.purpose || 'deposit')).map(paymentReceiptUrl).filter(Boolean);
+    const depositPayment = allPayments.find(item => (item.purpose || 'deposit') === 'deposit');
+    const depositMethod = depositPayment?.channel === 'mercadopago' ? 'Mercado Pago'
+      : depositPayment?.channel === 'cash' ? 'efectivo' : depositPayment?.channel === 'pos' ? 'POS'
+        : depositPayment?.channel === 'wallet' ? 'billetera' : depositPayment?.channel || 'verificado';
+    const summary = receipt.purpose === 'deposit'
+      ? 'Anticipo ' + money(receipt.amount) + ' · ' + depositMethod + ' · '
+        + new Intl.DateTimeFormat('es-PE', { timeZone: 'America/Lima', dateStyle: 'short', timeStyle: 'short' }).format(new Date(depositPayment?.at || receipt.at))
+        + (paymentReceiptUrl(depositPayment) ? ' · Comprobante Mercado Pago: ' + paymentReceiptUrl(depositPayment) : '')
+      : (receipt.paymentBreakdown || []).map(item => (item.purpose === 'deposit' ? 'Anticipo' : 'Saldo') + ' ' + money(item.amount)
+        + ' (' + (item.channel === 'mercadopago' ? 'Mercado Pago' : item.channel === 'cash' ? 'efectivo' : item.channel === 'pos' ? 'POS' : item.channel === 'wallet' ? 'billetera' : item.channel) + ')').join(' · ')
+        + (mpUrls.length ? ' · Comprobantes de Mercado Pago: ' + mpUrls.join(' ') : '');
+    const amount = receipt.purpose === 'deposit' ? 'Anticipo ' + money(receipt.amount) : 'Total ' + money(order.total) + ' · ' + summary;
+    const message = receipt.purpose === 'deposit'
+      ? confirmationCta(order, receiptLink(receipt), new Date(), paymentReceiptUrl(depositPayment) ? 'Comprobante Mercado Pago: ' + paymentReceiptUrl(depositPayment) : '')
+      : receiptCta(order, receiptLink(receipt), amount);
+    try {
+      if (config.waMode !== 'cloud') {
+        await update(order.id, data => {
+          data.chat.push({ id: 'SIM-' + randomUUID(), at: instant(), direction: 'out', status: 'simulated', text: displayText(message) });
+          for (const key of keyList) Object.assign(data.receiptDeliveries[key], { status: 'simulated', at: instant(), messageId: null });
+        });
+      } else {
+        const result = await send(order, message, { template: receipt.purpose === 'deposit' ? 'confirmation' : 'settlement',
+          receiptToken: receipt.token, templateValues: receipt.purpose === 'deposit'
+            ? [order.payer, order.ref, friendlyDate(order.visitAt, new Date(), true), money(receipt.amount), summary]
+            : [order.payer, order.ref, money(order.total), amount] });
+        const outbound = result.chat.at(-1);
+        await update(order.id, data => { for (const key of keyList) Object.assign(data.receiptDeliveries[key],
+          { status: 'sent', at: outbound?.at || instant(), messageId: outbound?.id || null });
+          for (const incident of data.incidents) if (incident.type === 'Envío de constancia pendiente'
+            && incident.key === keyList.join('|') && !incident.resolvedAt) { incident.resolvedAt = instant(); incident.resolution = 'WhatsApp aceptó el reintento.'; }
+        });
+      }
+    } catch (error) {
+      await update(order.id, data => {
+        for (const key of keyList) Object.assign(data.receiptDeliveries[key], { status: 'failed', at: instant(), error: String(error.message).slice(0, 300) });
+        openIssue(data, 'Envío de constancia pendiente', error.message, keyList.join('|'));
+      });
+    }
+  }
+  async function deliverPendingReceipts(order) {
+    if (openPaymentIssue(order)) {
+      if (order.stage === 'paid' && !order.receipts.some(item => item.purpose === 'settlement')) {
+        await update(order.id, data => openIssue(data, 'Constancia final pendiente', 'Se resolverá al aclarar la incidencia de pago.', 'settlement-pending'));
+      }
+      return;
+    }
+    let fresh = order;
+    if (fresh.stage === 'paid' && balance(fresh) === 0) {
+      const token = randomUUID();
+      const result = await update(fresh.id, data => issueReceipt(data, 'settlement', token));
+      fresh = result.order;
+    }
+    const settlement = fresh.receipts.find(item => item.purpose === 'settlement');
+    const balanceReceipts = fresh.receipts.filter(item => item.purpose === 'balance');
+    if (settlement && balanceReceipts.length) await deliverReceipt(fresh, settlement, { related: balanceReceipts });
+    else {
+      const pending = fresh.receipts.find(item => !['sent', 'simulated', 'suppressed'].includes(fresh.receiptDeliveries?.[item.token + ':' + item.purpose]?.status));
+      if (pending) await deliverReceipt(fresh, pending);
+    }
   }
   async function registerReservation(phone, text, parsed, timestamp, messageId) {
     const excerpt = String(text || '').slice(0, 200);
@@ -236,31 +350,69 @@ export async function makeApi(env, options = {}) {
   }
   function finishDeposit(data, payment, token) {
     const changed = applyPayment(data, payment);
-    if (changed && data.stage === 'confirmed' && !data.receipts.some(r => r.purpose === 'deposit')) issueReceipt(data, 'deposit', token);
+    if (changed && data.stage === 'confirmed' && !data.receipts.some(r => r.purpose === 'deposit')) issueReceipt(data, 'deposit', token, payment);
     return changed;
   }
+  function finishBalance(data, payment, token) {
+    const changed = applyPayment(data, payment);
+    if (!changed) return false;
+    const applied = data.payments.find(item => item.ref === payment.ref);
+    if (balance(data) === 0) {
+      if (!data.receipts.some(item => item.purpose === 'balance' && item.paymentRef === payment.ref)) issueReceipt(data, 'balance', token, applied);
+      if (data.stage === 'paid' && !openPaymentIssue(data)) issueReceipt(data, 'settlement', randomUUID());
+    }
+    return true;
+  }
   async function notifyConfirmation(order) {
-    if (config.waMode !== 'cloud' || !order.consent || !config.isPhoneAllowed(order.phone) || await optedOut(order.phone)
-      || !(await settings()).automaticConfirmation) return;
     const receipt = order.receipts.find(r => r.purpose === 'deposit');
+    if (receipt) await deliverReceipt(order, receipt);
+  }
+  async function sendBalanceLink(order, { forceNew = false, reply = false } = {}) {
     try {
-      const text = emojis.verified + ' Anticipo verificado. Tu reserva *' + order.ref + '* está confirmada para el *'
-        + friendlyDate(order.visitAt, new Date(), true) + '*. Saldo a pagar en el local: *' + money(balance(order)) + '*.';
-      await send(order, receipt ? confirmationCta(order, receiptLink(receipt)) : text, { template: 'confirmation' });
-    } catch (error) { await update(order.id, data => openIssue(data, 'Confirmación de WhatsApp pendiente', error.message)); }
+      if (!reply && (!order.consent || !config.isPhoneAllowed(order.phone) || config.isPhoneBlocked(order.phone) || await optedOut(order.phone))) {
+        throw new Problem('No se envió el link automático: falta consentimiento o el teléfono no admite mensajes iniciados por el restaurante.', 409);
+      }
+      const intent = await checkout(order.id, 'checkout', 'balance', forceNew);
+      const current = (await store.get(order.id))?.data || order;
+      const text = balancePaymentCta(current, intent, linkFor(intent));
+      return await send(current, text, { template: 'balance', intent, reply,
+        templateValues: [current.payer, current.ref, money(intent.amount)] });
+    } catch (error) {
+      if (/máximo de enlaces/i.test(error.message)) await update(order.id, data => openIssue(data,
+        'Máximo de enlaces de saldo alcanzado', 'No se generó otro enlace; el personal debe acercarse.', 'balance-link-limit'));
+      throw error;
+    }
+  }
+  async function autoPayOrder(order) {
+    if (order.stage === 'arrived' && balance(order) > 0) return sendBalanceLink(order, { reply: true });
+    if (order.stage === 'awaiting_deposit' && depositDue(order) > 0) {
+      if (new Date(order.deadline) <= new Date()) return sendReply(order, reservationMenu(order));
+      const intent = await checkout(order.id);
+      return send(order, paymentCta(order, intent, 'checkout', linkFor(intent), await settings()), { template: 'deposit', intent, reply: true });
+    }
+    if (order.stage === 'confirmed') return send(order, 'El saldo se habilita cuando recepción registre tu llegada. Por ahora no generaré un enlace de saldo.', { reply: true });
+    const receipt = order.receipts.find(item => item.purpose === 'settlement') || order.receipts.at(-1);
+    if (['paid', 'closed'].includes(order.stage) && receipt) return send(order, receiptCta(order, receiptLink(receipt)), { reply: true });
+    return send(order, reservationMenu(order), { reply: true });
   }
   async function notifyRejectedPayment(order, rejectedIntent) {
     if (config.waMode !== 'cloud' || !order.consent || !config.isPhoneAllowed(order.phone)
       || config.isPhoneBlocked(order.phone) || await optedOut(order.phone)) return;
     const activeSession = await sessionOpen(order.phone);
-    if (!activeSession && !config.env.WA_TEMPLATE_PAYMENT_REJECTED) {
+    const templateName = rejectedIntent.purpose === 'balance' ? config.env.WA_TEMPLATE_BALANCE : config.env.WA_TEMPLATE_PAYMENT_REJECTED;
+    if (!activeSession && !templateName) {
       await update(order.id, data => openIssue(data, 'Aviso de pago no aprobado pendiente',
-        'Fuera de la ventana de WhatsApp se necesita una plantilla aprobada. Configura WA_TEMPLATE_PAYMENT_REJECTED.', rejectedIntent.id));
+        'Fuera de la ventana de WhatsApp se necesita una plantilla aprobada. Configura ' + (rejectedIntent.purpose === 'balance' ? 'WA_TEMPLATE_BALANCE.' : 'WA_TEMPLATE_PAYMENT_REJECTED.'), rejectedIntent.id));
       return;
     }
     try {
-      const intent = await checkout(order.id);
-      await send(order, paymentRejectedCta(order, intent, linkFor(intent)), { template: 'paymentRejected', intent });
+      if (rejectedIntent.purpose === 'balance') {
+        const intent = await checkout(order.id, 'checkout', 'balance');
+        await send(order, balancePaymentCta(order, intent, linkFor(intent)), { template: 'balance', intent });
+      } else {
+        const intent = await checkout(order.id);
+        await send(order, paymentRejectedCta(order, intent, linkFor(intent)), { template: 'paymentRejected', intent });
+      }
     } catch (error) {
       await update(order.id, data => openIssue(data, 'Aviso de pago no aprobado pendiente', error.message, rejectedIntent.id));
     }
@@ -280,12 +432,16 @@ export async function makeApi(env, options = {}) {
     const p = verified || await service.payment(id);
     requireThat(uuid.test(String(p.external_reference || '')), 'La operación no corresponde a una reserva de la aplicación.', 404);
     const target = await store.find('intents', { id: p.external_reference, mode: 'mercado_pago' });
-    requireThat(target, 'Referencia de anticipo no encontrada.', 404);
+    requireThat(target, 'Referencia de pago no encontrada.', 404);
+    const intentPurpose = target.intents.find(item => item.id === p.external_reference)?.purpose || 'deposit';
     const token = randomUUID();
     let rejectedIntent = null;
     const { order, result } = await update(target.id, data => {
       rejectedIntent = null;
       const intent = data.intents.find(i => i.id === p.external_reference);
+      requireThat(intent, 'Intento de pago no encontrado.', 404);
+      const purpose = intent.purpose || 'deposit';
+      requireThat(['deposit', 'balance'].includes(purpose), 'Propósito de pago inválido.', 409);
       const ref = 'MP-' + String(p.id);
       const amount = Math.round(Number(p.transaction_amount) * 100);
       requireThat(Number.isSafeInteger(amount) && amount > 0, 'Importe de pago inválido.', 409);
@@ -294,20 +450,34 @@ export async function makeApi(env, options = {}) {
         return false;
       }
       let changed = false;
-      if (['approved', 'refunded', 'charged_back'].includes(p.status)) {
+      if (p.status === 'approved' && purpose === 'balance'
+        && (intent.status === 'superseded' || balance(data) === 0 || data.stage !== 'arrived'
+          || new Date(p.date_approved || instant()) > new Date(intent.expiresAt))) {
+        if (!data.unappliedPayments?.some(item => item.ref === ref)) {
+          data.unappliedPayments ||= [];
+          data.unappliedPayments.push({ ref, intentId: intent.id, amount, purpose, at: p.date_approved || instant(), reason: 'El saldo ya se cobró en caja, venció el link o cambió el estado.' });
+          openIssue(data, 'Pago por revisar', 'Mercado Pago aprobó un pago de saldo que ya no puede aplicarse. Operación: ' + ref, ref);
+          addEvent(data, 'Pago tardío no aplicado', ref + ' · ' + money(amount));
+          intent.status = 'late_approved';
+          changed = true;
+        }
+      } else if (['approved', 'refunded', 'charged_back'].includes(p.status)) {
         intent.status = p.status === 'approved' ? 'approved' : p.status;
-        changed = finishDeposit(data, { ref, amount, purpose: 'deposit', channel: 'mercadopago',
-          at: p.date_approved || instant(), intentId: intent.id,
-          review: p.status !== 'approved' || new Date(p.date_approved || instant()) > new Date(intent.expiresAt) }, token);
+        const payment = { ref, amount, purpose, channel: 'mercadopago', at: p.date_approved || instant(), intentId: intent.id,
+          review: p.status !== 'approved' || new Date(p.date_approved || instant()) > new Date(intent.expiresAt) };
+        changed = purpose === 'deposit' ? finishDeposit(data, payment, token) : finishBalance(data, payment, token);
         const reported = Math.round(Number(p.transaction_amount_refunded || 0) * 100);
         const reversed = ['refunded', 'charged_back'].includes(p.status) ? (reported || amount) : reported;
         const already = data.payments.filter(x => x.original === ref).reduce((sum, x) => sum - x.amount, 0);
         if (reversed > already && reversed <= amount) {
           data.payments.push({ ref: ref + '-AJUSTE-' + reversed, amount: -(reversed - already), at: instant(),
-            channel: 'mercadopago', purpose: 'deposit', original: ref });
+            channel: 'mercadopago', purpose, original: ref });
           openIssue(data, 'Reverso por revisar', 'Mercado Pago confirmó una devolución o reverso.', ref + '-reverso');
           if (data.stage === 'confirmed' && depositDue(data) > 0) data.stage = 'awaiting_deposit';
-          if (data.stage === 'paid' && balance(data) > 0) data.stage = 'arrived';
+          if (['paid', 'closed'].includes(data.stage) && balance(data) > 0) {
+            data.stage = 'arrived'; data.closedAt = null;
+            for (const receipt of data.receipts) if (receipt.purpose === 'settlement') receipt.reversedAt = instant();
+          }
           changed = true;
         }
       } else if (['rejected', 'cancelled'].includes(p.status)) {
@@ -315,12 +485,13 @@ export async function makeApi(env, options = {}) {
           intent.status = 'rejected';
           rejectedIntent = structuredClone(intent);
         }
-        openIssue(data, 'Intento rechazado', 'Mercado Pago informó un intento fallido de anticipo.', ref);
+        openIssue(data, 'Intento rechazado', 'Mercado Pago informó un intento fallido de ' + purpose + '.', ref);
       }
       return changed;
     });
     if (result && p.status === 'approved') {
-      if (order.stage === 'confirmed') await notifyConfirmation(order);
+      if (intentPurpose === 'deposit' && order.stage === 'confirmed') await notifyConfirmation(order);
+      else if (intentPurpose === 'balance' && !order.unappliedPayments?.some(x => x.ref === 'MP-' + String(p.id))) await deliverPendingReceipts(order);
       else {
         const reviewPayment = order.payments.find(item => item.ref === 'MP-' + String(p.id) && item.review);
         if (reviewPayment) await notifyPaymentReview(order, reviewPayment);
@@ -452,6 +623,7 @@ export async function makeApi(env, options = {}) {
 
     // Baja y alta se evalúan antes de clasificar la intención.
     const command = commandText(text);
+    const balanceShortcut = new Set(['pagar', 'cuenta', 'pagar comida', 'saldo', 'pagar saldo']).has(command);
     if (optOutPhrases.has(command)) {
       await store.setOptOut(phone, true);
       await service.sendWhatsAppReply(phone, texts.optOut);
@@ -489,8 +661,9 @@ export async function makeApi(env, options = {}) {
     }
 
     const staffFocus = action?.action === 'staff' ? (reservationFocus(orders) || orders[0]) : null;
+    const actionFocus = action?.ref ? orders.find(order => order.ref === action.ref) : null;
     const active = orders.filter(order => !terminal(order));
-    const candidates = staffFocus ? [staffFocus]
+    const candidates = actionFocus ? [actionFocus] : staffFocus ? [staffFocus]
       : ref ? orders.filter(order => order.ref === ref) : (active.length ? active : orders);
     if (!candidates.length) {
       await replyWithoutReservation(phone, text, action);
@@ -535,7 +708,19 @@ export async function makeApi(env, options = {}) {
     let recipient = target || order;
     try {
       let response;
-      if (action && (action.action === 'menu' || (action.ref && !target))) {
+      if (action?.action === 'payb' || action?.action === 'selb') {
+        const selected = target || order;
+        recipient = selected;
+        await autoPayOrder(selected);
+        return;
+      } else if (!action && balanceShortcut && !ref && orders.length > 1) {
+        const eligibles = active.length ? active : orders;
+        response = reservationList(eligibles, new Date(), 'selb');
+        recipient = reservationFocus(orders) || order;
+      } else if (!action && balanceShortcut) {
+        await autoPayOrder(order);
+        return;
+      } else if (action && (action.action === 'menu' || (action.ref && !target))) {
         response = reservationPrompt(orders);
         recipient = reservationFocus(orders) || order;
       } else if (action?.action === 'sel') {
@@ -558,6 +743,10 @@ export async function makeApi(env, options = {}) {
       await sendReply(recipient, response);
     } catch (error) {
       await update(order.id, data => openIssue(data, 'Respuesta de WhatsApp pendiente', error.message, message.id));
+        if (/máximo de enlaces de saldo/i.test(error.message)) {
+          try { await send(order, 'Por ahora no puedo crear otro enlace de saldo. El personal se acercará para ayudarte.', { reply: true }); }
+          catch { /* La incidencia deja el aviso visible para el personal. */ }
+        }
     }
   }
   async function delivery(status) {
@@ -647,6 +836,15 @@ export async function makeApi(env, options = {}) {
         });
         if (created) escalated++;
       }
+    }
+
+    for (const order of orders) {
+      if (!order.receipts?.length) continue;
+      const hasPendingDelivery = order.receipts.some(receipt => !order.receiptDeliveries?.[receipt.token + ':' + receipt.purpose]
+        || ['pending', 'failed'].includes(order.receiptDeliveries?.[receipt.token + ':' + receipt.purpose]?.status)
+        || (order.receiptDeliveries?.[receipt.token + ':' + receipt.purpose]?.status === 'sending'
+          && now - +new Date(order.receiptDeliveries[receipt.token + ':' + receipt.purpose].at) > 5 * 60000));
+      if (hasPendingDelivery) await deliverPendingReceipts((await store.get(order.id))?.data || order);
     }
 
     if (config.waMode !== 'cloud' || !rule.reminders || !contactTime(rule, new Date(now))) return { sent, escalated };
@@ -868,13 +1066,17 @@ export async function makeApi(env, options = {}) {
         }
       }
       const method = intent.method || 'checkout';
+      const purpose = intent.purpose || 'deposit';
       const methodEnabled = method === 'checkout' || (await settings())[method + 'Demo'];
       if (isGet) {
-        const usable = methodEnabled && target.stage === 'awaiting_deposit' && intent.amount === depositDue(target)
-          && new Date(intent.expiresAt) > new Date() && new Date(target.deadline) > new Date() && intent.status === 'pending';
+        const expected = purpose === 'deposit' ? depositDue(target) : balance(target);
+        const rightStage = purpose === 'deposit' ? target.stage === 'awaiting_deposit' && new Date(target.deadline) > new Date()
+          : target.stage === 'arrived' && balance(target) > 0;
+        const usable = methodEnabled && rightStage && intent.amount === expected
+          && new Date(intent.expiresAt) > new Date() && intent.status === 'pending';
         const safeCheckout = intent.mode !== 'mercado_pago' || isMercadoPagoInitPoint(intent.checkoutUrl);
         const requiresReview = target.payments.some(payment => payment.intentId === intent.id && payment.review);
-        return json(res, 200, { ref: target.ref, amount: intent.amount, status: intent.status, mode: intent.mode,
+        return json(res, 200, { ref: target.ref, amount: intent.amount, status: intent.status, mode: intent.mode, purpose,
           stage: target.stage, requiresReview,
           method, usable: usable && safeCheckout, checkoutUrl: usable && safeCheckout ? intent.checkoutUrl : null });
       }
@@ -885,19 +1087,24 @@ export async function makeApi(env, options = {}) {
         const { order, result } = await update(target.id, data => {
           const row = data.intents.find(i => i.id === intent.id);
           if (row.status === 'approved') return { status: row.status, confirmed: false };
-          requireThat(data.stage === 'awaiting_deposit' && row.status === 'pending' && row.amount === depositDue(data)
-            && new Date(row.expiresAt) > new Date() && new Date(data.deadline) > new Date(), 'El enlace ya no está disponible.', 409);
+          const due = purpose === 'deposit' ? depositDue(data) : balance(data);
+          const stageOkay = purpose === 'deposit' ? data.stage === 'awaiting_deposit' && new Date(data.deadline) > new Date()
+            : data.stage === 'arrived';
+          requireThat(stageOkay && due > 0 && row.status === 'pending' && row.amount === due
+            && new Date(row.expiresAt) > new Date(), 'El enlace ya no está disponible.', 409);
           if (input.outcome === 'rejected') {
             row.status = 'rejected';
             openIssue(data, 'Intento rechazado', 'El checkout local simuló un rechazo.', row.id);
           } else {
             requireThat(input.outcome === 'approved', 'Resultado de prueba inválido.');
             row.status = 'approved';
-            finishDeposit(data, { ref: 'SIM-' + row.id, amount: row.amount, purpose: 'deposit', channel: method === 'checkout' ? 'simulation' : method + '_demo', intentId: row.id }, token);
+            const payment = { ref: 'SIM-' + row.id, amount: row.amount, purpose, channel: method === 'checkout' ? 'simulation' : method + '_demo', intentId: row.id };
+            if (purpose === 'deposit') finishDeposit(data, payment, token); else finishBalance(data, payment, token);
           }
           return { status: row.status, confirmed: row.status === 'approved' && data.stage === 'confirmed' };
         });
         if (result.confirmed) await notifyConfirmation(order);
+        else if (purpose === 'balance' && result.status === 'approved') await deliverPendingReceipts(order);
         return json(res, 200, { status: result.status });
       }
     }
@@ -913,7 +1120,17 @@ export async function makeApi(env, options = {}) {
       const operationId = payment ? payment.ref.slice(3) : null;
       const mercadoPagoReceiptUrl = operationId ? 'https://www.mercadopago.com.pe/ccap/file-viewer/receipt?'
         + new URLSearchParams({ flow: 'cow_payment_receipts', origin: 'feedback-screen', payment_id: operationId }) : null;
+      const receiptPayments = receipt.purpose === 'settlement'
+        ? (receipt.paymentBreakdown?.length
+          ? receipt.paymentBreakdown.map(row => order.payments.find(item => item.ref === row.ref)).filter(Boolean)
+          : order.payments.filter(item => item.amount > 0 && !order.payments.some(adjustment => adjustment.original === item.ref && adjustment.amount < 0)))
+        : order.payments.filter(item => item.ref === receipt.paymentRef || (receipt.intentId && item.intentId === receipt.intentId));
+      const mercadoPagoReceipts = receiptPayments.filter(item => !order.payments.some(adjustment => adjustment.original === item.ref && adjustment.amount < 0))
+        .map(item => ({ paymentId: item.ref.slice(3), intentId: item.intentId || null, purpose: item.purpose || 'deposit', amount: item.amount,
+          url: paymentReceiptUrl(item) })).filter(item => item.url);
       return json(res, 200, { ...receipt, ref: order.ref, payer: order.payer, total: order.total,
+        payments: receipt.paymentBreakdown || receiptPayments.map(item => ({ purpose: item.purpose || 'deposit', amount: item.amount,
+          at: item.at, channel: item.channel, ref: item.ref })), mercadoPagoReceipts,
         ...(operationId ? { mercadoPagoOperationId: operationId, mercadoPagoReceiptUrl } : {}) });
     }
     requireThat(authenticated(req), 'Inicia sesión para acceder al panel.', 401);
@@ -971,15 +1188,22 @@ export async function makeApi(env, options = {}) {
         if (input.type === 'deposit') {
           const intent = await checkout(id, input.method);
           order = await send(order, paymentCta(order, intent, input.method || 'checkout', linkFor(intent), await settings()), { template: 'deposit', intent });
+        } else if (input.type === 'balance') {
+          order = await sendBalanceLink(order, { forceNew: Boolean(input.newLink) });
         } else if (input.type === 'visit') {
           requireThat(order.stage === 'confirmed', 'La visita debe estar confirmada.', 409);
           order = await send(order, emojis.visit + ' *Próxima visita*\nReserva: *' + order.ref + '*\n'
             + friendlyDate(order.visitAt, new Date(), true) + '\nSaldo en el local: *' + money(balance(order)) + '*', { template: 'visit' });
         } else if (input.type === 'receipt') {
-          const receipt = order.receipts.at(-1);
+          const receipt = order.receipts.find(item => item.token === input.receiptToken) || order.receipts.at(-1);
           requireThat(receipt, 'Aún no hay un comprobante emitido.', 409);
-          order = await send(order, receiptCta(order, receiptLink(receipt)),
-            { template: receipt.purpose === 'settlement' ? 'settlement' : undefined });
+          requireThat(!receipt.reversedAt, 'Esta liquidación fue revertida y no se puede reenviar.', 409);
+          const settlement = ['balance', 'settlement'].includes(receipt.purpose)
+            ? (receipt.purpose === 'settlement' && !receipt.reversedAt ? receipt : order.receipts.find(item => item.purpose === 'settlement' && !item.reversedAt)) : null;
+          if (receipt.purpose === 'balance') requireThat(settlement, 'La constancia final se habilitará al resolver las incidencias de pago.', 409);
+          await deliverReceipt(order, settlement || receipt, { force: true,
+            related: settlement ? order.receipts.filter(item => item.purpose === 'balance') : [] });
+          order = (await store.get(id)).data;
         } else throw new Problem('Selecciona un mensaje válido.');
         return json(res, 200, { order });
       }
@@ -1015,7 +1239,15 @@ export async function makeApi(env, options = {}) {
       const rule = await settings();
       const result = await update(id, data => {
         if (kind === 'arrive') return arrive(data, Number(input.count));
-        if (kind === 'counter') return recordCounterPayment(data, input.channel);
+        if (kind === 'counter') {
+          recordCounterPayment(data, input.channel);
+          const payment = data.payments.at(-1);
+          if (balance(data) === 0) {
+            issueReceipt(data, 'balance', receiptToken, payment);
+            if (!openPaymentIssue(data)) issueReceipt(data, 'settlement', randomUUID());
+          }
+          return payment;
+        }
         if (kind === 'receipt') return issueReceipt(data, 'settlement', receiptToken);
         if (kind === 'reschedule') return reschedule(data, input.visitAt);
         if (kind === 'renew') {
@@ -1037,25 +1269,39 @@ export async function makeApi(env, options = {}) {
           issue.resolution = resolution;
           addEvent(data, 'Incidencia resuelta', resolution, 'Operador');
           if (data.stage === 'awaiting_deposit' && depositDue(data) === 0 && new Date(data.visitAt) > new Date()
-            && !data.incidents.some(i => !i.resolvedAt && i.type === 'Pago por revisar')) {
+            && !data.incidents.some(i => !i.resolvedAt && ['Pago por revisar', 'Reverso por revisar'].includes(i.type))) {
             data.stage = 'confirmed';
             data.confirmedAt = instant();
             addEvent(data, 'Reserva confirmada tras revisión', '', 'Operador');
             issueReceipt(data, 'deposit', receiptToken);
           }
+          if (data.stage === 'arrived' && balance(data) === 0
+            && !data.incidents.some(i => !i.resolvedAt && ['Pago por revisar', 'Reverso por revisar'].includes(i.type))) {
+            data.stage = 'paid';
+            addEvent(data, 'Saldo conciliado tras revisión', '', 'Operador');
+            const balancePayment = [...data.payments].reverse().find(payment => payment.amount > 0 && payment.purpose === 'balance');
+            if (balancePayment && !data.receipts.some(r => r.purpose === 'balance' && r.paymentRef === balancePayment.ref)) {
+              issueReceipt(data, 'balance', receiptToken, balancePayment);
+            }
+          }
           return;
         }
         throw new Problem('Acción no disponible.', 404);
       });
-      if (kind === 'receipt' && result.result?.token === receiptToken && rule.automaticConfirmation
-        && config.waMode === 'cloud' && result.order.consent && config.isPhoneAllowed(result.order.phone)
-        && !(await optedOut(result.order.phone))) {
-        try {
-          await send(result.order, 'Verificamos tu llegada y el pago completo de ' + result.order.ref + '. Tu constancia de demostración: '
-            + receiptLink(result.result), { template: 'settlement' });
-        } catch (error) { await update(id, data => openIssue(data, 'Envío de constancia pendiente', error.message, receiptToken)); }
+      if (kind === 'arrive' && result.order.stage === 'arrived' && balance(result.order) > 0) {
+        try { await sendBalanceLink(result.order); }
+        catch (error) { await update(id, data => openIssue(data, 'Envío del link de saldo pendiente', error.message, 'balance-link:' + result.order.attendance.at)); }
       }
-      return json(res, 200, result);
+      if (kind === 'counter' && balance(result.order) === 0) await deliverPendingReceipts(result.order);
+      if (kind === 'resolve') {
+        await deliverPendingReceipts(result.order);
+        if (result.order.stage === 'arrived' && balance(result.order) > 0) {
+          try { await sendBalanceLink(result.order); }
+          catch (error) { await update(id, data => openIssue(data, 'Envío del link de saldo pendiente', error.message, 'balance-link-retry')); }
+        }
+      }
+      if (kind === 'receipt') await deliverPendingReceipts(result.order);
+      return json(res, 200, { ...result, order: (await store.get(id))?.data || result.order });
     }
     return json(res, 404, { error: 'Ruta no encontrada.' });
   }

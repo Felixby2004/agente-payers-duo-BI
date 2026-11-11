@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { makeApi } from '../server/api.mjs';
 import { hmac } from '../server/providers.mjs';
-import { confirmationCta, emojis, friendlyDate, limits, listMessage, paymentCta, receiptCta, reservationFocus,
+import { confirmationCta, emojis, friendlyDate, limits, listMessage, parseAction, paymentCta, receiptCta, reservationFocus,
   reservationList, reservationMenu, reservationPrompt } from '../server/interactive.mjs';
 
 test('El agente usa botones, listas y CTA con ids seguros y fallback de texto', async () => {
@@ -352,6 +352,18 @@ test('Más de diez reservas se recortan a diez filas con aviso en el cuerpo', ()
   const rows = list.list.sections.flatMap(section => section.rows);
   assert.equal(rows.length, limits.rows);
   assert.match(list.body, /Mostrando las 10 más relevantes de 12\. Si buscas otra, escríbeme su referencia\./);
+});
+
+test('El selector dedicado a pago de saldo conserva la referencia de reserva', () => {
+  assert.deepEqual(parseAction('payb:EST-1234ABCD'), { action: 'payb', ref: 'EST-1234ABCD' });
+  assert.deepEqual(parseAction('selb:EST-1234ABCD'), { action: 'selb', ref: 'EST-1234ABCD' });
+});
+
+test('Una reserva con llegada ofrece el botón independiente para pagar el saldo', () => {
+  const arrived = demoOrder({ ref: 'EST-1234ABCD', stage: 'arrived', total: 14900, deposit: 4000,
+    payments: [{ ref: 'MP-1', amount: 4000, purpose: 'deposit' }] });
+  const menu = reservationMenu(arrived, fixedNow);
+  assert.ok(menu.buttons.some(item => item.id === 'payb:EST-1234ABCD' && item.title === 'Pagar saldo en línea'));
 });
 
 test('Los límites recortan la referencia antes que el estado y los botones no llevan emojis', () => {

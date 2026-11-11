@@ -5,7 +5,7 @@ import { Dashboard, Reports } from './Dashboard.jsx';
 import { Detail, Register, Reservations } from './Operations.jsx';
 import { api } from './client.mjs';
 import { AgentSettings } from './AgentSettings.jsx';
-import { money, visitText } from '../shared/orders.mjs';
+import { money, paymentLabels, visitText } from '../shared/orders.mjs';
 import './styles.css';
 
 const nav = [
@@ -104,9 +104,9 @@ function PublicPage({ type, token }) {
     {error && <p className="error" role="alert">{error}</p>}
     {!data && !error && <p role="status">Consultando el estado…</p>}
     {data && type === 'payment' && <>
-      <div className="public-amount"><small>IMPORTE DEL ANTICIPO</small><strong>{money(data.amount)}</strong></div>
-      {data.status === 'approved' && data.requiresReview ? <div className="inline-note">Mercado Pago verificó el pago, pero la reserva requiere revisión por el plazo vencido. El restaurante confirmará la disponibilidad.</div>
-        : data.status === 'approved' ? <div className="closed-note"><CheckCircle2 size={21} /><span><strong>Anticipo verificado</strong><small>La operación de prueba se registró en PAYERS.</small></span></div>
+      <div className="public-amount"><small>{data.purpose === 'balance' ? 'IMPORTE DEL SALDO' : 'IMPORTE DEL ANTICIPO'}</small><strong>{money(data.amount)}</strong></div>
+      {data.status === 'approved' && data.requiresReview ? <div className="inline-note">Mercado Pago verificó el pago, pero PAYERS lo dejó pendiente de revisión. El restaurante confirmará los siguientes pasos.</div>
+        : data.status === 'approved' ? <div className="closed-note"><CheckCircle2 size={21} /><span><strong>{data.purpose === 'balance' ? 'Saldo verificado' : 'Anticipo verificado'}</strong><small>La operación de prueba se registró en PAYERS.</small></span></div>
         : data.status === 'rejected' ? <p className="error">El pago de prueba fue rechazado. Solicita un nuevo enlace.</p>
         : data.status === 'refunded' || data.status === 'charged_back' ? <p className="inline-note">La operación fue revertida. Consulta a caja.</p>
         : !data.usable ? <p className="inline-note">Este enlace está vencido o la reserva cambió. Consulta al restaurante.</p>
@@ -121,19 +121,20 @@ function PublicPage({ type, token }) {
         </>}
     </>}
     {data && type === 'receipt' && <>
-      <div className="receipt-type">Constancia interna · {data.purpose === 'deposit' ? 'Anticipo de reserva' : 'Liquidación de pedido'} · {data.number}</div>
+      <div className="receipt-type">Constancia interna · {data.purpose === 'deposit' ? 'Anticipo de reserva' : data.purpose === 'balance' ? 'Pago de saldo' : 'Liquidación de pedido'} · {data.number}</div>
+      {data.reversedAt && <p className="error">Esta constancia corresponde a una liquidación revertida y ya no representa el saldo actual.</p>}
       <dl className="public-receipt"><div><dt>Pagador</dt><dd>{data.payer}</dd></div><div><dt>Fecha de emisión</dt><dd>{visitText(data.at)}</dd></div>
-        <div><dt>Importe {data.purpose === 'deposit' ? 'del anticipo' : 'del pedido'}</dt><dd>{money(data.amount)}</dd></div>
-        {data.mercadoPagoOperationId && <div><dt>Operación de Mercado Pago</dt><dd>{data.mercadoPagoOperationId}</dd></div>}
-        {data.purpose === 'settlement' && <><div><dt>Anticipo aplicado</dt><dd>{money(data.appliedDeposit)}</dd></div>
-          <div><dt>Saldo pagado en el local</dt><dd>{money(data.total - data.appliedDeposit)}</dd></div></>}</dl>
+        {data.purpose !== 'settlement' && <div><dt>Importe {data.purpose === 'deposit' ? 'del anticipo' : 'del saldo'}</dt><dd>{money(data.amount)}</dd></div>}
+        {data.purpose === 'settlement' && <>
+          {(data.payments || []).filter(item => item.amount > 0).map((item, index) => <div key={index}><dt>{item.purpose === 'deposit' ? 'Anticipo' : 'Saldo'} · {paymentLabels[item.channel] || item.channel} · {visitText(item.at)}</dt><dd>{money(item.amount)}</dd></div>)}
+          <div><dt>Total</dt><dd>{money(data.total)}</dd></div></>}</dl>
       <p className="inline-note">Constancia de demostración. Sin validez tributaria.</p>
       <div className="button-row">
-        {data.mercadoPagoReceiptUrl && <a className="button outline print-hide" href={data.mercadoPagoReceiptUrl} target="_blank" rel="noopener noreferrer">
-          <ExternalLink size={17} /> Ver comprobante en Mercado Pago</a>}
+        {(data.mercadoPagoReceipts || (data.mercadoPagoReceiptUrl ? [{ url: data.mercadoPagoReceiptUrl, purpose: data.purpose, paymentId: data.mercadoPagoOperationId }] : [])).map(item => <a key={item.paymentId || item.url} className="button outline print-hide" href={item.url} target="_blank" rel="noopener noreferrer">
+          <ExternalLink size={17} /> Ver comprobante Mercado Pago · {item.purpose === 'balance' ? 'Saldo' : 'Anticipo'} {item.paymentId ? '#' + item.paymentId : ''}</a>)}
         <button className="button primary print-hide" onClick={() => window.print()}><Printer size={17} /> Imprimir constancia interna</button>
       </div>
-      {data.mercadoPagoReceiptUrl && <p className="receipt-help">Mercado Pago puede pedirte iniciar sesión con la cuenta compradora que hizo el pago.</p>}
+      {Boolean(data.mercadoPagoReceipts?.length || data.mercadoPagoReceiptUrl) && <p className="receipt-help">Mercado Pago puede pedirte iniciar sesión con la cuenta compradora que hizo cada pago.</p>}
     </>}
     {type === 'payment' && <button className="text-button refresh" onClick={refresh}><RefreshCw size={15} /> Actualizar estado</button>}
   </main></div>;
