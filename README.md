@@ -113,3 +113,5 @@ powershell -ExecutionPolicy Bypass -File .\scripts\stop-demo.ps1
 ```
 
 El inicio levanta el servidor y los túneles temporales y actualiza `PUBLIC_URL`. Las respuestas a mensajes se procesan directamente al llegar el webhook de Meta; n8n conserva las alertas programadas y la revisión de respaldo de la cola. Después de cada inicio debes actualizar en Meta la URL de devolución de WhatsApp y en Mercado Pago la URL de prueba de pagos. Ambas direcciones se muestran en la salida del comando. Los registros y la lista de procesos se guardan en `.demo/`.
+
+Si ya hay una instancia n8n saludable en `N8N_PORT` y tiene registrado el webhook de producción del workflow, el script la reutiliza en lugar de iniciar otra; `stop-demo.ps1` no detiene esa instancia preexistente. Si el puerto 5173 sigue ocupado después de detener los procesos registrados, el inicio falla antes de levantar n8n o los túneles.

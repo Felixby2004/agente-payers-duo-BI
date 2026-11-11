@@ -478,6 +478,7 @@ function Test-DemoTunnel {
 }
 
 $environmentUpdated = $false
+$n8nReused = $false
 try {
   Set-Location -LiteralPath $script:ProjectRoot
   $envPath = Join-Path $script:ProjectRoot '.env'
@@ -581,7 +582,7 @@ try {
       Write-Host '2. Omitiría la compilación porque dist/index.html ya existe.'
     }
     if ($orchestration -eq 'n8n') {
-      Write-Host ('3. Iniciaría n8n en segundo plano y esperaría {0}/healthz (90 s).' -f $n8nOrigin)
+      Write-Host ('3. Reutilizaría n8n si ya responde y tiene registrado el webhook en {0}; si no, lo iniciaría.' -f $n8nOrigin)
     } else {
       Write-Host '3. Omitiría n8n porque AGENT_ORCHESTRATION=server.'
     }
@@ -683,6 +684,11 @@ try {
     Remove-Item -LiteralPath $script:PidsFile -Force -ErrorAction SilentlyContinue
   }
 
+  $existingPanelListener = Get-DemoListenerProcessId -Port 5173
+  if ($existingPanelListener) {
+    throw ('El puerto 5173 ya está ocupado por PID {0}; no se iniciaron n8n ni los túneles. Detén el servidor anterior o libera ese puerto.' -f $existingPanelListener)
+  }
+
   if (-not $NoBuild -and -not (Test-Path -LiteralPath $distIndex -PathType Leaf)) {
     Write-Host 'Compilando la aplicación con npm.cmd run build...'
     & $npmCommand.Source run build
@@ -697,12 +703,27 @@ try {
   }
 
   if ($orchestration -eq 'n8n') {
-    $env:N8N_PORT = [string]$n8nPort
-    $env:N8N_RUNNERS_BROKER_PORT = [string]$n8nBrokerPort
-    $n8nProcess = Start-DemoProcess -Name 'n8n' -Executable $n8nCommand.Source `
-      -Arguments @('start') -StdoutPath (Join-Path $script:DemoDirectory 'n8n.out.log') `
-      -StderrPath (Join-Path $script:DemoDirectory 'n8n.err.log')
-    Wait-DemoHttp -Uri ($n8nOrigin + '/healthz') -TimeoutSeconds 90 -ServiceName 'n8n'
+    $existingN8nListener = Get-DemoListenerProcessId -Port $n8nPort
+    if ($existingN8nListener) {
+      $n8nHealth = Invoke-DemoHttp -Uri ($n8nOrigin + '/healthz') -Method GET -TimeoutSeconds 5
+      if ($n8nHealth.StatusCode -ne 200) {
+        throw ('El puerto {0} ya está ocupado por PID {1}, pero n8n no responde en /healthz (HTTP {2}).' -f $n8nPort, $existingN8nListener, $n8nHealth.StatusCode)
+      }
+      $n8nWebhookCheck = Invoke-DemoHttp -Uri ($n8nOrigin + '/webhook/' + $webhookPath) `
+        -Method POST -TimeoutSeconds 5
+      if (@(401, 403) -notcontains $n8nWebhookCheck.StatusCode) {
+        throw ('n8n responde en el puerto {0}, pero el webhook /webhook/{1} no está registrado (HTTP {2}). Activa el workflow en esa instancia.' -f $n8nPort, $webhookPath, $n8nWebhookCheck.StatusCode)
+      }
+      $n8nReused = $true
+      Write-Host ('Reutilizando n8n existente (PID {0}); webhook registrado y protegido.' -f $existingN8nListener)
+    } else {
+      $env:N8N_PORT = [string]$n8nPort
+      $env:N8N_RUNNERS_BROKER_PORT = [string]$n8nBrokerPort
+      $n8nProcess = Start-DemoProcess -Name 'n8n' -Executable $n8nCommand.Source `
+        -Arguments @('start') -StdoutPath (Join-Path $script:DemoDirectory 'n8n.out.log') `
+        -StderrPath (Join-Path $script:DemoDirectory 'n8n.err.log')
+      Wait-DemoHttp -Uri ($n8nOrigin + '/healthz') -TimeoutSeconds 90 -ServiceName 'n8n'
+    }
   }
 
   $panelTunnel = Start-DemoProcess -Name 'cloudflared túnel del panel' -Executable $cloudflaredPath `
@@ -815,7 +836,11 @@ try {
   Write-Host ('Logs del túnel del panel: {0} y {1}' -f $panelTunnel.DemoStdoutPath, $panelTunnel.DemoStderrPath)
   if ($orchestration -eq 'n8n') {
     Write-Host ('Webhook de activación de n8n: {0}' -f $wakeUrl)
-    Write-Host ('Logs de n8n: {0} y {1}' -f $n8nProcess.DemoStdoutPath, $n8nProcess.DemoStderrPath)
+    if ($n8nReused) {
+      Write-Host 'n8n ya estaba activo y no se añadió a .demo/pids.json; detener la demo no apagará esa instancia.'
+    } else {
+      Write-Host ('Logs de n8n: {0} y {1}' -f $n8nProcess.DemoStdoutPath, $n8nProcess.DemoStderrPath)
+    }
     Write-Host ('Logs del túnel de n8n: {0} y {1}' -f $n8nTunnel.DemoStdoutPath, $n8nTunnel.DemoStderrPath)
   } else {
     Write-Host 'Orquestación server: n8n y el túnel 2 no se iniciaron; N8N_WAKE_URL quedó vacía.'
