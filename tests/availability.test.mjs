@@ -36,7 +36,8 @@ test('Los bloqueos, día cerrado y calendario se respetan en Lima', () => {
 });
 
 test('La elegibilidad verifica estado, propietario, margen y máximo de cambios', () => {
-  const setting = { whatsappRescheduling: true, minRescheduleHours: 24, maxCustomerReschedules: 2 };
+  const setting = { whatsappRescheduling: true, minRescheduleHours: 24, maxCustomerReschedules: 2,
+    weeklySchedule: { mon: { open: '10:00', close: '14:00' } }, capacityPerSlot: 10 };
   const order = { phone: '51911111111', stage: 'confirmed', visitAt: new Date(Date.now() + 48 * 3600000).toISOString(), rescheduleCount: 0 };
   assert.doesNotThrow(() => checkRescheduleEligibility(order, setting, order.phone));
   assert.throws(() => checkRescheduleEligibility(order, setting, '51922222222'), /no pertenece/);
@@ -102,5 +103,24 @@ test('El RPC solo asigna el último cupo a una reprogramación concurrente e ign
     assert.equal(+new Date(moved.data.deadline), +new Date(earlierSlot));
     assert.equal(moved.data.intents[0].status, 'pending');
     assert.equal(moved.data.intents[0].expiresAt, pending.expiresAt);
+  } finally { await store.close(); }
+});
+
+test('El RPC bloquea al cliente sin disponibilidad, pero permite el cambio manual del panel', async () => {
+  const store = await openStore({ env: {} }, { memory: true });
+  try {
+    const currentDay = dayAfter(8), targetDay = dayAfter(4);
+    const order = createOrder({ agreed: true, payer: 'Prueba', phone: '51911111111', guests: 1,
+      visitAt: limaDateTime(currentDay, '12:00'), items: [{ name: 'Parrilla', price: 50000, quantity: 1 }] },
+    { depositPerPerson: 2000, deadlineMs: 3600000 });
+    order.stage = 'confirmed';
+    await store.insert(order);
+    const target = limaDateTime(targetDay, '03:00');
+    const settings = { availabilityConfigured: false, weeklySchedule: defaultWeeklySchedule(), capacityPerSlot: 40,
+      slotMinutes: 60, whatsappRescheduling: true };
+    await assert.rejects(store.rescheduleAtomic(order.id, target, settings, false, 'Cliente', order.visitAt), /disponibilidad aún no está configurada/);
+    assert.equal((await store.get(order.id)).data.visitAt, order.visitAt);
+    const moved = await store.rescheduleAtomic(order.id, target, settings, false, 'Operador', order.visitAt);
+    assert.equal(moved.data.visitAt, target);
   } finally { await store.close(); }
 });

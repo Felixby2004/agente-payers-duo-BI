@@ -120,6 +120,7 @@ export async function openStore(config, { memory = false } = {}) {
   await db.exec(await readFile(new URL('../supabase/migrations/002_payers_agent.sql', import.meta.url), 'utf8'));
   await db.exec(await readFile(new URL('../supabase/migrations/003_contactos.sql', import.meta.url), 'utf8'));
   await db.exec(await readFile(new URL('../supabase/migrations/004_payers_availability.sql', import.meta.url), 'utf8'));
+  await db.exec(await readFile(new URL('../supabase/migrations/005_availability_unconfigured.sql', import.meta.url), 'utf8'));
   const queryRow = 'id,phone,state,message_count,excerpt,created_at,handled_at';
   async function noteQuery(phone, excerpt, create) {
     const current = (await db.query(`select ${queryRow} from payers_agent_queries where phone = $1 and state = 'open'`, [phone])).rows[0];

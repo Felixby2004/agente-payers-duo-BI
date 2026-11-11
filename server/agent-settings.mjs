@@ -32,6 +32,22 @@ export function defaults(config) {
   };
 }
 
+export function completeSettings(saved, initial) {
+  const previous = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+  const result = { ...initial, ...previous };
+  // Ajustes guardados antes de disponibilidad aún no tienen estos campos.
+  for (const key of ['weeklySchedule', 'slotMinutes', 'capacityPerSlot']) {
+    if (!Object.hasOwn(previous, key)) result[key] = structuredClone(initial[key]);
+  }
+  if (result.weeklySchedule && typeof result.weeklySchedule === 'object' && !Array.isArray(result.weeklySchedule)) {
+    result.weeklySchedule = Object.fromEntries(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'].map(day => {
+      const hours = result.weeklySchedule[day];
+      return [day, hours === null || (hours && typeof hours.open === 'string' && typeof hours.close === 'string') ? hours : null];
+    }));
+  }
+  return result;
+}
+
 export function validateSettings(input, initial) {
   const data = {};
   const ranges = { depositPerPerson: [1, 100000], deadlineMinutes: [1, 43200], graceMinutes: [0, 1440],

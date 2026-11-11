@@ -122,7 +122,9 @@ export function AgentSettings({ config, onSave }) {
       </form>
     </section>
     <section className="panel">
-      <div className="panel-head"><div><h2>Disponibilidad</h2><p>Bloqueos excepcionales y ocupación de hoy, calculada con las reservas activas.</p></div></div>
+      <div className="panel-head"><div><h2>Disponibilidad</h2><p>{config.availabilityConfigured === false
+        ? 'Aún no está configurada: las altas no validan horario ni aforo y la reprogramación automática por WhatsApp deriva al personal.'
+        : 'Bloqueos excepcionales y ocupación de hoy, calculada con las reservas activas.'}</p></div></div>
       <form className="form-grid" onSubmit={saveBlock}>
         <label>Tipo<select value={blockForm.kind} onChange={e => setBlockForm(v => ({ ...v, kind: e.target.value }))}><option value="day">Día completo</option><option value="range">Rango horario</option><option value="slot">Franja concreta</option></select></label>
         <label>Fecha<input type="date" required value={blockForm.local_date} onChange={e => setBlockForm(v => ({ ...v, local_date: e.target.value }))} /></label>

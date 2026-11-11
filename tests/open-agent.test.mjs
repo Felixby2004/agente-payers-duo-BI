@@ -6,6 +6,7 @@ import { makeApi } from '../server/api.mjs';
 import { hmac } from '../server/providers.mjs';
 import { readConfig } from '../server/config.mjs';
 import { noReservationMessage, parseAction, reservationHelpMessage, texts } from '../server/interactive.mjs';
+import { limaDateTime } from '../server/availability.mjs';
 
 const base = () => ({
   PUBLIC_URL: 'https://establo.example', ADMIN_PASSWORD: 'prueba-operador-2026',
@@ -63,7 +64,7 @@ async function runtime(extra = {}) {
   };
   const createOrder = async (phone, payer, consent = true) => (await call('orders', JSON.stringify({
     agreed: true, payer, phone, consent, guests: 2,
-    visitAt: new Date(Date.now() + 3 * 3600000).toISOString(),
+    visitAt: limaDateTime(new Date(Date.now() + 3 * 86400000 - 5 * 3600000).toISOString().slice(0, 10), '12:00'),
     items: [{ name: 'Parrilla familiar', price: 14900, quantity: 1 }],
   }), 201)).data;
   const close = async () => {

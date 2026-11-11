@@ -1,4 +1,4 @@
-import { balance, depositDue, limaDay, money, terminal } from '../shared/orders.mjs';
+import { balance, depositDue, limaDay, money, reservationStatus, terminal } from '../shared/orders.mjs';
 import { menu } from '../shared/samples.mjs';
 
 export const limits = Object.freeze({ body: 1024, buttons: 3, buttonTitle: 20, listButton: 20,
@@ -358,15 +358,19 @@ const receiptButton = (order, receipt) => receipt ? button('rcp:' + order.ref, '
 export function reservationMenu(order, now = new Date()) {
   const receipt = order.receipts?.at(-1);
   if (terminal(order)) {
-    const text = order.stage === 'closed'
-      ? emojis.farewell + ' Gracias por visitarnos, ' + order.payer + '. ¡Esperamos verte pronto en El Establo!'
-      : emojis.farewell + ' *Reserva cerrada*\nReferencia: *' + order.ref + '*';
+    const terminalText = { closed: 'Reserva cerrada. Gracias por visitarnos, ' + order.payer + '. ¡Esperamos verte pronto!',
+      cancelled: 'Reserva cancelada', no_show: 'No asistió: la visita quedó marcada como inasistencia' };
+    const text = emojis.farewell + ' *' + (terminalText[order.stage] || 'Reserva finalizada') + '*\nReferencia: *' + order.ref + '*';
     return receipt ? buttonsMessage(text, [button('rcp:' + order.ref, 'Ver constancia')]) : text;
   }
   const date = friendlyDate(order.visitAt, now, true);
   const people = personLabel(order.guests);
   if (order.stage === 'awaiting_deposit') {
-    const expired = new Date(order.deadline) <= new Date(now);
+    const status = reservationStatus(order, now);
+    const expired = status === 'deposit_expired';
+    if (status === 'deposit_received') return buttonsMessage(emojis.verified + ' *Anticipo recibido, confirmación pendiente*\nReserva: *'
+      + order.ref + '*\nEstamos actualizando el estado del pago. Si no cambia pronto, avísame para revisarlo.',
+    [button('hum:' + order.ref, 'Hablar con alguien')]);
     const text = expired
       ? emojis.attention + ' *Venció el plazo del anticipo*\nReserva: *' + order.ref + '*\nSi necesitas revisarlo, puedo avisar al personal.'
       : emojis.greeting + ' *Anticipo pendiente*\nReserva: *' + order.ref + '*\nVisita: ' + date + ' · ' + people
@@ -376,7 +380,9 @@ export function reservationMenu(order, now = new Date()) {
       : [button('pay:' + order.ref, 'Pagar anticipo'), button('chg:' + order.ref, 'Cambiar fecha'),
         button('hum:' + order.ref, 'Hablar con alguien')]);
   }
-  const text = emojis.visit + ' *Reserva confirmada*\nReferencia: *' + order.ref + '*\nVisita: ' + date + ' · ' + people
+  const status = reservationStatus(order, now);
+  const headline = status === 'arrived' ? 'Llegada registrada' : status === 'paid' ? 'Pago completo' : 'Reserva confirmada';
+  const text = emojis.visit + ' *' + headline + '*\nReferencia: *' + order.ref + '*\nVisita: ' + date + ' · ' + people
     + '\nSaldo en el local: *' + money(balance(order)) + '*';
   if (order.stage === 'confirmed') {
     return buttonsMessage(text, [receiptButton(order, receipt), button('chg:' + order.ref, 'Cambiar fecha'),
@@ -395,13 +401,16 @@ const sectionDefinitions = Object.freeze([
 ]);
 const blockingIncidents = new Set(['Pago por revisar', 'Reverso por revisar', 'Anticipo por resolver', 'Anticipo vencido']);
 
-const blockingIssue = (order) => (order.incidents || []).find(incident => !incident.resolvedAt && blockingIncidents.has(incident.type));
-const isExpired = (order, now) => order.stage === 'awaiting_deposit' && new Date(order.deadline) <= new Date(now);
+const isExpired = (order, now) => reservationStatus(order, now) === 'deposit_expired';
+const blockingIssue = (order, now) => (order.incidents || []).find(incident => !incident.resolvedAt
+  && blockingIncidents.has(incident.type)
+  // Una incidencia histórica de vencimiento deja de bloquear visualmente al confirmarse el anticipo.
+  && (incident.type !== 'Anticipo vencido' || isExpired(order, now)));
 
 function sectionOf(order, now) {
   if (terminal(order)) return 'finished';
-  if (isExpired(order, now) || blockingIssue(order)) return 'attention';
-  return order.stage === 'awaiting_deposit' ? 'deposit' : 'confirmed';
+  if (['deposit_expired', 'deposit_received'].includes(reservationStatus(order, now)) || blockingIssue(order, now)) return 'attention';
+  return reservationStatus(order, now) === 'deposit_pending' ? 'deposit' : 'confirmed';
 }
 
 function visitSorter(now) {
@@ -417,17 +426,22 @@ function visitSorter(now) {
 function descriptionOf(order, section, now) {
   let state;
   if (section === 'attention') {
-    state = isExpired(order, now) ? 'Anticipo vencido' : blockingIssue(order)?.type || 'Requiere atención';
+    state = reservationStatus(order, now) === 'deposit_expired' ? 'Anticipo vencido' : statusLabel(order, now);
   } else if (section === 'deposit') {
     state = 'Falta anticipo ' + money(depositDue(order));
-  } else if (section === 'confirmed') {
-    state = 'Confirmada · saldo ' + money(balance(order));
   } else {
-    state = order.stage === 'cancelled' ? 'Cancelada' : order.stage === 'no_show' ? 'Inasistencia' : 'Finalizada';
+    state = statusLabel(order, now);
   }
   const base = state + ' · ' + personLabel(order.guests);
   const full = base + ' · ' + order.ref;
   return normalized(full).length <= limits.rowDescription ? full : clip(base, limits.rowDescription);
+}
+
+function statusLabel(order, now) {
+  const labels = { confirmed: 'Confirmada · saldo ' + money(balance(order)), arrived: 'Llegó · saldo ' + money(balance(order)),
+    deposit_received: 'Anticipo recibido · confirmación pendiente', paid: 'Pagada', closed: 'Cerrada', cancelled: 'Cancelada',
+    no_show: 'No asistió', unknown: 'Requiere atención' };
+  return labels[reservationStatus(order, now)] || labels.unknown;
 }
 
 function rowOf(order, section, now, selector = 'sel') {
@@ -498,7 +512,7 @@ export function balancePaymentCta(order, intent, url) {
 export function receiptCta(order, url, summary = '') {
   return ctaMessage(emojis.receipt + ' *Constancia interna de reserva*\nReferencia: *' + order.ref
     + '*' + (summary ? '\n' + summary : '')
-    + '\nEste documento es de El Establo y no reemplaza el comprobante oficial de Mercado Pago.', 'Ver constancia', url);
+    + '\nEs el resumen de El Establo. El comprobante oficial de Mercado Pago se consulta en la operación del pago.', 'Ver constancia', url);
 }
 
 export function confirmationCta(order, url, now = new Date(), additional = '') {

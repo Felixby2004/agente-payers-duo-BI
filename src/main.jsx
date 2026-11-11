@@ -1,16 +1,18 @@
 import { StrictMode, useCallback, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { ArrowLeft, ArrowRight, CalendarDays, CheckCircle2, ChevronRight, ClipboardPlus, Database, ExternalLink, Flame, LayoutDashboard, LogOut, MessageCircle, PanelTop, Printer, ReceiptText, RefreshCw, Settings2, ShieldCheck, Wallet, X } from 'lucide-react';
+import { ArrowLeft, ArrowRight, CalendarDays, CalendarRange, CheckCircle2, ChevronRight, ClipboardPlus, Database, ExternalLink, Flame, LayoutDashboard, LogOut, MessageCircle, PanelTop, Printer, ReceiptText, RefreshCw, Settings2, ShieldCheck, Wallet, X } from 'lucide-react';
 import { Dashboard, Reports } from './Dashboard.jsx';
 import { Detail, Register, Reservations } from './Operations.jsx';
 import { api } from './client.mjs';
 import { AgentSettings } from './AgentSettings.jsx';
+import { Availability } from './Availability.jsx';
 import { money, paymentLabels, visitText } from '../shared/orders.mjs';
 import './styles.css';
 
 const nav = [
   { key: 'inicio', label: 'Resumen', icon: LayoutDashboard },
   { key: 'reservas', label: 'Reservas', icon: CalendarDays },
+  { key: 'disponibilidad', label: 'Disponibilidad', icon: CalendarRange },
   { key: 'registro', label: 'Registrar pedido', icon: ClipboardPlus },
   { key: 'reportes', label: 'Reportes', icon: ReceiptText },
   { key: 'conexiones', label: 'Conexiones', icon: Settings2 },
@@ -109,7 +111,10 @@ function PublicPage({ type, token }) {
         : data.status === 'approved' ? <div className="closed-note"><CheckCircle2 size={21} /><span><strong>{data.purpose === 'balance' ? 'Saldo verificado' : 'Anticipo verificado'}</strong><small>La operación de prueba se registró en PAYERS.</small></span></div>
         : data.status === 'rejected' ? <p className="error">El pago de prueba fue rechazado. Solicita un nuevo enlace.</p>
         : data.status === 'refunded' || data.status === 'charged_back' ? <p className="inline-note">La operación fue revertida. Consulta a caja.</p>
-        : !data.usable ? <p className="inline-note">Este enlace está vencido o la reserva cambió. Consulta al restaurante.</p>
+        : !data.usable ? <p className="inline-note">{data.unusableReason === 'already_paid'
+          ? 'Este pago ya figura registrado. No necesitas volver a pagar; puedes cerrar esta página.'
+          : data.unusableReason === 'reservation_changed' ? 'La reserva cambió y este enlace dejó de estar activo. Consulta el estado actualizado en WhatsApp.'
+            : 'Este enlace de pago venció. Solicita uno nuevo si todavía tienes un importe pendiente.'}</p>
         : data.mode === 'local' ? <>
           <p>{data.method === 'plin' ? 'Plin simulado' : data.method === 'yape' ? 'Yape simulado' : 'Tarjeta de demostración'}. Elige el resultado para ensayar la confirmación del anticipo.</p>
           <div className="button-row"><button className="button primary" disabled={busy} onClick={() => simulate('approved')}>Aprobar pago de prueba</button>
@@ -208,6 +213,7 @@ function App() {
         {page === 'inicio' && <Dashboard orders={orders} go={go} open={setOrderId} />}
         {page === 'registro' && <Register config={config} notify={notify} created={order => { setOrders(list => [order, ...list.filter(o => o.id !== order.id)]); go('reservas'); setOrderId(order.id); }} />}
         {page === 'reservas' && <Reservations orders={orders} open={setOrderId} go={go} />}
+        {page === 'disponibilidad' && <Availability />}
         {page === 'reportes' && <Reports orders={orders} />}
         {page === 'conexiones' && <Config config={config} onSettings={next => {
           setConfig(current => ({ ...current, ...next })); notify('Configuración guardada. El agente usará los nuevos valores.');

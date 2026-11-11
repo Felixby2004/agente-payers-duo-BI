@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { makeApi } from '../server/api.mjs';
 import { hmac } from '../server/providers.mjs';
+import { limaDateTime } from '../server/availability.mjs';
 
 test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desde Mercado Pago', async () => {
   const e = {
@@ -161,7 +162,8 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     await call('agent/settings', JSON.stringify({ ...rule, deadlineMinutes: 1 }), 200);
     const { data: demo } = await call('orders', JSON.stringify({
       agreed: true, payer: 'Demo Plin', synthetic: true, guests: 2,
-      visitAt: new Date(Date.now() + 3 * 3600000).toISOString(), items: [{ name: 'Parrilla familiar', price: 14900, quantity: 1 }],
+      visitAt: limaDateTime(new Date(Date.now() + 3 * 86400000 - 5 * 3600000).toISOString().slice(0, 10), '12:00'),
+      items: [{ name: 'Parrilla familiar', price: 14900, quantity: 1 }],
     }), 201);
     const clock = Date.now;
     try {
@@ -176,7 +178,8 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
 
     const { data: balanceOrder } = await call('orders', JSON.stringify({
       agreed: true, payer: 'Saldo Mercado Pago', phone: '+51999999999', consent: true, guests: 1,
-      visitAt: new Date(Date.now() + 3 * 3600000).toISOString(), items: [{ name: 'Parrilla familiar', price: 14900, quantity: 1 }],
+      visitAt: limaDateTime(new Date(Date.now() + 3 * 86400000 - 5 * 3600000).toISOString().slice(0, 10), '12:00'),
+      items: [{ name: 'Parrilla familiar', price: 14900, quantity: 1 }],
     }), 201);
     const balancePrefix = 'orders/' + balanceOrder.id + '/';
     const { data: depositLink } = await call(balancePrefix + 'link', JSON.stringify({ method: 'checkout' }), 200);
@@ -191,7 +194,7 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     assert.equal(balancePaymentIntent.amount, 12900);
     assert.equal(preference.items[0].title, 'Saldo de pedido · ' + balanceOrder.ref);
     const balanceWebhook = { 'x-request-id': 'saldo-mp-990', 'x-signature': 'ts=123,v1=' + hmac(e.MP_WEBHOOK_SECRET,
-      'id:990;request-id:saldo-mp-990;ts=123;') };
+      'id:990;request-id:saldo-mp-990;ts:123;') };
     const beforeBalanceWebhook = sent.length;
     await call('webhooks/mercado-pago?data.id=990', JSON.stringify({ type: 'payment', data: { id: '990' } }), 200, balanceWebhook);
     await call('webhooks/mercado-pago?data.id=990', JSON.stringify({ type: 'payment', data: { id: '990' } }), 200, balanceWebhook);
@@ -203,14 +206,17 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     assert.ok(final.receipts.some(item => item.purpose === 'balance'));
     assert.ok(final.receipts.some(item => item.purpose === 'settlement'));
     assert.equal(Object.values(final.receiptDeliveries).filter(item => item.status === 'sent').length, 3);
-    assert.match(sent.at(-1).interactive.body.text, /ccap\/file-viewer\/receipt/);
+    assert.doesNotMatch(sent.at(-1).interactive.body.text, /ccap\/file-viewer\/receipt/);
+    assert.match(sent.at(-1).interactive.body.text, /comprobante oficial.*Mercado Pago/i);
+    assert.match(sent.at(-1).interactive.body.text, /Constancia interna de reserva/);
     const finalReceipt = final.receipts.find(item => item.purpose === 'settlement');
     const { data: publicFinal } = await call('receipt/' + finalReceipt.token, undefined, 200);
     assert.deepEqual(publicFinal.mercadoPagoReceipts.map(item => item.purpose), ['deposit', 'balance']);
 
     const { data: shortcutOrder } = await call('orders', JSON.stringify({
       agreed: true, payer: 'Atajo de pago', phone: '+51988888888', consent: true, guests: 1,
-      visitAt: new Date(Date.now() + 3 * 3600000).toISOString(), items: [{ name: 'Parrilla familiar', price: 14900, quantity: 1 }],
+      visitAt: limaDateTime(new Date(Date.now() + 3 * 86400000 - 5 * 3600000).toISOString().slice(0, 10), '12:00'),
+      items: [{ name: 'Parrilla familiar', price: 14900, quantity: 1 }],
     }), 201);
     const shortcutPrefix = 'orders/' + shortcutOrder.id + '/';
     const shortcutSession = { ...message, id: 'wamid.in-shortcut-session', from: '51988888888',
@@ -230,7 +236,7 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     assert.match(sent.at(-1).interactive.action.parameters.url, new RegExp('/pago/' + autoLink.id + '$'));
     assert.equal(preference.external_reference, autoLink.id);
     const badAmountNotice = { 'x-request-id': 'bad-balance-997', 'x-signature': 'ts=123,v1=' + hmac(e.MP_WEBHOOK_SECRET,
-      'id:997;request-id:bad-balance-997;ts=123;') };
+      'id:997;request-id:bad-balance-997;ts:123;') };
     amountOverride = 0.01;
     await call('webhooks/mercado-pago?data.id=997', JSON.stringify({ type: 'payment', data: { id: '997' } }), 200, badAmountNotice);
     await call('webhooks/mercado-pago?data.id=997', JSON.stringify({ type: 'payment', data: { id: '997' } }), 200, badAmountNotice);
@@ -242,7 +248,8 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
 
     const { data: raceOrder } = await call('orders', JSON.stringify({
       agreed: true, payer: 'Carrera caja y online', phone: '+51977777777', consent: true, guests: 1,
-      visitAt: new Date(Date.now() + 3 * 3600000).toISOString(), items: [{ name: 'Parrilla familiar', price: 14900, quantity: 1 }],
+      visitAt: limaDateTime(new Date(Date.now() + 3 * 86400000 - 5 * 3600000).toISOString().slice(0, 10), '12:00'),
+      items: [{ name: 'Parrilla familiar', price: 14900, quantity: 1 }],
     }), 201);
     const racePrefix = 'orders/' + raceOrder.id + '/';
     const raceDeposit = await call(racePrefix + 'link', JSON.stringify({ method: 'checkout' }), 200);
@@ -254,11 +261,11 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
       || raceArrival.order.intents.find(item => item.purpose === 'balance');
     await call(racePrefix + 'counter', JSON.stringify({ channel: 'cash' }), 200);
     const lateNotice = { 'x-request-id': 'race-late-996', 'x-signature': 'ts=123,v1=' + hmac(e.MP_WEBHOOK_SECRET,
-      'id:996;request-id:race-late-996;ts=123;') };
+      'id:996;request-id:race-late-996;ts:123;') };
     await call('webhooks/mercado-pago?data.id=996', JSON.stringify({ type: 'payment', data: { id: '996' } }), 200, lateNotice);
     const { data: afterRace } = await call('orders', undefined, 200);
     const raced = afterRace.find(item => item.id === raceOrder.id);
-    assert.equal(raced.intents.find(item => item.id === raceIntent.id).status, 'superseded');
+    assert.equal(raced.intents.find(item => item.id === raceIntent.id).status, 'late_approved');
     assert.equal(raced.payments.filter(item => item.purpose === 'balance').length, 1);
     assert.equal(raced.payments.find(item => item.purpose === 'balance').channel, 'cash');
     assert.ok(raced.unappliedPayments.some(item => item.intentId === raceIntent.id));

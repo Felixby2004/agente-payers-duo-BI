@@ -3,6 +3,15 @@ import { Problem, requireThat } from './domain.mjs';
 const DAY_KEYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 const ACTIVE = new Set(['awaiting_deposit', 'confirmed', 'arrived', 'paid']);
 const MINUTE = 60000;
+const WEEKDAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+export function availabilityConfigured(settings = {}) {
+  if (settings.availabilityConfigured === false) return false;
+  const hasOpenDay = WEEKDAYS.some(day => {
+    const hours = settings.weeklySchedule?.[day];
+    return hours && typeof hours.open === 'string' && typeof hours.close === 'string';
+  });
+  return hasOpenDay && Number(settings.capacityPerSlot) > 0;
+}
 const localParts = (date) => {
   const shifted = new Date(+new Date(date) - 5 * 3600000);
   return { year: shifted.getUTCFullYear(), month: shifted.getUTCMonth() + 1, day: shifted.getUTCDate(),
@@ -36,6 +45,7 @@ export function isSlotBlocked(blocks, visitAt, settings) {
 
 export function getAvailableSlots({ orders = [], blocks = [], settings, fromDate, toDate, guests = 1, excludeOrderId = null, now = new Date() }) {
   requireThat(Number.isInteger(guests) && guests >= 1 && guests <= 40, 'La cantidad de personas no es válida.');
+  if (!availabilityConfigured(settings)) return [];
   const duration = Number(settings.slotMinutes || 60), capacity = Number(settings.capacityPerSlot || 0);
   const first = new Date(`${fromDate}T12:00:00Z`), last = new Date(`${toDate}T12:00:00Z`);
   requireThat(Number.isFinite(+first) && Number.isFinite(+last) && first <= last, 'El rango de fechas no es válido.');
@@ -61,6 +71,7 @@ export function getAvailableSlots({ orders = [], blocks = [], settings, fromDate
 }
 
 export function getDayOccupancy({ orders = [], blocks = [], settings, date }) {
+  if (!availabilityConfigured(settings)) return { date, closed: false, unconfigured: true, slots: [] };
   const weekday = new Date(`${date}T12:00:00Z`).getUTCDay(), rule = settings.weeklySchedule?.[DAY_KEYS[weekday]];
   if (!rule) return { date, closed: true, slots: [] };
   const [oh, om] = rule.open.split(':').map(Number), [ch, cm] = rule.close.split(':').map(Number);
@@ -77,6 +88,7 @@ export function getDayOccupancy({ orders = [], blocks = [], settings, date }) {
 
 export function checkRescheduleEligibility(order, settings, fromPhone = null, now = new Date()) {
   requireThat(settings.whatsappRescheduling, 'La reprogramación por WhatsApp está desactivada.', 409);
+  requireThat(availabilityConfigured(settings), 'La disponibilidad aún no está configurada. El personal te ayudará con el cambio.', 409);
   requireThat(['awaiting_deposit', 'confirmed'].includes(order.stage), 'Esta reserva ya no se puede reprogramar por WhatsApp.', 409);
   if (fromPhone !== null) requireThat(String(order.phone) === String(fromPhone), 'Esta reserva no pertenece a este número.', 403);
   const remaining = +new Date(order.visitAt) - +now;

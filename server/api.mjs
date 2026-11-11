@@ -3,14 +3,14 @@ import { readConfig } from './config.mjs';
 import { openStore, updateOrder } from './store.mjs';
 import { providers, hmac, matches } from './providers.mjs';
 import { agentAI } from './agent-ai.mjs';
-import { contactTime, defaults, validateSettings } from './agent-settings.mjs';
+import { completeSettings, contactTime, defaults, validateSettings } from './agent-settings.mjs';
 import { balance, depositDue, money, terminal, stageLabels } from '../shared/orders.mjs';
 import { displayText, emojis, friendlyDate, parseAction, reservationFocus, reservationMenu, reservationPrompt, reservationList,
   paymentCta, balancePaymentCta, paymentRejectedCta, receiptCta, confirmationCta, requestMessage, noReservationMessage, reservationHelpMessage,
   reservationRequest, parseReservation, reservationKey, reservationConfirmation, reservationRepeatedMessage, rescheduleDaysMessage,
   rescheduleTimesMessage, rescheduleConfirmMessage, texts } from './interactive.mjs';
 import { Problem, requireThat, createOrder, addEvent, openIssue, applyPayment, arrive, recordCounterPayment, issueReceipt, reschedule, endReservation, digits } from './domain.mjs';
-import { checkRescheduleEligibility, getAvailableSlots, getDayOccupancy, isSlotBlocked, limaDateKey, limaDateTime, validateSlotInput } from './availability.mjs';
+import { availabilityConfigured, checkRescheduleEligibility, getAvailableSlots, getDayOccupancy, isSlotBlocked, limaDateKey, limaDateTime, limaFormatDay, validateSlotInput } from './availability.mjs';
 
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const instant = () => new Date().toISOString();
@@ -42,11 +42,17 @@ function parse(raw) {
 
 export async function makeApi(env, options = {}) {
   const config = readConfig(env);
-  const store = await openStore(config, options);
+  const store = options.store || await openStore(config, options);
   const service = providers(config);
   const ai = agentAI(config, service);
   const initialSettings = defaults(config);
-  const settings = async () => ({ ...initialSettings, ...await store.settings() });
+  const settings = async () => {
+    const saved = await store.settings();
+    const merged = completeSettings(saved, initialSettings);
+    // Los defaults de la interfaz no cuentan como configuración guardada del aforo.
+    merged.availabilityConfigured = availabilityConfigured(saved || {});
+    return merged;
+  };
   const locks = new Map();
   const rateEvents = new Map();
   const rateWarned = new Map();
@@ -100,6 +106,7 @@ export async function makeApi(env, options = {}) {
   }
   async function ensureAvailable(visitAt, guests, excludeOrderId = null, rule = null, forceCapacity = false) {
     const setting = rule || await settings();
+    if (!(setting.availabilityConfigured ?? availabilityConfigured(setting))) return true;
     validateSlotInput(visitAt, setting);
     const key = limaDateKey(visitAt);
     const blocks = await store.availabilityBlocks(key, key);
@@ -213,7 +220,6 @@ export async function makeApi(env, options = {}) {
       return;
     }
     const allPayments = order.payments.filter(item => item.amount > 0 && !order.payments.some(adjustment => adjustment.original === item.ref && adjustment.amount < 0));
-    const mpUrls = allPayments.filter(item => ['deposit', 'balance'].includes(item.purpose || 'deposit')).map(paymentReceiptUrl).filter(Boolean);
     const depositPayment = allPayments.find(item => (item.purpose || 'deposit') === 'deposit');
     const depositMethod = depositPayment?.channel === 'mercadopago' ? 'Mercado Pago'
       : depositPayment?.channel === 'cash' ? 'efectivo' : depositPayment?.channel === 'pos' ? 'POS'
@@ -221,13 +227,13 @@ export async function makeApi(env, options = {}) {
     const summary = receipt.purpose === 'deposit'
       ? 'Anticipo ' + money(receipt.amount) + ' · ' + depositMethod + ' · '
         + new Intl.DateTimeFormat('es-PE', { timeZone: 'America/Lima', dateStyle: 'short', timeStyle: 'short' }).format(new Date(depositPayment?.at || receipt.at))
-        + (paymentReceiptUrl(depositPayment) ? ' · Comprobante Mercado Pago: ' + paymentReceiptUrl(depositPayment) : '')
+        + (paymentReceiptUrl(depositPayment) ? ' · Comprobante oficial: consultar en Mercado Pago' : '')
       : (receipt.paymentBreakdown || []).map(item => (item.purpose === 'deposit' ? 'Anticipo' : 'Saldo') + ' ' + money(item.amount)
         + ' (' + (item.channel === 'mercadopago' ? 'Mercado Pago' : item.channel === 'cash' ? 'efectivo' : item.channel === 'pos' ? 'POS' : item.channel === 'wallet' ? 'billetera' : item.channel) + ')').join(' · ')
-        + (mpUrls.length ? ' · Comprobantes de Mercado Pago: ' + mpUrls.join(' ') : '');
+        + (allPayments.some(item => item.channel === 'mercadopago') ? ' · Comprobante oficial: consultar cada operación en Mercado Pago' : '');
     const amount = receipt.purpose === 'deposit' ? 'Anticipo ' + money(receipt.amount) : 'Total ' + money(order.total) + ' · ' + summary;
     const message = receipt.purpose === 'deposit'
-      ? confirmationCta(order, receiptLink(receipt), new Date(), paymentReceiptUrl(depositPayment) ? 'Comprobante Mercado Pago: ' + paymentReceiptUrl(depositPayment) : '')
+      ? confirmationCta(order, receiptLink(receipt), new Date(), paymentReceiptUrl(depositPayment) ? 'Comprobante oficial: consulta la operación en Mercado Pago.' : '')
       : receiptCta(order, receiptLink(receipt), amount);
     try {
       if (config.waMode !== 'cloud') {
@@ -716,6 +722,7 @@ export async function makeApi(env, options = {}) {
     // Baja y alta se evalúan antes de clasificar la intención.
     const command = commandText(text);
     const balanceShortcut = new Set(['pagar', 'cuenta', 'pagar comida', 'saldo', 'pagar saldo']).has(command);
+    const balanceDetailsRequest = /^saldo\s+EST-[a-f0-9]{8}$/i.test(String(text).trim());
     if (optOutPhrases.has(command)) {
       await store.setOptOut(phone, true);
       await service.sendWhatsAppReply(phone, texts.optOut);
@@ -797,6 +804,7 @@ export async function makeApi(env, options = {}) {
     }
 
     const target = action?.ref ? orders.find(order => order.ref === action.ref) : null;
+    const textTarget = ref ? orders.find(order => order.ref === ref) : null;
     let recipient = target || order;
     try {
       let response;
@@ -815,6 +823,9 @@ export async function makeApi(env, options = {}) {
         recipient = selected;
         await autoPayOrder(selected);
         return;
+      } else if (!action && balanceDetailsRequest && textTarget) {
+        recipient = textTarget;
+        response = await replyTo(textTarget, text, undefined, 'balance');
       } else if (!action && balanceShortcut && !ref && orders.length > 1) {
         const eligibles = active.length ? active : orders;
         response = reservationList(eligibles, new Date(), 'selb');
@@ -1129,7 +1140,8 @@ export async function makeApi(env, options = {}) {
         if (queue.length) console.info('WhatsApp webhook: mensajes=' + queuedMessages + '; estados=' + queuedStatuses);
         // Atiende la cola desde el servidor en cuanto Meta entrega el webhook. n8n
         // conserva la programación de alertas, pero no media la respuesta conversacional.
-        if (queue.length) void drainInbox().then(result => {
+        // Las pruebas con store en memoria vacían la cola explícitamente para evitar carreras.
+        if (queue.length && !options.memory) void drainInbox().then(result => {
           if (result.failed) console.error('WhatsApp: falló el procesamiento de ' + result.failed + ' elemento(s) de la cola.');
         }).catch(error => console.error('WhatsApp: no se pudo vaciar la cola:', error.message));
         return json(res, 200, { received: true });
@@ -1181,8 +1193,12 @@ export async function makeApi(env, options = {}) {
           && new Date(intent.expiresAt) > new Date() && intent.status === 'pending';
         const safeCheckout = intent.mode !== 'mercado_pago' || isMercadoPagoInitPoint(intent.checkoutUrl);
         const requiresReview = target.payments.some(payment => payment.intentId === intent.id && payment.review);
+        const unusableReason = purpose === 'balance' && (balance(target) === 0 || ['paid', 'closed'].includes(target.stage))
+          ? 'already_paid' : purpose === 'deposit' && (depositDue(target) === 0 || ['confirmed', 'arrived', 'paid', 'closed'].includes(target.stage))
+            ? 'already_paid' : ['superseded', 'expired'].includes(intent.status) || +new Date(intent.expiresAt) <= Date.now()
+              ? 'expired' : !rightStage ? 'reservation_changed' : null;
         return json(res, 200, { ref: target.ref, amount: intent.amount, status: intent.status, mode: intent.mode, purpose,
-          stage: target.stage, requiresReview,
+          stage: target.stage, requiresReview, unusableReason,
           method, usable: usable && safeCheckout, checkoutUrl: usable && safeCheckout ? intent.checkoutUrl : null });
       }
       if (isPost) {
@@ -1268,7 +1284,7 @@ export async function makeApi(env, options = {}) {
       requireThat(Number.isInteger(guests) && guests >= 1 && guests <= 40, 'La cantidad de personas no es válida.');
       const [orders, blocks] = await Promise.all([store.list(), store.availabilityBlocks(date, date)]);
       const occupancy = getDayOccupancy({ orders, blocks, settings: rule, date });
-      return json(res, 200, { ...occupancy, label: limaFormatDay(date), available: getAvailableSlots({ orders, blocks, settings: rule,
+      return json(res, 200, { ...occupancy, label: limaFormatDay(date), slotMinutes: rule.slotMinutes, available: getAvailableSlots({ orders, blocks, settings: rule,
         fromDate: date, toDate: date, guests }).flatMap(day => day.slots) });
     }
     if (path === '/api/availability/blocks' && isGet) return json(res, 200, await store.availabilityBlocks());
@@ -1468,9 +1484,36 @@ export async function makeApi(env, options = {}) {
     }
     return json(res, 404, { error: 'Ruta no encontrada.' });
   }
+  function redactDiagnostic(value) {
+    let result;
+    try { result = typeof value === 'string' ? value : JSON.stringify(value); }
+    catch { result = String(value); }
+    if (result === undefined) return null;
+    for (const [name, secret] of Object.entries(config.env || {})) {
+      if (!/(TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL|ACCESS)/i.test(name) || typeof secret !== 'string' || !secret) continue;
+      result = result.split(secret).join('[REDACTED]');
+    }
+    return result;
+  }
   const middleware = (req, res, next) => route(req, res, next).catch(error => {
-    if (!(error instanceof Problem)) console.error(error);
-    if (!res.headersSent) json(res, error.status || 500, { error: error.status ? error.message : 'No se pudo completar la operación.' });
+    if (error instanceof Problem) {
+      if (!res.headersSent) json(res, error.status, { error: error.message });
+      else res.end();
+      return;
+    }
+    const path = (() => { try { return new URL(req.url, 'http://localhost').pathname; } catch { return '[ruta no disponible]'; } })();
+    console.error('Error inesperado en PAYERS API', {
+      method: req.method,
+      path,
+      error: {
+        message: redactDiagnostic(error?.message),
+        code: redactDiagnostic(error?.code),
+        details: redactDiagnostic(error?.details),
+        hint: redactDiagnostic(error?.hint),
+        stack: redactDiagnostic(error?.stack),
+      },
+    });
+    if (!res.headersSent) json(res, 500, { error: 'No se pudo completar la operación.' });
     else res.end();
   });
   return { middleware, async close() {

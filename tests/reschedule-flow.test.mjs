@@ -33,6 +33,8 @@ test('WhatsApp permite seleccionar y confirmar una reprogramación completa en m
     const login = await call(api, 'POST', 'login', { password: env.ADMIN_PASSWORD });
     assert.equal(login.status, 200);
     const cookie = login.headers['Set-Cookie'].split(';')[0], admin = { cookie };
+    const configured = await call(api, 'GET', 'config', undefined, admin);
+    assert.equal((await call(api, 'POST', 'agent/settings', configured.data, admin)).status, 200);
     const targetDay = new Date(Date.now() + 10 * 86400000 - 5 * 3600000).toISOString().slice(0, 10);
     const targetDate = limaDateTime(targetDay, '18:00');
     const create = await call(api, 'POST', 'orders', { agreed: true, payer: 'Cliente Demo', phone: '51911111111', consent: true,
@@ -50,6 +52,8 @@ test('WhatsApp permite seleccionar y confirmar una reprogramación completa en m
       const payload = JSON.stringify({ entry: [{ changes: [{ value: { metadata: { phone_number_id: env.WA_PHONE_NUMBER_ID }, messages: [message] } }] }] });
       const result = await call(api, 'POST', 'webhooks/whatsapp', payload, { 'x-hub-signature-256': 'sha256=' + hmac(env.WA_APP_SECRET, payload) });
       assert.equal(result.status, 200);
+      const drained = await call(api, 'POST', 'internal/agent/inbox', {}, { authorization: 'Bearer ' + env.N8N_AGENT_TOKEN });
+      assert.equal(drained.data.processed, 1, JSON.stringify(drained.data));
       let conversation;
       for (let attempt = 0; attempt < 100; attempt++) {
         conversation = (await call(api, 'GET', 'orders', undefined, admin)).data.find(item => item.id === order.id)?.chat || [];

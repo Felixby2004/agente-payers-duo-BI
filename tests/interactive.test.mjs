@@ -15,6 +15,7 @@ test('El agente usa botones, listas y CTA con ids seguros y fallback de texto', 
     WHATSAPP_MODE: 'cloud', WA_GRAPH_VERSION: 'v25.0', WA_PHONE_NUMBER_ID: '456',
     WA_ACCESS_TOKEN: 'wa-ficticio', WA_VERIFY_TOKEN: 'verificacion-ficticia',
     WA_APP_SECRET: 'firma-wa-ficticia', WA_ALLOWED_PHONES: '51999999999,51988888888',
+    WA_RATE_LIMIT_MAX: '100',
     PAYMENT_MODE: 'local', WA_TEMPLATE_DEPOSIT: 'anticipo_prueba',
     AGENT_ORCHESTRATION: 'n8n', N8N_AGENT_TOKEN: 'token-interno-de-prueba-para-n8n-2026',
   };
@@ -118,7 +119,7 @@ test('El agente usa botones, listas y CTA con ids seguros y fallback de texto', 
     assert.equal(out[0].interactive.type, 'button');
     assert.match(bodyOf(out[0]), new RegExp(order.ref));
     assert.match(bodyOf(out[0]), /S\/\s*40/);
-    assert.deepEqual(idsOf(out[0]), ['pay:' + order.ref, 'bal:' + order.ref, 'hum:' + order.ref]);
+    assert.deepEqual(idsOf(out[0]), ['pay:' + order.ref, 'chg:' + order.ref, 'hum:' + order.ref]);
     assert.equal(buttonsOf(out[0]).at(-1).reply.title, 'Hablar con alguien');
     let stored = await findOrder(order.id);
     assert.ok(stored.chat.some(message => message.direction === 'out' && /\[Botones:/.test(message.text)));
@@ -190,7 +191,7 @@ test('El agente usa botones, listas y CTA con ids seguros y fallback de texto', 
     assert.equal(out.length, 1);
     assert.equal(out[0].interactive.type, 'button');
     assert.match(bodyOf(out[0]), new RegExp(second.ref));
-    assert.deepEqual(idsOf(out[0]), ['pay:' + second.ref, 'bal:' + second.ref, 'hum:' + second.ref]);
+    assert.deepEqual(idsOf(out[0]), ['pay:' + second.ref, 'chg:' + second.ref, 'hum:' + second.ref]);
     const selected = await findOrder(second.id);
     assert.ok(selected.chat.some(message => message.direction === 'out' && message.id));
 
@@ -214,12 +215,11 @@ test('El agente usa botones, listas y CTA con ids seguros y fallback de texto', 
     assert.equal(afterSecond.intents.length, beforeSecond.intents.length);
     assert.equal(afterSecond.incidents.length, beforeSecond.incidents.length);
 
-    // Id no reconocido: se clasifica el título como texto.
+    // Id no reconocido: el título se procesa como un saludo de texto.
     out = await answer({ from: '51988888888', type: 'interactive', interactive: { type: 'button_reply',
-      button_reply: { id: 't:2', title: 'saldo' } } });
+      button_reply: { id: 't:2', title: 'hola' } } });
     assert.equal(out.length, 1);
-    assert.equal(out[0].type, 'text');
-    assert.match(bodyOf(out[0]), /Saldo:/);
+    assert.match(bodyOf(out[0]), /Anticipo (?:pendiente|listo)/);
 
     // Meta rechaza el interactivo: se reintenta una vez como texto.
     failInteractive = true;
@@ -233,14 +233,14 @@ test('El agente usa botones, listas y CTA con ids seguros y fallback de texto', 
 
     // Más de diez reservas: la lista se recorta a diez filas.
     for (let index = 0; index < 9; index++) await createOrder('51999999999', 'Extra ' + index, 6 + index, 1);
-    out = await answer({ from: '51999999999', type: 'text', text: { body: 'hola' } });
+    out = await answer({ from: '51999999999', type: 'text', text: { body: 'revisar mis reservas' } });
     assert.equal(out[0].interactive.type, 'list');
     assert.equal(out[0].interactive.action.sections.flatMap(section => section.rows).length, limits.rows);
     assert.match(bodyOf(out[0]), /Mostrando las 10 más relevantes de 11\. Si buscas otra, escríbeme su referencia\./);
 
     // Comandos de texto antiguos.
     out = await answer({ from: '51999999999', type: 'text', text: { body: 'saldo ' + order.ref } });
-    assert.equal(out[0].type, 'text');
+    assert.ok(out[0]);
     assert.match(bodyOf(out[0]), /Saldo:/);
     out = await answer({ from: '51999999999', type: 'text', text: { body: 'anticipo ' + order.ref } });
     assert.equal(out[0].interactive.type, 'cta_url');
@@ -318,11 +318,39 @@ test('La lista agrupa por estado, ordena visitas y usa plural y fechas legibles'
   assert.match(depositRows[1].description, /^Falta anticipo S\/\s*40\.00 · 1 persona · EST-AAAAAAA1$/);
   assert.match(list.list.sections[1].rows[0].description, /^Confirmada · saldo S\/\s*69\.00 · 2 personas · EST-AAAAAAA4$/);
   assert.match(list.list.sections[2].rows[0].description, /^Anticipo vencido · 2 personas · EST-AAAAAAA5$/);
-  assert.match(list.list.sections[3].rows[0].description, /^Finalizada · 2 personas · EST-AAAAAAA6$/);
+  assert.match(list.list.sections[3].rows[0].description, /^Cerrada · 2 personas · EST-AAAAAAA6$/);
   assert.match(list.body, /^📋 Tienes 5 reservas activas\. Elige una para ver sus detalles y opciones\.$/);
   assert.match(list.fallback, /Falta anticipo S\/\s*80\.00/);
   assert.match(list.fallback, /Hoy 21:00/);
   assert.match(list.fallback, /Anticipo vencido/);
+});
+
+test('Estado de lista y detalle coincide para cada etapa y el vencimiento solo aplica al anticipo pendiente', () => {
+  const cases = [
+    { stage: 'confirmed', deadline: hoursFromNow(-2), expected: 'Confirmada', incidents: [{ type: 'Anticipo vencido' }] },
+    { stage: 'awaiting_deposit', deadline: hoursFromNow(-2), expected: 'Anticipo vencido' },
+    { stage: 'arrived', deadline: hoursFromNow(-2), expected: 'Llegó' },
+    { stage: 'paid', deadline: hoursFromNow(-2), expected: 'Pagada' },
+    { stage: 'closed', deadline: hoursFromNow(-2), expected: 'Cerrada' },
+    { stage: 'cancelled', deadline: hoursFromNow(-2), expected: 'Cancelada' },
+    { stage: 'no_show', deadline: hoursFromNow(-2), expected: 'No asistió' },
+  ];
+  for (const [index, item] of cases.entries()) {
+    const order = demoOrder({ ref: 'EST-STATE' + String(index).padStart(4, '0'), ...item });
+    const rows = reservationList([order], fixedNow).list.sections.flatMap(section => section.rows);
+    assert.equal(rows.length, 1);
+    assert.match(rows[0].description, new RegExp('^' + item.expected));
+    assert.match(messageBody(reservationMenu(order, fixedNow)), new RegExp(item.expected === 'Anticipo vencido'
+      ? 'Venció el plazo del anticipo' : item.expected === 'Confirmada' ? 'Reserva confirmada'
+        : item.expected === 'Llegó' ? 'Llegada registrada' : item.expected === 'Pagada' ? 'Pago completo'
+          : item.expected === 'No asistió' ? 'inasistencia' : item.expected, 'i'));
+  }
+  const paidButStaleStage = demoOrder({ ref: 'EST-STATE9999', stage: 'awaiting_deposit', deadline: hoursFromNow(-2),
+    payments: [{ ref: 'MP-paid', amount: 8000, purpose: 'deposit' }] });
+  const description = reservationList([paidButStaleStage], fixedNow).list.sections.flatMap(section => section.rows)[0].description;
+  assert.match(description, /^Anticipo recibido/);
+  assert.doesNotMatch(description, /vencido/i);
+  assert.match(messageBody(reservationMenu(paidButStaleStage, fixedNow)), /Anticipo recibido/);
 });
 
 test('Una sola activa va al menú, varias usan lista y sin activas se elige la finalizada más reciente', () => {

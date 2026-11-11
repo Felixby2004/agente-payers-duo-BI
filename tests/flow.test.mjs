@@ -6,6 +6,7 @@ import { makeApi } from '../server/api.mjs';
 import { classify } from '../server/intents.mjs';
 import { balance, deposited } from '../shared/orders.mjs';
 import { samples } from '../shared/samples.mjs';
+import { limaDateTime } from '../server/availability.mjs';
 
 test('El catálogo contiene 100 casos distintos y el registro nace vacío', async () => {
   assert.equal(samples.length, 100);
@@ -25,7 +26,8 @@ test('De formulario a cierre de caja, con rechazos, confirmación duplicada y de
     assert.equal(res.status, expected, JSON.stringify(result));
     return result;
   }
-  const visitAt = new Date(Date.now() + 86400000).toISOString();
+  const targetDay = new Date(Date.now() + 4 * 86400000 - 5 * 3600000).toISOString().slice(0, 10);
+  const visitAt = limaDateTime(targetDay, '18:00');
   const seed = { agreed: true, synthetic: true, payer: 'Ana de prueba', guests: 4, visitAt, items: [{ name: 'Parrilla', price: 6000, quantity: 4 }] };
   try {
     assert.deepEqual(await call('orders'), []);
@@ -126,6 +128,10 @@ test('El link de saldo aparece al registrar llegada; caja supersede el intento y
     assert.equal(settledAtCounter.order.intents.find(item => item.id === balanceIntent.id).status, 'superseded');
     assert.equal(settledAtCounter.order.stage, 'closed');
     assert.equal(settledAtCounter.order.receipts.filter(item => ['balance', 'settlement'].includes(item.purpose)).length, 2);
+    const staleLink = await fetch(root + 'payment/' + balanceIntent.id);
+    const staleLinkState = await staleLink.json();
+    assert.equal(staleLinkState.usable, false);
+    assert.equal(staleLinkState.unusableReason, 'already_paid');
     await call('payment/' + balanceIntent.id, { outcome: 'approved' }, 409);
     assert.equal((await call('orders')).find(item => item.id === order.id).payments.filter(item => item.purpose === 'balance').length, 1);
 
