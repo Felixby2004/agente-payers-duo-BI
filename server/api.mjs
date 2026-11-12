@@ -7,10 +7,10 @@ import { createPortal } from './portal.mjs';
 import { isArrivalReport, paymentPromise, wantsPortal } from './customer-intents.mjs';
 import { reportKinds, reportPdf } from './reports.mjs';
 import { completeSettings, contactTime, defaults, validateSettings } from './agent-settings.mjs';
-import { balance, depositDue, money, terminal, stageLabels } from '../shared/orders.mjs';
+import { balance, depositDue, money, paid, terminal, stageLabels } from '../shared/orders.mjs';
 import { displayText, emojis, friendlyDate, parseAction, reservationFocus, reservationMenu, reservationPrompt, reservationList,
   paymentCta, balancePaymentCta, paymentRejectedCta, receiptCta, paymentReceiptCta, confirmationCta, requestMessage, noReservationMessage,
-  customerMainMenu, customerReservationsEmptyMessage, reservationInstructionsMessage, reservationRequest, reservationListRequest,
+  customerMainMenu, customerReservationsEmptyMessage, reservationInstructionsMessage, reservationRequest, reservationListRequest, availabilityInquiry,
   parseReservation, reservationKey, reservationConfirmation, reservationRepeatedMessage, rescheduleDaysMessage,
   rescheduleTimesMessage, rescheduleConfirmMessage, cancelReservationConfirmMessage, buttonsMessage, texts } from './interactive.mjs';
 import { Problem, requireThat, createOrder, addEvent, openIssue, applyPayment, arrive, recordCounterPayment, issueReceipt, reschedule, endReservation, digits } from './domain.mjs';
@@ -126,6 +126,52 @@ export async function makeApi(env, options = {}) {
   const linkFor = (intent) => config.publicUrl + '/pago/' + intent.id;
   const receiptLink = (receipt) => config.publicUrl + '/comprobante/' + receipt.token;
   const datePlus = (key, days) => new Date(+new Date(key + 'T12:00:00Z') + days * 86400000).toISOString().slice(0, 10);
+  function availabilityRangeFromText(text, at) {
+    const plain = commandText(text);
+    const today = limaDateKey(new Date(at));
+    const explicit = plain.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
+    if (explicit) {
+      const parsed = new Date(explicit[1] + 'T12:00:00Z');
+      if (Number.isFinite(+parsed) && parsed.toISOString().slice(0, 10) === explicit[1])
+        return { fromDate: explicit[1], toDate: explicit[1], label: 'el ' + explicit[1] };
+      return null;
+    }
+    if (/\b(?:proxima semana|siguiente semana|semana que viene)\b/.test(plain)) {
+      const weekday = new Date(today + 'T12:00:00Z').getUTCDay();
+      const daysUntilMonday = (8 - weekday) % 7 || 7;
+      const fromDate = datePlus(today, daysUntilMonday);
+      return { fromDate, toDate: datePlus(fromDate, 6), label: 'la próxima semana' };
+    }
+    if (/\besta semana\b/.test(plain)) {
+      const weekday = new Date(today + 'T12:00:00Z').getUTCDay();
+      const daysUntilSunday = (7 - weekday) % 7;
+      return { fromDate: today, toDate: datePlus(today, daysUntilSunday), label: 'esta semana' };
+    }
+    if (/\bmanana\b/.test(plain)) return { fromDate: datePlus(today, 1), toDate: datePlus(today, 1), label: 'mañana' };
+    if (/\bhoy\b/.test(plain)) return { fromDate: today, toDate: today, label: 'hoy' };
+    const weekdays = ['domingo', 'lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado'];
+    const index = weekdays.findIndex(day => new RegExp('\\b' + day + '\\b').test(plain));
+    if (index >= 0) {
+      const current = new Date(today + 'T12:00:00Z').getUTCDay();
+      let offset = (index - current + 7) % 7;
+      const fromDate = datePlus(today, offset);
+      return { fromDate, toDate: fromDate, label: 'el ' + weekdays[index] };
+    }
+    return null;
+  }
+  async function availabilityAnswer(text, at) {
+    const range = availabilityRangeFromText(text, at);
+    if (!range) return 'Claro. ¿Para qué día o período quieres consultar la disponibilidad? Puedes decir, por ejemplo, «mañana» o «la próxima semana».';
+    const peopleMatch = commandText(text).match(/\bpara\s+(\d{1,2})\s+personas?\b/);
+    const guests = peopleMatch ? Number(peopleMatch[1]) : 1;
+    if (!Number.isInteger(guests) || guests < 1 || guests > 40) return 'Dime la cantidad de personas, entre 1 y 40, para revisar el aforo.';
+    const { rule, days } = await availableDays({ ...range, guests });
+    if (!availabilityConfigured(rule)) return 'Aún no está configurado el horario y aforo en el sistema. El personal puede confirmarte la disponibilidad.';
+    if (!days.length) return 'No encuentro horarios libres para ' + range.label + ' según el horario, los bloqueos y el aforo actuales.';
+    const lines = days.map(day => day.label + ': ' + day.slots.map(slot => slot.time).join(', '));
+    return '📅 Horarios con disponibilidad para ' + range.label + ' (para ' + guests + (guests === 1 ? ' persona' : ' personas') + '):\n'
+      + lines.join('\n') + '\n\nLa disponibilidad final depende de la cantidad de personas. Para solicitar la reserva, envíame el formato RESERVA con el día y la hora elegidos.';
+  }
   async function availableDays({ fromDate = limaDateKey(new Date()), toDate, guests = 1, excludeOrderId = null } = {}) {
     const rule = await settings();
     const endDate = toDate || datePlus(fromDate, rule.offerWindowDays);
@@ -252,6 +298,41 @@ export async function makeApi(env, options = {}) {
   }
   async function sendReply(order, reply) {
     for (const message of Array.isArray(reply) ? reply : [reply]) if (message) await send(order, message, { reply: true });
+  }
+  async function sendResolutionNotice(orderId, incidentId) {
+    const { result: original } = await update(orderId, data => {
+      const issue = data.incidents.find(item => item.id === incidentId && item.resolvedAt);
+      const pending = data.incidents.find(item => item.type === 'Aviso de resolución pendiente'
+        && item.key === 'resolution-notice:' + incidentId && !item.resolvedAt);
+      if (!issue || !pending || pending.noticeStatus === 'sent') return null;
+      if (pending.noticeStatus === 'sending' && Date.now() - +new Date(pending.noticeAttemptAt) < 5 * 60000) return null;
+      pending.noticeStatus = 'sending'; pending.noticeAttemptAt = instant();
+      return structuredClone(issue);
+    });
+    if (!original) return { sent: false, error: 'El aviso ya se envió o se está procesando.' };
+    const current = (await store.get(orderId))?.data;
+    try {
+      requireThat(current?.phone && config.isPhoneAllowed(current.phone) && !config.isPhoneBlocked(current.phone)
+        && !(await optedOut(current.phone)), 'El número no admite mensajes.', 409);
+      requireThat(config.waMode !== 'cloud' || await sessionOpen(current.phone),
+        'La ventana de WhatsApp está cerrada. Pide al cliente que escriba «hola» para poder avisarle.', 409);
+      await send(current, '✅ *Actualización de tu solicitud*\nReserva: *' + current.ref + '*\n'
+        + original.type + ': ' + original.resolution + '\n\nSi necesitas más ayuda, responde a este mensaje.', { reply: true });
+      await update(orderId, data => {
+        const pending = data.incidents.find(item => item.type === 'Aviso de resolución pendiente'
+          && item.key === 'resolution-notice:' + incidentId && !item.resolvedAt);
+        if (pending) { pending.resolvedAt = instant(); pending.resolution = 'Aviso enviado al cliente.'; pending.noticeStatus = 'sent'; }
+        addEvent(data, 'Resolución comunicada al cliente por WhatsApp', original.type, 'Operador');
+      });
+      return { sent: true };
+    } catch (error) {
+      await update(orderId, data => {
+        const pending = data.incidents.find(item => item.type === 'Aviso de resolución pendiente'
+          && item.key === 'resolution-notice:' + incidentId && !item.resolvedAt);
+        if (pending) { pending.detail = error.message; pending.noticeStatus = 'failed'; }
+      });
+      return { sent: false, error: error.message };
+    }
   }
   function paymentReceiptUrl(payment) {
     if (!payment || payment.channel !== 'mercadopago' || !/^MP-\d+$/.test(String(payment.ref || ''))) return null;
@@ -440,7 +521,7 @@ export async function makeApi(env, options = {}) {
     let staff = action?.action === 'staff';
     const bookingRequest = action?.action === 'book' || reservationRequest(text) || /^\s*RESERVA(?:\s|$)/i.test(String(text || ''));
     if (bookingRequest) {
-      if (config.canReserve(phone)) await service.sendWhatsAppReply(phone, reservationInstructionsMessage());
+      if (config.canReserve(phone)) await service.sendWhatsAppReply(phone, reservationInstructionsMessage({ availabilityQuestion: availabilityInquiry(text) }));
       else {
         await store.noteQuery(phone, excerpt, true);
         await service.sendWhatsAppReply(phone, texts.reservationUnavailable);
@@ -789,7 +870,8 @@ export async function makeApi(env, options = {}) {
       || (/\b(?:pagar|pago|enlace|link)\b/i.test(String(text || '')) && /\b(?:yape|plin)\b/i.test(String(text || '')))) {
       return 'Por ahora, el pago en línea de esta reserva se realiza con Mercado Pago. Usa «Pagar anticipo» para continuar.';
     }
-    const { intent: intentType, method } = forced || await ai.classify(text);
+    const analysis = forced || await ai.classify(text);
+    const { intent: intentType, method, paymentIssue, priority, customerReply } = analysis;
     switch (intentType) {
       case 'link': {
         if (order.stage !== 'awaiting_deposit') return summary;
@@ -812,8 +894,19 @@ export async function makeApi(env, options = {}) {
       case 'issue':
       case 'human': {
         const type = { change: 'Solicitud de reprogramación', cancel: 'Solicitud de cancelación o devolución', issue: 'Dificultad de pago', human: 'Ayuda del personal' }[intentType];
-        await update(order.id, data => openIssue(data, type, text.slice(0, 500)));
-        return requestMessage(order, intentType);
+        const issueLabels = { expired_link: 'enlace vencido', payment_declined: 'medio de pago rechazado', technical_error: 'error técnico',
+          amount_mismatch: 'posible diferencia de importe', payment_method: 'consulta sobre medio de pago', other: 'motivo por revisar' };
+        const aiNote = intentType === 'issue' && paymentIssue
+          ? 'Clasificación asistida: ' + (issueLabels[paymentIssue] || 'motivo por revisar') + '. Prioridad sugerida: ' + (priority === 'high' ? 'alta' : 'normal') + '. ' : '';
+        await update(order.id, data => {
+          openIssue(data, type, aiNote + text.slice(0, 500));
+          if (intentType === 'issue' && paymentIssue) {
+            const incident = [...data.incidents].reverse().find(item => item.type === type && !item.resolvedAt);
+            if (incident) { incident.aiCategory = paymentIssue; incident.priority = priority === 'high' ? 'high' : 'normal'; }
+          }
+        });
+        return (intentType === 'issue' ? (customerReply || 'Gracias por avisarme.') + '\n\n' : '')
+          + requestMessage(order, intentType);
       }
       case 'receipt': {
         if (portal) return portalText;
@@ -828,9 +921,19 @@ export async function makeApi(env, options = {}) {
             addEvent(data, 'Intención de asistir informada por WhatsApp', 'La llegada se registra en recepción.', 'Pagador');
           });
         }
-        return summary;
+        return '📅 *Datos de tu visita*\nReserva: *' + order.ref + '*\nFecha y hora: '
+          + friendlyDate(order.visitAt, new Date(), true) + '\nPersonas: ' + order.guests
+          + '\nSi necesitas cambiarla, escribe «cambiar fecha».';
       }
-      case 'balance': return summary;
+      case 'balance': return [
+        '💳 *Resumen de pagos*',
+        'Reserva: *' + order.ref + '*',
+        'Estado: ' + stageLabels[order.stage],
+        'Total acordado: *' + money(order.total) + '*',
+        'Pagado registrado: *' + money(paid(order)) + '*',
+        'Saldo pendiente: *' + money(balance(order)) + '*',
+        ...(order.stage === 'closed' && balance(order) === 0 ? ['La cobranza figura completada.'] : []),
+      ].join('\n');
       case 'menu':
       default: return reservationMenu(order);
     }
@@ -969,9 +1072,10 @@ export async function makeApi(env, options = {}) {
     });
     return result ? 'La reserva ' + current.ref + ' quedó cancelada.' : reservationMenu(current);
   }
-  async function reportArrival(phone, orders, ref, timestamp, messageId, text) {
+  async function reportArrival(phone, orders, ref, timestamp, messageId, text, preferredOrder = null) {
     const eligible = orders.filter(order => ['confirmed', 'arrived', 'paid', 'closed'].includes(order.stage)
-      && limaDateKey(order.visitAt) === limaDateKey(new Date(timestamp)) && (!ref || ref === order.ref));
+      && limaDateKey(order.visitAt) === limaDateKey(new Date(timestamp))
+      && (ref ? ref === order.ref : !preferredOrder || preferredOrder.ref === order.ref));
     if (!eligible.length) return service.sendWhatsAppReply(phone, 'No encontré una reserva confirmada para hoy. Si ya estás en el local, consulta con caja.');
     if (eligible.length > 1) return service.sendWhatsAppReply(phone, reservationList(eligible, new Date(), 'sela'));
     const order = eligible[0];
@@ -994,7 +1098,8 @@ export async function makeApi(env, options = {}) {
   function recentConversationOrder(orders, at = Date.now()) {
     const mentions = [];
     for (const order of orders) for (const message of order.chat || []) {
-      if (message.direction !== 'out' || at - +new Date(message.at) > 30 * 60000 || at < +new Date(message.at)) continue;
+      // Conserva la última reserva mencionada durante el día para entender seguimientos breves.
+      if (message.direction !== 'out' || at - +new Date(message.at) > 24 * 3600000 || at < +new Date(message.at)) continue;
       const refs = [...new Set((String(message.text || '').match(/EST-[A-F0-9]{8}/gi) || []).map(value => value.toUpperCase()))];
       if (refs.length === 1 && refs[0] === order.ref) mentions.push({ order, at: +new Date(message.at) });
     }
@@ -1043,13 +1148,7 @@ export async function makeApi(env, options = {}) {
     }
 
     // Baja y alta se evalúan antes de clasificar la intención.
-    const command = commandText(text);
-    const customerPaymentRequest = new Set(['pagar', 'cuenta', 'pagar comida', 'saldo', 'pagar saldo', 'quiero pagar',
-      'quiero pagar en linea', 'quiero pagar online', 'pagar en linea', 'pagar online', 'quiero el link de pago',
-      'quiero el enlace de pago']).has(command)
-      || /\b(?:quiero|quisiera|deseo|necesito|puedo)\b.{0,24}\b(?:pagar|pago)\b/.test(command)
-      || /\b(?:pagar|pago)\b.{0,28}\b(?:en linea|online|por internet|saldo|anticipo)\b/.test(command);
-    const balanceDetailsRequest = /^saldo\s+EST-[a-f0-9]{8}$/i.test(String(text).trim());
+    let command = commandText(text);
     if (optOutPhrases.has(command)) {
       await store.setOptOut(phone, true);
       await service.sendWhatsAppReply(phone, texts.optOut);
@@ -1088,9 +1187,56 @@ export async function makeApi(env, options = {}) {
     // Responder a quien escribe no exige consentimiento; solo los mensajes que
     // inicia el restaurante exigen order.consent y un número no dado de baja.
     const orders = await store.phone(phone);
+    // Transcribe antes de elegir reserva o clasificar la intención: una nota de voz
+    // debe seguir el mismo flujo determinista que el texto equivalente.
+    let proof, mediaError;
+    if (attachment && ['image', 'audio'].includes(message.type)) {
+      try {
+        if (message.type === 'document') throw new Problem('Documento recibido para revisión del personal.');
+        const result = await ai.readMedia(message.type, attachment.id);
+        if (result.text) text = result.text;
+        proof = result.proof;
+        if (proof) proof.messageId = message.id;
+      } catch (error) { mediaError = error.message; }
+    }
+    if (message.type === 'audio' && !String(text || '').trim() && !mediaError) {
+      mediaError = 'No se obtuvo una transcripción utilizable.';
+    }
+    if (message.type === 'audio' && mediaError) {
+      const context = recentConversationOrder(orders, timestamp);
+      const response = /alcanzó un límite de uso/i.test(mediaError)
+        ? 'Por ahora no puedo procesar notas de voz. Escríbeme tu mensaje por texto o vuelve a intentarlo más tarde.'
+        : /no está disponible temporalmente/i.test(mediaError)
+          ? 'El servicio para procesar notas de voz no está disponible por el momento. Escríbeme tu mensaje por texto o vuelve a intentarlo más tarde.'
+          : 'No pude entender la nota de voz. Escríbeme el mensaje o envía otra nota de voz, por favor.';
+      if (context) await sendReply(context, response);
+      else await service.sendWhatsAppReply(phone, response);
+      return;
+    }
+    command = commandText(text);
+    const customerPaymentRequest = new Set(['pagar', 'cuenta', 'pagar comida', 'pagar saldo', 'quiero pagar',
+      'quiero pagar en linea', 'quiero pagar online', 'pagar en linea', 'pagar online', 'quiero el link de pago',
+      'quiero el enlace de pago']).has(command)
+      || /\b(?:quiero|quisiera|deseo|necesito|puedo)\b.{0,24}\b(?:pagar|pago)\b/.test(command)
+      || /\b(?:pagar|pago)\b.{0,28}\b(?:en linea|online|por internet|saldo|anticipo)\b/.test(command);
+    const balanceDetailsRequest = /^(?:(?:mi )?saldo(?: pendiente)?|saldo\s+EST-[a-f0-9]{8})$/i.test(String(text).trim())
+      || /\b(?:cuanto|que monto|cual es).{0,30}\b(?:debo|falta|saldo|pagar|pago)\b/.test(command)
+      || /\b(?:cuanto|que monto).{0,24}\b(?:queda|resta|pendiente)\b/.test(command);
     const ref = text.match(/\bEST-[a-f0-9]{8}\b/i)?.[0]?.toUpperCase();
-    const conversationOrder = customerPaymentRequest && !action
+    const explicitBookingPhrase = /\b(reservar|reserva nueva|nueva reserva|hacer (?:una |otra )?reserva|crear (?:una |otra )?reserva|tomar (?:una |otra )?reserva|agendar (?:una |otra )?reserva)\b/.test(command);
+    const isNewBookingRequest = explicitBookingPhrase || /^\s*RESERVA(?:\s|$)/i.test(text) || action?.action === 'book'
+      || (reservationRequest(text) && !availabilityInquiry(text));
+    const conversationOrder = !action && !isNewBookingRequest && !reservationListRequest(text) && !isGreeting(text)
       ? orders.find(item => item.ref === ref) || recentConversationOrder(orders, timestamp) : null;
+    if (availabilityInquiry(text) && !isNewBookingRequest) {
+      const answer = await availabilityAnswer(text, timestamp);
+      if (conversationOrder) await sendReply(conversationOrder, answer);
+      else await service.sendWhatsAppReply(phone, answer);
+      return;
+    }
+    // Una nueva reserva no debe confundirse con una de las reservas existentes ni
+    // registrar su audio/texto dentro de un pedido anterior.
+    if (isNewBookingRequest) return replyWithoutReservation(phone, text, action);
     const wantsOrders = action?.action === 'orders' || reservationListRequest(text);
     // La consulta de reservas prevalece sobre el detector genérico del portal.
     // Se muestra siempre la lista dentro de WhatsApp, incluso si solo hay una reserva.
@@ -1123,19 +1269,8 @@ export async function makeApi(env, options = {}) {
       return;
     }
 
-    let proof, mediaError;
-    if (attachment && ['image', 'audio'].includes(message.type)) {
-      try {
-        if (message.type === 'document') throw new Problem('Documento recibido para revisión del personal.');
-        const result = await ai.readMedia(message.type, attachment.id);
-        if (result.text) text = result.text;
-        proof = result.proof;
-        if (proof) proof.messageId = message.id;
-      } catch (error) { mediaError = error.message; }
-    }
-
-    if (!attachment && (action?.action === 'sela' || isArrivalReport(text))) {
-      return reportArrival(phone, orders, action?.ref || ref, timestamp, message.id, text);
+    if ((!attachment || message.type === 'audio') && (action?.action === 'sela' || isArrivalReport(text))) {
+      return reportArrival(phone, orders, action?.ref || ref, timestamp, message.id, text, conversationOrder);
     }
     if (!attachment && portal && wantsPortal(text)) return service.sendWhatsAppReply(phone, portalText);
     const promise = portal && !attachment && !proof && !action ? paymentPromise(text, new Date(timestamp)) : null;
@@ -1190,7 +1325,7 @@ export async function makeApi(env, options = {}) {
 
     const bookingRequest = action?.action === 'book' || reservationRequest(text) || /^\s*RESERVA(?:\s|$)/i.test(text);
     if (bookingRequest) {
-      if (config.canReserve(phone)) await sendReply(order, reservationInstructionsMessage());
+      if (config.canReserve(phone)) await sendReply(order, reservationInstructionsMessage({ availabilityQuestion: availabilityInquiry(text) }));
       else {
         await update(order.id, data => openIssue(data, 'Ayuda del personal', text.slice(0, 500) || message.id));
         await sendReply(order, texts.reservationUnavailable);
@@ -1242,6 +1377,18 @@ export async function makeApi(env, options = {}) {
         catch (error) { response = 'No pude cancelar la reserva: ' + error.message; }
       } else if (target && action?.action === 'cx') {
         response = reservationMenu((await store.get(target.id))?.data || target);
+      } else if (!action && balanceDetailsRequest) {
+        const selected = textTarget || conversationOrder || (active.length === 1 ? active[0] : null);
+        if (!selected && active.length > 1) {
+          response = reservationList(active, new Date(), 'selb');
+          recipient = reservationFocus(orders) || order;
+        } else if (!selected) response = 'No encontré una reserva para consultar. Escribe «ver mis reservas» para elegir una.';
+        else {
+          recipient = selected;
+          const latest = (await store.get(selected.id))?.data;
+          response = latest?.phone === phone ? await replyTo(latest, text, undefined, 'balance')
+            : 'No pude validar esta reserva desde tu número. Escribe «ver mis reservas» para actualizar la lista.';
+        }
       } else if (action?.action === 'payb' || action?.action === 'selb' || (!action && customerPaymentRequest)) {
         const selected = target || textTarget || conversationOrder || (active.length === 1 ? active[0] : null);
         if (!selected && active.length > 1) {
@@ -1257,9 +1404,6 @@ export async function makeApi(env, options = {}) {
             response = await replyTo(latest, 'anticipo', undefined, { intent: 'link', method: 'checkout' });
           } else response = await requestOnlinePayment(latest.id, phone, text);
         }
-      } else if (!action && balanceDetailsRequest && textTarget) {
-        recipient = textTarget;
-        response = await replyTo(textTarget, text, undefined, 'balance');
       } else if (action && (action.action === 'menu' || (action.ref && !target))) {
         response = reservationPrompt(orders);
         recipient = reservationFocus(orders) || order;
@@ -1274,7 +1418,7 @@ export async function makeApi(env, options = {}) {
         if (!latest || latest.phone !== phone) response = 'No pude validar esta reserva desde tu número. Escribe «ver mis reservas» para actualizar la lista.';
         else response = await actionReply(latest, action.action);
       }
-      else if (!ref && orders.length > 1) {
+      else if (!ref && !conversationOrder && orders.length > 1) {
         if (isGreeting(text)) {
           const previous = reservationListRepliedAt.get(phone) || 0;
           if (timestamp - previous >= 120_000) {
@@ -1414,7 +1558,7 @@ export async function makeApi(env, options = {}) {
     const rule = await settings();
     const now = Date.now();
     const orders = await store.list();
-    let sent = 0, escalated = 0, attempted = 0, retriedThisCycle = false;
+    let sent = 0, escalated = 0, attempted = 0, retriedThisCycle = false, personalizedReminderUsed = false;
     for (const order of orders) {
       if (terminal(order)) continue;
       const cancelHours = Number(rule.autoCancelExpiredHours ?? 24);
@@ -1590,7 +1734,17 @@ export async function makeApi(env, options = {}) {
               await skipStaleClaims(claimed);
               continue;
             }
-            await send(current, paymentCta(current, intent, linkFor(intent)), { template: 'deposit', intent });
+            const message = paymentCta(current, intent, linkFor(intent));
+            const unresolvedDifficulty = current.incidents?.some(item => !item.resolvedAt && item.type === 'Dificultad de pago');
+            if (activeSession && unresolvedDifficulty && !personalizedReminderUsed) {
+              personalizedReminderUsed = true;
+              const personalLine = await ai.personalizePaymentReminder();
+              if (personalLine) {
+                message.body = personalLine + '\n' + message.body;
+                message.fallback = personalLine + '\n' + message.fallback;
+              }
+            }
+            await send(current, message, { template: 'deposit', intent });
           }
         } else {
           current = (await store.get(current.id))?.data;
@@ -1873,6 +2027,43 @@ export async function makeApi(env, options = {}) {
         'Content-Disposition': 'attachment; filename="PAYERS-' + measure + '-' + from + '.pdf"', 'Cache-Control': 'private, no-store' });
       return res.end(pdf);
     }
+    if (isPost && path === '/api/reports/insights') {
+      requireThat(staff.role === 'admin', 'Las recomendaciones de reportes requieren acceso de administrador.', 403);
+      const input = parse(await readBody(req));
+      const from = String(input.from || ''), to = String(input.to || '');
+      const validDay = day => /^\d{4}-\d{2}-\d{2}$/.test(day) && Number.isFinite(Date.parse(day))
+        && new Date(day).toISOString().slice(0, 10) === day;
+      requireThat(validDay(from) && validDay(to) && from <= to
+        && (Date.parse(to) - Date.parse(from)) / 86400000 <= 92, 'Selecciona un período válido de hasta 93 días.');
+      const inRange = value => value && limaDateKey(value) >= from && limaDateKey(value) <= to;
+      const orders = await store.list();
+      const metrics = {
+        period: { from, to },
+        reservationsCreated: orders.filter(order => inRange(order.createdAt)).length,
+        overdueDeposits: orders.filter(order => order.stage === 'awaiting_deposit' && +new Date(order.deadline) < Date.now()).length,
+        rejectedOrExpiredLinks: orders.reduce((count, order) => count + order.intents.filter(intent => ['rejected', 'expired', 'failed'].includes(intent.status)
+          && inRange(intent.updatedAt || intent.createdAt)).length, 0),
+        unresolvedPaymentDifficulties: orders.reduce((count, order) => count + order.incidents.filter(item => !item.resolvedAt
+          && ['Dificultad de pago', 'Pago por revisar', 'Pago informado por el cliente'].includes(item.type)).length, 0),
+        failedReminders: orders.reduce((count, order) => count + Object.values(order.reminders || {}).filter(item => item.status === 'failed').length, 0),
+        noShows: orders.filter(order => order.stage === 'no_show' && inRange(order.visitAt)).length,
+        closedReservations: orders.filter(order => order.stage === 'closed' && inRange(order.closedAt)).length,
+      };
+      const fallback = [];
+      if (metrics.unresolvedPaymentDifficulties) fallback.push({ title: 'Priorizar dificultades de pago',
+        detail: 'Revisa las incidencias abiertas de pago y registra su resolución para evitar seguimientos duplicados.', priority: 'high' });
+      if (metrics.rejectedOrExpiredLinks || metrics.overdueDeposits) fallback.push({ title: 'Revisar enlaces y anticipos vencidos',
+        detail: 'Comprueba rechazos y enlaces vencidos antes de emitir nuevos enlaces o cancelar reservas.', priority: 'high' });
+      if (metrics.failedReminders) fallback.push({ title: 'Verificar entrega de recordatorios',
+        detail: 'Revisa ventana de WhatsApp, consentimiento y configuración del webhook para los recordatorios fallidos.', priority: 'normal' });
+      if (metrics.noShows) fallback.push({ title: 'Observar inasistencias',
+        detail: 'Compara las inasistencias con los recordatorios de visita y la verificación de llegada.', priority: 'normal' });
+      if (!fallback.length) fallback.push({ title: 'Seguir observando la tendencia',
+        detail: 'El período no muestra alertas agregadas destacadas. Revisa de nuevo cuando haya más operaciones.', priority: 'normal' });
+      const aiResult = await ai.recommend(metrics);
+      return json(res, 200, { metrics, insights: aiResult?.insights?.length ? aiResult.insights : fallback,
+        source: aiResult?.insights?.length ? 'gemini' : 'local' });
+    }
     const attachment = path.match(/^\/api\/orders\/([a-f0-9-]+)\/media\/([^/]+)$/);
     if (attachment && isGet && uuid.test(attachment[1])) {
       const order = (await store.get(attachment[1]))?.data;
@@ -1968,10 +2159,18 @@ export async function makeApi(env, options = {}) {
           const type = input.type === 'balance' ? 'Envío del link de saldo pendiente'
             : input.type === 'receipt' ? 'Envío de constancia pendiente'
               : input.type === 'arrival' ? 'Confirmación de asistencia pendiente'
-                : input.type === 'no_show' ? 'Aviso de inasistencia pendiente' : 'Recordatorio pendiente';
-          await update(id, data => openIssue(data, type, error.message,
-            input.type === 'arrival' ? 'attendance-confirmation:' + order.visitAt
-              : input.type === 'no_show' ? 'no-show-notice:' + order.visitAt : 'manual-message:' + input.type));
+                : input.type === 'no_show' ? 'Aviso de inasistencia pendiente'
+                  : input.type === 'resolution' ? 'Aviso de resolución pendiente' : 'Recordatorio pendiente';
+          await update(id, data => {
+            if (input.type === 'resolution') {
+              const pending = data.incidents.find(issue => issue.type === type && !issue.resolvedAt
+                && issue.key?.startsWith('resolution-notice:'));
+              if (pending) pending.detail = error.message;
+              else openIssue(data, type, error.message, 'resolution-notice:unknown');
+            } else openIssue(data, type, error.message,
+              input.type === 'arrival' ? 'attendance-confirmation:' + order.visitAt
+                : input.type === 'no_show' ? 'no-show-notice:' + order.visitAt : 'manual-message:' + input.type);
+          });
           throw error;
         }
         try {
@@ -1990,6 +2189,16 @@ export async function makeApi(env, options = {}) {
           } else if (input.type === 'no_show') {
             requireThat(order.stage === 'no_show', 'Primero registra la inasistencia de la reserva.', 409);
             requireThat(await sendNoShowNotification(order), 'No se pudo enviar el aviso al cliente. Revisa la incidencia abierta.', 409);
+            order = (await store.get(id))?.data || order;
+          } else if (input.type === 'resolution') {
+            const pending = order.incidents.find(issue => issue.type === 'Aviso de resolución pendiente'
+              && !issue.resolvedAt && issue.key?.startsWith('resolution-notice:'));
+            requireThat(pending, 'No hay un aviso de resolución pendiente.', 409);
+            const originalId = pending.key.slice('resolution-notice:'.length);
+            const original = order.incidents.find(issue => issue.id === originalId && issue.resolvedAt);
+            requireThat(original, 'No se encontró la resolución que se debe comunicar.', 409);
+            const delivery = await sendResolutionNotice(id, original.id);
+            requireThat(delivery.sent, delivery.error || 'No se pudo enviar el aviso al cliente.', 409);
             order = (await store.get(id))?.data || order;
           } else if (input.type === 'visit') {
             requireThat(order.stage === 'confirmed', 'La visita debe estar confirmada.', 409);
@@ -2013,8 +2222,17 @@ export async function makeApi(env, options = {}) {
             const type = input.type === 'receipt' ? 'Envío de constancia pendiente'
               : input.type === 'deposit' ? 'Envío del link de anticipo pendiente'
                 : input.type === 'arrival' ? 'Confirmación de asistencia pendiente'
-                  : input.type === 'no_show' ? 'Aviso de inasistencia pendiente' : 'Recordatorio pendiente';
-            await update(id, data => openIssue(data, type, error.message, 'manual-message:' + input.type));
+                  : input.type === 'no_show' ? 'Aviso de inasistencia pendiente'
+                    : input.type === 'resolution' ? 'Aviso de resolución pendiente' : 'Recordatorio pendiente';
+            const pendingNotice = input.type === 'resolution'
+              ? (await store.get(id))?.data.incidents.find(issue => issue.type === 'Aviso de resolución pendiente' && !issue.resolvedAt) : null;
+            const key = input.type === 'resolution' ? pendingNotice?.key : 'manual-message:' + input.type;
+            await update(id, data => {
+              const current = input.type === 'resolution' && key
+                ? data.incidents.find(issue => issue.key === key && !issue.resolvedAt) : null;
+              if (current) current.detail = error.message;
+              else openIssue(data, type, error.message, key);
+            });
           }
           throw error;
         }
@@ -2121,6 +2339,11 @@ export async function makeApi(env, options = {}) {
           issue.resolvedAt = instant();
           issue.resolution = resolution;
           addEvent(data, 'Incidencia resuelta', resolution, 'Operador');
+          // Reclama el aviso en la misma escritura para que una caída no lo pierda.
+          openIssue(data, 'Aviso de resolución pendiente', 'Preparando el mensaje para el cliente.', 'resolution-notice:' + issue.id);
+          const notice = data.incidents.find(item => item.type === 'Aviso de resolución pendiente'
+            && item.key === 'resolution-notice:' + issue.id && !item.resolvedAt);
+          if (notice) notice.noticeStatus ||= 'pending';
           if (data.stage === 'awaiting_deposit' && depositDue(data) === 0 && new Date(data.visitAt) > new Date()
             && !data.incidents.some(i => !i.resolvedAt && ['Pago por revisar', 'Reverso por revisar'].includes(i.type))) {
             data.stage = 'confirmed';
@@ -2144,11 +2367,15 @@ export async function makeApi(env, options = {}) {
       if (kind === 'arrive' && arrivalReported) await sendAttendanceConfirmation(result.order);
       if (kind === 'no-show') await sendNoShowNotification(result.order);
       if (['counter', 'arrive'].includes(kind) && balance(result.order) === 0) await deliverPendingReceipts(result.order);
+      let customerNotified = null;
       if (kind === 'resolve') {
+        const resolved = result.order.incidents.find(issue => issue.id === input.id);
+        const delivery = resolved ? await sendResolutionNotice(id, resolved.id) : { sent: false };
+        customerNotified = Boolean(delivery.sent);
         await deliverPendingReceipts(result.order);
       }
       if (kind === 'receipt') await deliverPendingReceipts(result.order);
-      return json(res, 200, { ...result, order: (await store.get(id))?.data || result.order });
+      return json(res, 200, { ...result, ...(kind === 'resolve' ? { customerNotified } : {}), order: (await store.get(id))?.data || result.order });
     }
     return json(res, 404, { error: 'Ruta no encontrada.' });
   }

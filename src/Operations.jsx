@@ -199,7 +199,12 @@ export function Detail({ order, config, close, reload, notify }) {
   async function run(kind, body = {}, message = 'Reserva actualizada.') {
     if (busy) return;
     setBusy(kind); setError('');
-    try { await api('orders/' + order.id + '/' + kind, body); await reload(); notify(message); }
+    try {
+      const result = await api('orders/' + order.id + '/' + kind, body);
+      await reload();
+      notify(kind === 'resolve' && result.customerNotified === false
+        ? 'Incidencia resuelta. El aviso al cliente quedó pendiente; revisa la incidencia abierta.' : message);
+    }
     catch (e) { setError(e.message); }
     finally { setBusy(''); }
   }
@@ -270,8 +275,9 @@ export function Detail({ order, config, close, reload, notify }) {
             </div>; })}
           </section>}
           {pendingIssues.length > 0 && <section className="action-panel"><h3><TriangleAlert size={18} /> Incidencias abiertas</h3>
-            <label>Nota de resolución<input value={note} maxLength={300} onChange={e => setNote(e.target.value)} placeholder="Resultado de la revisión" /></label>
-            {pendingIssues.map(issue => <div className="issue-line" key={issue.id}><div><strong>{issue.type}</strong><small>{issue.detail}</small></div>
+            <label>Respuesta al cliente por WhatsApp<input value={note} maxLength={300} onChange={e => setNote(e.target.value)} placeholder="Ej.: Revisamos tu solicitud y ya quedó atendida." /></label>
+            <small className="muted">Escribe al menos 3 caracteres. Este texto se guardará como resolución y se enviará si la ventana de WhatsApp está abierta.</small>
+            {pendingIssues.map(issue => <div className="issue-line" key={issue.id}><div><strong>{issue.priority === 'high' ? 'Prioridad alta · ' : ''}{issue.type}</strong><small>{issue.detail}</small></div>
               {issue.type === 'Solicitud de pago en línea' && <button className="button primary"
                 disabled={Boolean(busy) || !(order.stage === 'awaiting_deposit' && depositDue(order) > 0 && !expired)
                   && !(order.stage === 'arrived' && balance(order) > 0)}
@@ -282,7 +288,10 @@ export function Detail({ order, config, close, reload, notify }) {
                 disabled={Boolean(busy)} onClick={() => run('message', { type: 'arrival' }, 'Confirmación de asistencia reenviada.')}>Reintentar aviso al cliente</button>}
               {issue.type === 'Aviso de inasistencia pendiente' && <button className="button outline"
                 disabled={Boolean(busy)} onClick={() => run('message', { type: 'no_show' }, 'Aviso de inasistencia enviado por WhatsApp.')}>Reintentar aviso al cliente</button>}
-              <button className="button outline" disabled={Boolean(busy) || note.trim().length < 3} onClick={() => run('resolve', { id: issue.id, note }, 'Incidencia resuelta.')}>Resolver</button></div>)}</section>}
+              {issue.type === 'Aviso de resolución pendiente' && <button className="button outline"
+                disabled={Boolean(busy)} onClick={() => run('message', { type: 'resolution' }, 'Aviso de resolución enviado por WhatsApp.')}>Reintentar aviso</button>}
+              {issue.type !== 'Aviso de resolución pendiente' && <button className="button outline" disabled={Boolean(busy) || note.trim().length < 3}
+                onClick={() => run('resolve', { id: issue.id, note }, 'Incidencia resuelta y cliente avisado por WhatsApp.')}>Resolver y avisar</button>}</div>)}</section>}
           {beforeVisit && <details className="action-panel"><summary>Reprogramar o cancelar</summary>
             <div className="action-line"><label>Nueva fecha<input type="date" value={rescheduleDay} onChange={e => setRescheduleDay(e.target.value)} /></label>
               <label>Horario<select value={rescheduleTime} onChange={e => setRescheduleTime(e.target.value)}>

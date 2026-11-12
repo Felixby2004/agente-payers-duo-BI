@@ -185,8 +185,11 @@ export function customerReservationsEmptyMessage() {
   ]);
 }
 
-export function reservationInstructionsMessage() {
-  const body = '¡Claro! 📝 Copia solo el bloque desde RESERVA y reemplaza los textos entre corchetes.\n\n'
+export function reservationInstructionsMessage({ availabilityQuestion = false } = {}) {
+  const intro = availabilityQuestion
+    ? '📅 La disponibilidad depende del día, la hora y la cantidad de personas. Envíame esos datos con este formato y revisaré el horario y el aforo antes de registrar la reserva. No se registra si no hay cupo.\n\n'
+    : '¡Claro! 📝 Copia solo el bloque desde RESERVA y reemplaza los textos entre corchetes.\n\n';
+  const body = intro
     + 'RESERVA\nNombre: [nombre y apellido]\nFecha: [AAAA-MM-DD]\nHora: [HH:MM]\n'
     + 'Personas: [1 a 40]\nItems: 2x Parrilla familiar\n\n'
     + '📅 Indica una fecha futura y hora de Lima (con al menos 2 horas de anticipación).\n'
@@ -223,6 +226,11 @@ export function reservationRequest(value) {
   const plain = String(value || '').normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase().replace(/\s+/g, ' ');
   if (!plain || reservationChange.test(plain)) return false;
   return reservationRequests.some(pattern => pattern.test(plain));
+}
+
+export function availabilityInquiry(value) {
+  const plain = String(value || '').normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase().replace(/\s+/g, ' ').trim();
+  return /\b(disponibilidad|hay (?:cupo|cupos|mesa|mesas)|tienen (?:cupo|disponibilidad)|que horarios tienen)\b/.test(plain);
 }
 
 export const reservationErrors = Object.freeze({
@@ -529,8 +537,13 @@ export function reservationPrompt(orders, now = new Date()) {
 }
 
 export function requestMessage(order, type) {
-  return (type === 'change' ? emojis.calendar : emojis.note) + ' Registré tu solicitud para *' + order.ref
-    + '*. El personal la revisará y te confirmará los próximos pasos.';
+  const title = type === 'change' ? 'Solicitud de cambio recibida'
+    : type === 'cancel' ? 'Solicitud de cancelación recibida'
+      : type === 'issue' ? 'Consulta enviada al personal'
+        : 'Ayuda solicitada';
+  const icon = type === 'change' ? emojis.calendar : emojis.note;
+  return icon + ' *' + title + '*\nReserva: *' + order.ref
+    + '*\nEl personal revisará tu caso y te responderá por este medio.';
 }
 
 export function paymentCta(order, intent, url) {

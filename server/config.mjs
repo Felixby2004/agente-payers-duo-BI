@@ -8,6 +8,7 @@ export function readConfig(env) {
   const paymentMode = env.PAYMENT_MODE || 'local';
   const waMode = env.WHATSAPP_MODE || 'off';
   const orchestration = env.AGENT_ORCHESTRATION || 'server';
+  if (env.AI_PROVIDER && !['gemini', 'openai'].includes(env.AI_PROVIDER)) throw new Error('AI_PROVIDER debe ser gemini u openai.');
   const remote = Boolean(publicUrl || paymentMode === 'mercado_pago' || waMode === 'cloud');
   const portalEnabled = env.PAYERS_PORTAL === 'true';
   const otpFreeForm = env.WA_OTP_FREE_FORM === 'true';
@@ -73,7 +74,13 @@ export function readConfig(env) {
 export async function requestJson(url, { service, ...options }) {
   let res;
   try { res = await fetch(url, { ...options, signal: options.signal || AbortSignal.timeout(12000) }); }
-  catch { throw new Problem('No se pudo contactar con ' + service + '. Revisa la conexión y vuelve a intentar.', 502); }
+  catch (cause) {
+    const error = new Problem('No se pudo contactar con ' + service + '. Revisa la conexión y vuelve a intentar.', 502);
+    // Metadatos técnicos para diagnóstico seguro; nunca se conserva la URL ni el cuerpo enviado.
+    error.upstreamHttpStatus = null;
+    error.upstreamCode = cause?.name === 'TimeoutError' || cause?.name === 'AbortError' ? 'TIMEOUT' : 'NETWORK_ERROR';
+    throw error;
+  }
   const data = await res.json().catch(() => null);
   if (!res.ok || !data) {
     if (service === 'WhatsApp' && data?.error?.message) {
@@ -82,7 +89,15 @@ export async function requestJson(url, { service, ...options }) {
       const code = data.error.code ? ' · código ' + String(data.error.code).slice(0, 20) : '';
       throw new Problem('Meta rechazó el envío' + code + ': ' + detail, 502);
     }
-    throw new Problem(service + ' respondió con un error (' + res.status + '). Revisa su configuración.', 502);
+    const error = new Problem(service + ' respondió con un error (' + res.status + '). Revisa su configuración.', 502);
+    error.upstreamHttpStatus = res.status;
+    // El status/código de proveedores permite distinguir cuota, acceso y solicitud inválida.
+    // Se limita a un identificador alfanumérico para no filtrar mensajes ni datos de respuesta.
+    const rawCode = data?.error?.status ?? data?.error?.code;
+    error.upstreamCode = rawCode == null
+      ? (data ? 'UPSTREAM_ERROR' : 'NON_JSON_RESPONSE')
+      : String(rawCode).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40);
+    throw error;
   }
   return data;
 }

@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
-import { Activity, ArrowDownToLine, ArrowRight, CalendarDays, CircleCheck, CircleDollarSign, ClipboardList, Clock3, ReceiptText, TriangleAlert, Wallet } from 'lucide-react';
+import { Activity, ArrowDownToLine, ArrowRight, CalendarDays, CircleCheck, CircleDollarSign, ClipboardList, Clock3, ReceiptText, Sparkles, TriangleAlert, Wallet } from 'lucide-react';
 import { balance, depositDue, limaDay, money, paid, paymentLabels, stageLabels, terminal, visitText } from '../shared/orders.mjs';
-import { downloadCsv } from './client.mjs';
+import { api, downloadCsv } from './client.mjs';
 
 export const Badge = ({ stage }) => <span className={'badge ' + stage}><i />{stageLabels[stage]}</span>;
 export function Empty({ icon: Icon = ClipboardList, title, detail, children }) {
@@ -52,7 +52,9 @@ export function Dashboard({ orders, go, open }) {
   const openOrders = orders.filter(o => !terminal(o));
   const pending = openOrders.filter(o => o.stage === 'awaiting_deposit');
   const visits = orders.filter(o => limaDay(o.visitAt) === today && ['confirmed', 'arrived', 'paid', 'closed'].includes(o.stage));
-  const issues = orders.flatMap(order => order.incidents.filter(i => !i.resolvedAt).map(issue => ({ order, issue })));
+  const issues = orders.flatMap(order => order.incidents.filter(i => !i.resolvedAt).map(issue => ({ order, issue })))
+    .sort((a, b) => Number(b.issue.priority === 'high') - Number(a.issue.priority === 'high')
+      || +new Date(b.issue.at) - +new Date(a.issue.at));
   return <>
     <section className="hero">
       <div><span className="hero-kicker"><i /> FASE PAYERS</span>
@@ -75,7 +77,7 @@ export function Dashboard({ orders, go, open }) {
     <div className="dashboard-grid">
       <section className="panel"><div className="panel-head"><div><h2>Movimiento de cobranza</h2><p>Importes netos por fecha de pago</p></div><span className="label-chip">Últimos 7 días</span></div><Trend list={pay} /></section>
       <section className="panel"><div className="panel-head"><div><h2>Atención prioritaria</h2><p>Incidencias abiertas</p></div><span className="label-chip">{issues.length}</span></div>
-        {issues.length ? <div className="issue-preview">{issues.slice(0, 3).map(({ order, issue }) => <button key={issue.id} onClick={() => open(order.id)}><TriangleAlert size={16} /><span><strong>{issue.type}</strong><small>{order.ref} · {order.payer}</small></span><ArrowRight size={14} /></button>)}</div>
+        {issues.length ? <div className="issue-preview">{issues.slice(0, 3).map(({ order, issue }) => <button key={issue.id} onClick={() => open(order.id)}><TriangleAlert size={16} /><span><strong>{issue.priority === 'high' ? 'Prioridad alta · ' : ''}{issue.type}</strong><small>{order.ref} · {order.payer}</small></span><ArrowRight size={14} /></button>)}</div>
           : <Empty icon={CircleCheck} title="Todo al día" detail="Aquí aparecerán pagos por revisar, solicitudes y otros casos que requieran atención." />}
       </section>
     </div>
@@ -87,6 +89,9 @@ export function Dashboard({ orders, go, open }) {
 
 export function Reports({ orders }) {
   const [period, setPeriod] = useState(7);
+  const [insightResult, setInsightResult] = useState(null);
+  const [insightBusy, setInsightBusy] = useState(false);
+  const [insightError, setInsightError] = useState('');
   const from = relativeDay(1 - period), today = limaDay();
   const within = (value) => value && limaDay(value) >= from && limaDay(value) <= today;
   const list = movements(orders).filter(p => within(p.at));
@@ -113,6 +118,12 @@ export function Reports({ orders }) {
     downloadCsv('cobranza-establo-' + today, [['Reserva', 'Fecha de pago', 'Finalidad', 'Medio', 'Referencia', 'Importe PEN'],
       ...list.map(p => [p.order.ref, p.at, p.purpose === 'deposit' ? 'Anticipo' : 'Saldo', paymentLabels[p.channel], p.ref, p.amount / 100])]);
   }
+  async function loadInsights() {
+    setInsightBusy(true); setInsightError('');
+    try { setInsightResult(await api('reports/insights', { from, to: today })); }
+    catch (error) { setInsightError(error.message); }
+    finally { setInsightBusy(false); }
+  }
   return <>
     <div className="page-head"><div><span className="eyebrow">INTELIGENCIA DE NEGOCIOS</span><h1>Reportes de cobranza</h1><p>Conciliación, cierres y asistencia de la fase PAYERS.</p></div>
       <div className="button-row"><select aria-label="Período del reporte" value={period} onChange={e => setPeriod(Number(e.target.value))}><option value={7}>Últimos 7 días</option><option value={30}>Últimos 30 días</option></select>
@@ -138,6 +149,16 @@ export function Reports({ orders }) {
           <span>Tiempo entre llegada y cierre de {durations.length} reservas.</span></div>
         <div><strong>{closed.reduce((sum, o) => sum + (o.attendance?.count || 0), 0)} comensales</strong><span>Personas que asistieron en las reservas cerradas del período.</span></div>
       </div>
+    </section>
+    <section className="panel"><div className="panel-head"><div><h2>Recomendaciones de mejora</h2><p>Lectura de indicadores agregados; no ejecuta cambios en las reservas.</p></div>
+      <button className="button outline" disabled={insightBusy} onClick={loadInsights}><Sparkles size={17} />{insightBusy ? 'Analizando…' : 'Analizar período'}</button></div>
+      {insightError && <p className="alert error">{insightError}</p>}
+      {insightResult && <>
+        <p className="inline-note">{insightResult.source === 'gemini' ? 'Análisis asistido por Gemini' : 'Sugerencias basadas en reglas locales'} · Indicadores del {insightResult.metrics.period.from} al {insightResult.metrics.period.to}.</p>
+        <div className="report-notes">{insightResult.insights.map((item, index) => <div key={index}>
+          <strong>{item.priority === 'high' ? 'Prioridad alta · ' : ''}{item.title}</strong><span>{item.detail}</span></div>)}</div>
+        <p className="inline-note">Las recomendaciones son orientativas. Verifica los reportes y las incidencias antes de tomar decisiones.</p>
+      </>}
     </section>
     <section className="panel"><div className="panel-head"><div><h2>Seguimiento operativo</h2><p>Situación actual de todas las reservas</p></div></div>
       <div className="report-notes">
