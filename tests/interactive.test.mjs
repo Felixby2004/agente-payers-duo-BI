@@ -123,7 +123,8 @@ test('El agente usa botones, listas y CTA con ids seguros y fallback de texto', 
     let stored = await findOrder(order.id);
     assert.ok(stored.chat.some(message => message.direction === 'out' && /\[Botones:/.test(message.text)));
 
-    // Llegada no emite saldo; el pedido del cliente con la reserva ya llegada sí lo hace.
+    // La llegada no emite saldo ni el pedido del cliente envía el link directamente:
+    // el pedido crea una incidencia y caja envía el link desde el panel.
     const arrivedOrder = await createOrder('51977777777', 'Cliente con llegada', 4, 1);
     const arrivedPrefix = 'orders/' + arrivedOrder.id + '/';
     const arrivedDeposit = await call(arrivedPrefix + 'link', '{}', 200);
@@ -133,9 +134,16 @@ test('El agente usa botones, listas y CTA con ids seguros y fallback de texto', 
     out = await answer({ from: '51977777777', type: 'interactive', interactive: { type: 'button_reply',
       button_reply: { id: 'payb:' + arrivedOrder.ref, title: 'Pagar saldo en línea' } } });
     assert.equal(out.length, 1);
-    assert.equal(out[0].interactive.type, 'cta_url');
-    assert.match(out[0].interactive.action.parameters.url, /^https:\/\/establo\.example\/pago\//);
-    assert.equal((await findOrder(arrivedOrder.id)).intents.filter(item => item.purpose === 'balance').length, 1);
+    assert.match(bodyOf(out[0]), /personal la verá en el panel y te enviará el enlace/i);
+    let arrivedStored = await findOrder(arrivedOrder.id);
+    assert.equal(arrivedStored.intents.filter(item => item.purpose === 'balance').length, 0);
+    assert.ok(arrivedStored.incidents.some(item => item.type === 'Solicitud de pago en línea' && !item.resolvedAt));
+    const manualBalance = await call(arrivedPrefix + 'message', JSON.stringify({ type: 'balance' }), 200);
+    assert.ok(manualBalance.data.order.intents.some(item => item.purpose === 'balance'));
+    assert.equal(sent.at(-1).interactive.type, 'cta_url');
+    assert.match(sent.at(-1).interactive.action.parameters.url, /^https:\/\/establo\.example\/pago\//);
+    arrivedStored = await findOrder(arrivedOrder.id);
+    assert.ok(arrivedStored.incidents.some(item => item.type === 'Solicitud de pago en línea' && item.resolvedAt));
 
     // Pagar anticipo: un solo CTA, sin un segundo mensaje de opciones.
     out = await answer({ from: '51999999999', type: 'interactive', interactive: { type: 'button_reply',
@@ -404,11 +412,11 @@ test('El selector dedicado a pago de saldo conserva la referencia de reserva', (
   assert.deepEqual(parseAction('selb:EST-1234ABCD'), { action: 'selb', ref: 'EST-1234ABCD' });
 });
 
-test('Una reserva con llegada ofrece el botón independiente para pagar el saldo', () => {
+test('Una reserva con llegada ofrece la acción para solicitar el envío del saldo por caja', () => {
   const arrived = demoOrder({ ref: 'EST-1234ABCD', stage: 'arrived', total: 14900, deposit: 4000,
     payments: [{ ref: 'MP-1', amount: 4000, purpose: 'deposit' }] });
   const menu = reservationMenu(arrived, fixedNow);
-  assert.ok(menu.buttons.some(item => item.id === 'payb:EST-1234ABCD' && item.title === 'Pagar saldo en línea'));
+  assert.ok(menu.buttons.some(item => item.id === 'payb:EST-1234ABCD' && item.title.startsWith('Solicitar pago en l')));
 });
 
 test('Los límites recortan la referencia antes que el estado y los botones no llevan emojis', () => {

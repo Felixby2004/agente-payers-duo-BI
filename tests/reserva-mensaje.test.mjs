@@ -5,6 +5,7 @@ import { once } from 'node:events';
 import { makeApi } from '../server/api.mjs';
 import { readConfig } from '../server/config.mjs';
 import { hmac } from '../server/providers.mjs';
+import { limaDateKey, limaDateTime } from '../server/availability.mjs';
 import { parseReservation, reservationKey, texts } from '../server/interactive.mjs';
 import { menu } from '../shared/samples.mjs';
 
@@ -426,6 +427,15 @@ test('Modos off y staff protegen el alta; alta de cliente consiente y texto libr
 });
 
 test('Las reservas nuevas entran al ciclo de pago, constancia, recordatorio y alerta por vencimiento', async () => {
+  const RealDate = globalThis.Date;
+  const stableDay = limaDateKey(new RealDate());
+  const stableNow = +new RealDate(limaDateTime(stableDay, '12:00'));
+  globalThis.Date = class extends RealDate {
+    constructor(...args) { super(...(args.length ? args : [stableNow])); }
+    static now() { return stableNow; }
+    static parse(value) { return RealDate.parse(value); }
+    static UTC(...args) { return RealDate.UTC(...args); }
+  };
   const r = await runtime({ ENABLE_REMINDERS: 'true', WA_RESERVATION_MODE: 'open' });
   try {
     const currentSettings = (await r.call('config')).data;
@@ -455,7 +465,7 @@ test('Las reservas nuevas entran al ciclo de pago, constancia, recordatorio y al
     const alerts = (await r.call('internal/agent/alerts', '{}', 200, r.worker)).data;
     assert.equal(alerts.sent, 1, JSON.stringify({ alerts, reminders: order.reminders }));
     assert.ok(r.sent.some(payload => payload.to === '51911111111'));
-  } finally { await r.close(); }
+  } finally { globalThis.Date = RealDate; await r.close(); }
 });
 
 test('Una reserva sin pagar tras vencer el plazo genera una alerta interna', async () => {

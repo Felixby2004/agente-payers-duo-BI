@@ -233,11 +233,21 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
       interactive: { type: 'button_reply', button_reply: { id: 'payb:' + balanceOrder.ref, title: 'Pagar saldo en línea' } } };
     await receive(balanceRequest);
     assert.equal((await drain()).processed, 1);
-    const balancePaymentIntent = (await call('orders', undefined, 200)).data
+    let currentBalanceOrder = (await call('orders', undefined, 200)).data
       .find(item => item.id === balanceOrder.id).intents.find(item => item.purpose === 'balance');
+    assert.equal(currentBalanceOrder, undefined, 'el pedido del cliente no genera el link automáticamente');
+    let updatedBalanceOrder = (await call('orders', undefined, 200)).data.find(item => item.id === balanceOrder.id);
+    assert.ok(updatedBalanceOrder.incidents.some(item => item.type === 'Solicitud de pago en línea' && !item.resolvedAt));
+    assert.match(sent.at(-1).text.body, /personal la verá en el panel y te enviará el enlace/i);
+
+    // Caja prepara y envía el link desde el panel después de ver la solicitud.
+    const manualBalance = await call('orders/' + balanceOrder.id + '/message', JSON.stringify({ type: 'balance' }), 200);
+    const balancePaymentIntent = manualBalance.data.order.intents.find(item => item.purpose === 'balance');
     assert.ok(balancePaymentIntent);
     assert.equal(balancePaymentIntent.amount, 12900);
     assert.equal(preference.items[0].title, 'Saldo de pedido · ' + balanceOrder.ref);
+    updatedBalanceOrder = (await call('orders', undefined, 200)).data.find(item => item.id === balanceOrder.id);
+    assert.ok(updatedBalanceOrder.incidents.some(item => item.type === 'Solicitud de pago en línea' && item.resolvedAt));
     const balanceWebhook = { 'x-request-id': 'saldo-mp-990', 'x-signature': 'ts=123,v1=' + hmac(e.MP_WEBHOOK_SECRET,
       'id:990;request-id:saldo-mp-990;ts:123;') };
     const beforeBalanceWebhook = sent.length;
@@ -279,12 +289,19 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     assert.equal(shortcutArrived.order.intents.some(item => item.purpose === 'balance'), false);
     const beforeShortcut = sent.length;
     await receive({ ...shortcutSession, id: 'wamid.in-pay-shortcut', text: { body: 'pagar saldo' } }); await drain();
-    const autoLink = (await call('orders', undefined, 200)).data.find(item => item.id === shortcutOrder.id)
-      .intents.find(item => item.purpose === 'balance');
-    assert.ok(autoLink, 'el pedido del cliente debe crear el enlace después de la llegada');
-    assert.equal(sent.length, beforeShortcut + 1);
-    assert.match(sent.at(-1).interactive.action.parameters.url, new RegExp('/pago/' + autoLink.id + '$'));
-    assert.equal(preference.external_reference, autoLink.id);
+    let shortcutCurrent = (await call('orders', undefined, 200)).data.find(item => item.id === shortcutOrder.id);
+    assert.equal(shortcutCurrent.intents.some(item => item.purpose === 'balance'), false,
+      'la solicitud del cliente no crea el enlace antes de que caja lo envíe');
+    assert.ok(shortcutCurrent.incidents.some(item => item.type === 'Solicitud de pago en línea' && !item.resolvedAt));
+    assert.match(sent.at(-1).text.body, /personal la verá en el panel y te enviará el enlace/i);
+    const { data: manualShortcut } = await call(shortcutPrefix + 'message', JSON.stringify({ type: 'balance' }), 200);
+    const manualLink = manualShortcut.order.intents.find(item => item.purpose === 'balance');
+    assert.ok(manualLink);
+    assert.equal(sent.length, beforeShortcut + 2);
+    assert.match(sent.at(-1).interactive.action.parameters.url, new RegExp('/pago/' + manualLink.id + '$'));
+    assert.equal(preference.external_reference, manualLink.id);
+    shortcutCurrent = (await call('orders', undefined, 200)).data.find(item => item.id === shortcutOrder.id);
+    assert.ok(shortcutCurrent.incidents.some(item => item.type === 'Solicitud de pago en línea' && item.resolvedAt));
     const badAmountNotice = { 'x-request-id': 'bad-balance-997', 'x-signature': 'ts=123,v1=' + hmac(e.MP_WEBHOOK_SECRET,
       'id:997;request-id:bad-balance-997;ts:123;') };
     amountOverride = 0.01;
@@ -311,6 +328,10 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     await receive({ ...message, id: 'wamid.in-race-balance-request', from: '51977777777', text: undefined,
       interactive: { type: 'button_reply', button_reply: { id: 'payb:' + raceOrder.ref, title: 'Pagar saldo en línea' } } });
     assert.equal((await drain()).processed, 1);
+    let raceCurrent = (await call('orders', undefined, 200)).data.find(item => item.id === raceOrder.id);
+    assert.equal(raceCurrent.intents.some(item => item.purpose === 'balance'), false);
+    assert.ok(raceCurrent.incidents.some(item => item.type === 'Solicitud de pago en línea' && !item.resolvedAt));
+    await call(racePrefix + 'message', JSON.stringify({ type: 'balance' }), 200);
     const raceIntent = (await call('orders', undefined, 200)).data.find(item => item.id === raceOrder.id)
       .intents.find(item => item.purpose === 'balance');
     assert.ok(raceIntent);

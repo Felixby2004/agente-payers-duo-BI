@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { makeApi } from '../server/api.mjs';
 import { readConfig } from '../server/config.mjs';
 import { openStore } from '../server/store.mjs';
-import { limaDateKey } from '../server/availability.mjs';
+import { limaDateKey, limaDateTime } from '../server/availability.mjs';
 import { isArrivalReport, paymentPromise } from '../server/customer-intents.mjs';
 import { hmac } from '../server/providers.mjs';
 
@@ -41,6 +41,15 @@ test('Se reconoce una hora pactada en Lima y se distingue de un aviso de llegada
 
 test('Portal OTP, caja y PDF operan con permisos separados y asistencia verificada', async () => {
   const originalFetch = globalThis.fetch;
+  const RealDate = globalThis.Date;
+  const stableDay = limaDateKey(new RealDate());
+  const stableNow = +new RealDate(limaDateTime(stableDay, '12:00'));
+  globalThis.Date = class extends RealDate {
+    constructor(...args) { super(...(args.length ? args : [stableNow])); }
+    static now() { return stableNow; }
+    static parse(value) { return RealDate.parse(value); }
+    static UTC(...args) { return RealDate.UTC(...args); }
+  };
   const sends = [], otp = [];
   globalThis.fetch = async (url, options) => {
     assert.match(String(url), /^https:\/\/graph\.facebook\.com\//);
@@ -129,6 +138,7 @@ test('Portal OTP, caja y PDF operan con permisos separados y asistencia verifica
     assert.match(attendancePdf.data.toString('latin1'), /Cajero 01/);
     assert.doesNotMatch(attendancePdf.data.toString('latin1'), new RegExp(other.ref));
   } finally {
+    globalThis.Date = RealDate;
     await api.close();
     globalThis.fetch = originalFetch;
   }

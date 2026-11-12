@@ -193,10 +193,12 @@ test('Responder no exige consentimiento y la baja/alta bloquea solo los envíos 
     const consented = await r.createOrder('51999999999', 'Con Consentimiento', true);
     const noConsent = await r.createOrder('51988888888', 'Sin Consentimiento', false);
 
-    // Con reserva SIN consentimiento el agente responde a quien escribe.
-    let out = await r.answer({ from: '51988888888', type: 'text', text: { body: 'hola' } });
+    // Sin consentimiento no se inician avisos, pero sí se responde a la consulta explícita.
+    let out = await r.answer({ from: '51988888888', type: 'text', text: { body: 'ver mis reservas' } });
     assert.equal(out.length, 1);
-    assert.match(bodyOf(out[0]), new RegExp(noConsent.ref));
+    assert.equal(out[0].interactive.type, 'list');
+    assert.ok(out[0].interactive.action.sections.flatMap(section => section.rows)
+      .some(row => row.id.includes(noConsent.ref)));
 
     const config = (await r.call('config', undefined, 200)).data;
     await r.call('agent/settings', JSON.stringify({ ...config, reminders: true, initialRequest: true,
