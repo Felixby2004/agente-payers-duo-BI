@@ -159,7 +159,6 @@ export function Detail({ order, config, close, reload, notify }) {
   const [reason, setReason] = useState('');
   const [note, setNote] = useState('');
   const [paymentId, setPaymentId] = useState('');
-  const [depositMethod, setDepositMethod] = useState('checkout');
   const [forceReschedule, setForceReschedule] = useState(false);
   const box = useRef(null);
   useEffect(() => {
@@ -191,7 +190,7 @@ export function Detail({ order, config, close, reload, notify }) {
     }).catch(() => { if (alive) { setRescheduleChoices([]); setRescheduleTime(''); } });
     return () => { alive = false; };
   }, [rescheduleDay, rescheduleTime, forceReschedule, order.guests]);
-  const activeLink = order.intents.filter(i => (i.method || 'checkout') === depositMethod && i.status === 'pending' && i.expiresAt === order.deadline
+  const activeLink = order.intents.filter(i => (i.method || 'checkout') === 'checkout' && i.status === 'pending' && i.expiresAt === order.deadline
     && (i.mode === 'local' || i.checkoutUrl) && +new Date(i.expiresAt) > Date.now()).at(-1);
   const balanceIntent = order.intents.filter(i => (i.purpose || 'deposit') === 'balance').at(-1);
   const beforeVisit = ['awaiting_deposit', 'confirmed'].includes(order.stage);
@@ -228,18 +227,14 @@ export function Detail({ order, config, close, reload, notify }) {
             <div><small>Anticipo neto</small><strong>{money(deposited(order))}</strong></div><div><small>Saldo pendiente</small><strong>{money(balance(order))}</strong></div></div>
           {order.stage === 'awaiting_deposit' && <section className="action-panel">
             <h3><Link2 size={18} /> Anticipo virtual</h3><p>{money(depositDue(order))} pendiente · {expired ? 'Plazo vencido' : 'Pagar hasta ' + visitText(order.deadline)}</p>
-            <label>Medio de anticipo<select value={depositMethod} onChange={e => setDepositMethod(e.target.value)}>
-              <option value="checkout">{config.paymentMode === 'mercado_pago' ? 'Mercado Pago de prueba (tarjeta o Yape)' : 'Tarjeta de demostración'}</option>
-              {config.yapeDemo && <option value="yape">Yape simulado</option>}
-              {config.plinDemo && <option value="plin">Plin simulado</option>}
-            </select></label>
+            <p>{config.paymentMode === 'mercado_pago' ? 'Mercado Pago de prueba · tarjeta' : 'Pago con tarjeta de demostración'}</p>
             <div className="button-row">{activeLink ? <>
               <a className="button primary" href={'/pago/' + activeLink.id} target="_blank" rel="noreferrer">Abrir pago de prueba <ExternalLink size={15} /></a>
               <button className="button outline" onClick={() => copyLink(activeLink)}><Copy size={16} /> Copiar enlace</button></>
               : expired ? <button className="button outline" disabled={Boolean(busy) || depositDue(order) <= 0} onClick={() => {
                 if (confirm('¿Confirmas que el cupo sigue disponible para reabrir el plazo?')) run('renew', {}, 'Plazo reabierto.');
-              }}>Reabrir plazo</button> : <button className="button primary" disabled={Boolean(busy) || depositDue(order) <= 0} onClick={() => run('link', { method: depositMethod }, 'Enlace de anticipo preparado.')}>Generar enlace</button>}
-              {config.whatsapp === 'cloud' && <button className="button outline" disabled={Boolean(busy) || expired || depositDue(order) <= 0} onClick={() => run('message', { type: 'deposit', method: depositMethod }, 'WhatsApp aceptó el envío.')}><MessageCircle size={16} /> Enviar anticipo</button>}</div>
+              }}>Reabrir plazo</button> : <button className="button primary" disabled={Boolean(busy) || depositDue(order) <= 0} onClick={() => run('link', { method: 'checkout' }, 'Enlace de anticipo preparado.')}>Generar enlace</button>}
+              {config.whatsapp === 'cloud' && <button className="button outline" disabled={Boolean(busy) || expired || depositDue(order) <= 0} onClick={() => run('message', { type: 'deposit', method: 'checkout' }, 'WhatsApp aceptó el envío.')}><MessageCircle size={16} /> Enviar anticipo</button>}</div>
             {config.paymentMode === 'mercado_pago' && <div className="action-line"><input aria-label="Número de operación de Mercado Pago" value={paymentId} onChange={e => setPaymentId(e.target.value)} placeholder="N.º de operación" />
               <button className="button outline" disabled={Boolean(busy) || !paymentId} onClick={() => run('sync', { paymentId }, 'Consulta de pago completada.')}>Consultar pago</button></div>}
           </section>}
@@ -277,6 +272,16 @@ export function Detail({ order, config, close, reload, notify }) {
           {pendingIssues.length > 0 && <section className="action-panel"><h3><TriangleAlert size={18} /> Incidencias abiertas</h3>
             <label>Nota de resolución<input value={note} maxLength={300} onChange={e => setNote(e.target.value)} placeholder="Resultado de la revisión" /></label>
             {pendingIssues.map(issue => <div className="issue-line" key={issue.id}><div><strong>{issue.type}</strong><small>{issue.detail}</small></div>
+              {issue.type === 'Solicitud de pago en línea' && <button className="button primary"
+                disabled={Boolean(busy) || !(order.stage === 'awaiting_deposit' && depositDue(order) > 0 && !expired)
+                  && !(order.stage === 'arrived' && balance(order) > 0)}
+                onClick={() => run('message', { type: order.stage === 'awaiting_deposit' ? 'deposit' : 'balance', method: 'checkout' }, 'Enlace solicitado enviado por WhatsApp.')}>Enviar enlace solicitado</button>}
+              {issue.type === 'Solicitud de pago en línea' && order.stage === 'confirmed'
+                && <small>El saldo estará disponible cuando caja confirme la llegada.</small>}
+              {issue.type === 'Confirmación de asistencia pendiente' && <button className="button outline"
+                disabled={Boolean(busy)} onClick={() => run('message', { type: 'arrival' }, 'Confirmación de asistencia reenviada.')}>Reintentar aviso al cliente</button>}
+              {issue.type === 'Aviso de inasistencia pendiente' && <button className="button outline"
+                disabled={Boolean(busy)} onClick={() => run('message', { type: 'no_show' }, 'Aviso de inasistencia enviado por WhatsApp.')}>Reintentar aviso al cliente</button>}
               <button className="button outline" disabled={Boolean(busy) || note.trim().length < 3} onClick={() => run('resolve', { id: issue.id, note }, 'Incidencia resuelta.')}>Resolver</button></div>)}</section>}
           {beforeVisit && <details className="action-panel"><summary>Reprogramar o cancelar</summary>
             <div className="action-line"><label>Nueva fecha<input type="date" value={rescheduleDay} onChange={e => setRescheduleDay(e.target.value)} /></label>
@@ -288,7 +293,8 @@ export function Detail({ order, config, close, reload, notify }) {
             {config.role !== 'cashier' && <label className="check"><input type="checkbox" checked={forceReschedule} onChange={e => setForceReschedule(e.target.checked)} /> Permitir exceder el aforo</label>}
             <label>Motivo<input value={reason} onChange={e => setReason(e.target.value)} placeholder="Motivo de cancelación o inasistencia" /></label>
             <div className="button-row"><button className="button outline danger" disabled={Boolean(busy) || reason.trim().length < 3} onClick={() => run('cancel', { reason }, 'Reserva cancelada.')}>Cancelar reserva</button>
-              {order.stage === 'confirmed' && +new Date(order.visitAt) + config.graceMinutes * 60000 <= Date.now()
+              {order.stage === 'confirmed' && !order.attendance?.reportedAt
+                && +new Date(order.visitAt) + config.graceMinutes * 60000 <= Date.now()
                 && <button className="button outline" disabled={Boolean(busy) || reason.trim().length < 3} onClick={() => run('no-show', { reason }, 'Inasistencia registrada.')}>Registrar inasistencia</button>}</div>
           </details>}
           {config.role !== 'cashier' && order.payments.filter(p => p.amount > 0 && p.purpose === 'deposit'

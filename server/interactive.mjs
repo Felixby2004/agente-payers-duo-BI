@@ -99,7 +99,7 @@ export function parseAction(value) {
   const page = id.match(/^(rsm|rsh):(EST-[A-F0-9]{8}):(\d{4}-\d{2}-\d{2}|\d{1,4})(?::(\d{1,4}))?$/i);
   if (page) return { action: page[1].toLowerCase(), ref: page[2].toUpperCase(), value: page[3], offset: Number(page[4] || (page[1].toLowerCase() === 'rsm' ? page[3] : 0)) };
   const match = id.match(/^([a-z]+):(EST-[A-F0-9]{8})$/i);
-  if (!match || !['pay', 'payb', 'yape', 'plin', 'bal', 'rcp', 'chg', 'hum', 'sel', 'sela', 'selb', 'selc', 'rsx', 'ren', 'can', 'cnf', 'cx'].includes(match[1].toLowerCase())) return null;
+  if (!match || !['pay', 'payb', 'bal', 'rcp', 'chg', 'hum', 'sel', 'sela', 'selb', 'selc', 'rsx', 'ren', 'can', 'cnf', 'cx'].includes(match[1].toLowerCase())) return null;
   return { action: match[1].toLowerCase(), ref: match[2].toUpperCase() };
 }
 
@@ -247,7 +247,7 @@ const reservationLabels = Object.freeze([
 const catalog = new Map(menu.map(item => [productKey(item.name), item]));
 
 // Parser determinista del mensaje estructurado. No usa IA ni acepta importes.
-export function parseReservation(value, now = new Date()) {
+export function parseReservation(value, now = new Date(), minNoticeMinutes = 120) {
   const lines = String(value || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
   if (!lines.length) return null;
   const keyword = fold(lines[0]).replace(/\s+/g, ' ').replace(/:$/, '').trim().toLowerCase();
@@ -291,15 +291,15 @@ export function parseReservation(value, now = new Date()) {
   // Lima es UTC-5 todo el año: la hora escrita se interpreta como hora local.
   const visit = new Date(Date.UTC(year, month - 1, day, hour + 5, minute));
   if (+visit <= +new Date(now)) return { ok: false, error: 'Esa fecha y hora ya pasó.' };
-  if (+visit < +new Date(now) + 2 * 3600000) {
-    const localNow = new Date(+new Date(now) - 5 * 3600000);
-    const localVisit = new Date(+visit - 5 * 3600000);
-    if (localNow.toISOString().slice(0, 10) === localVisit.toISOString().slice(0, 10)) {
-      const min = new Date(+new Date(now) + 2 * 3600000);
-      const minTime = new Intl.DateTimeFormat('es-PE', { timeZone: 'America/Lima', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(min);
-      return { ok: false, error: 'La visita debe tener al menos 2 horas de anticipación. La hora mínima permitida hoy es ' + minTime + '.' };
-    }
-    return { ok: false, error: reservationErrors.future };
+  const noticeMinutes = Number.isInteger(minNoticeMinutes) && minNoticeMinutes >= 1 ? minNoticeMinutes : 120;
+  const minimumVisitAt = new Date(+new Date(now) + noticeMinutes * 60000);
+  if (+visit < +minimumVisitAt) {
+    const minimumLocal = new Date(+minimumVisitAt - 5 * 3600000);
+    const minDate = minimumLocal.toISOString().slice(0, 10);
+    const minTime = new Intl.DateTimeFormat('es-PE', { timeZone: 'America/Lima', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(minimumVisitAt);
+    const noticeLabel = noticeMinutes % 60 === 0 && noticeMinutes >= 60
+      ? (noticeMinutes / 60) + ' horas' : noticeMinutes + ' minutos';
+    return { ok: false, error: 'La visita debe tener al menos ' + noticeLabel + ' de anticipación. La fecha y hora mínima permitida es ' + minDate + ' ' + minTime + ' (hora de Lima).' };
   }
 
   const guests = /^\d{1,2}$/.test(String(fields.guests || '').trim()) ? Number(fields.guests) : NaN;
@@ -429,7 +429,7 @@ export function reservationMenu(order, now = new Date()) {
       button('hum:' + order.ref, 'Hablar con alguien')]);
   }
   if (order.stage === 'arrived' && balance(order) > 0) return buttonsMessage(text,
-    [button('payb:' + order.ref, 'Pagar saldo en línea'), button('bal:' + order.ref, 'Ver saldo'), button('hum:' + order.ref, 'Hablar con alguien')]);
+    [button('payb:' + order.ref, 'Solicitar pago en línea'), button('bal:' + order.ref, 'Ver saldo'), button('hum:' + order.ref, 'Hablar con alguien')]);
   return buttonsMessage(text, [receiptButton(order, receipt), button('hum:' + order.ref, 'Hablar con alguien')]);
 }
 
@@ -533,13 +533,10 @@ export function requestMessage(order, type) {
     + '*. El personal la revisará y te confirmará los próximos pasos.';
 }
 
-export function paymentCta(order, intent, method, url, options = {}) {
-  const label = method === 'yape' ? 'Simular con Yape' : method === 'plin' ? 'Simular con Plin' : 'Pagar anticipo';
-  const channel = method === 'checkout' ? 'Mercado Pago de prueba' : 'el medio de demostración elegido';
-  const alternatives = [options.yapeDemo && 'Yape', options.plinDemo && 'Plin'].filter(Boolean);
+export function paymentCta(order, intent, url) {
+  const label = 'Pagar anticipo';
   const text = emojis.payment + ' *Anticipo listo*\nReserva: *' + order.ref + '*\nImporte: *' + money(intent.amount)
-    + '*\nContinúa en ' + channel + ' con el botón.'
-    + (method === 'checkout' && alternatives.length ? '\nPara otro medio simulado, escribe *' + alternatives.join('* o *') + '*.' : '');
+    + '*\nContinúa con el botón de pago.';
   return ctaMessage(text, clip(label, limits.ctaText), url);
 }
 

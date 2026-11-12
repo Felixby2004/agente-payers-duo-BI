@@ -162,7 +162,7 @@ export function providers(config) {
       const name = { deposit: e.WA_TEMPLATE_DEPOSIT, paymentRejected: e.WA_TEMPLATE_PAYMENT_REJECTED,
         visit: e.WA_TEMPLATE_VISIT, balance: e.WA_TEMPLATE_BALANCE, confirmation: e.WA_TEMPLATE_CONFIRMATION,
         balanceReceipt: e.WA_TEMPLATE_BALANCE_RECEIPT, settlement: e.WA_TEMPLATE_SETTLEMENT,
-        reschedule: e.WA_TEMPLATE_RESCHEDULE }[template];
+        reschedule: e.WA_TEMPLATE_RESCHEDULE, noShow: e.WA_TEMPLATE_NO_SHOW }[template];
       requireThat(name, 'Pide al pagador que escriba al número de WhatsApp o configura una plantilla aprobada.', 409);
       const values = templateValues || (['deposit', 'paymentRejected', 'balance'].includes(template) ? [order.payer, order.ref, money(intent.amount)]
         : template === 'reschedule' ? [order.payer, order.ref, visitText(order.visitAt), String(order.rescheduledTo || '')]

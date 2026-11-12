@@ -8,7 +8,6 @@ const audioExtensions = {
   'audio/ogg': 'ogg', 'audio/opus': 'ogg', 'audio/mpeg': 'mp3', 'audio/mp4': 'm4a',
   'audio/aac': 'aac', 'audio/wav': 'wav', 'audio/webm': 'webm', 'audio/x-wav': 'wav',
 };
-const method = (text) => /\bplin\b/i.test(text) ? 'plin' : /\byape\b/i.test(text) ? 'yape' : 'checkout';
 const normalize = value => String(value || '').trim();
 const bounded = (value, max) => normalize(value).slice(0, max);
 
@@ -55,9 +54,9 @@ export function agentAI(config, provider) {
   return {
     enabled: Boolean(token),
     async classify(text) {
-      const fallback = { intent: classify(text), method: method(text) };
+      const fallback = { intent: classify(text), method: 'checkout' };
       const plain = text.replace(/\bEST-[a-f0-9]{8}\b/gi, '').trim();
-      if (/^(tarjeta|yape|plin)$/i.test(plain)) return { ...fallback, intent: 'link' };
+      if (/^tarjeta$/i.test(plain)) return { ...fallback, intent: 'link' };
       if (!token || plain.split(/\s+/).length < 3) return fallback;
       try {
         const result = await inspect(

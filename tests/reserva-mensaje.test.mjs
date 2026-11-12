@@ -202,7 +202,12 @@ test('parseReservation valida el formato con remitente único, catálogo y hora 
   assert.match(parseReservation(reservationText({ ...validMessage(), Fecha: '31/12/2026' }), fixedNow).error, /AAAA-MM-DD/);
   assert.match(parseReservation(reservationText({ ...validMessage(), Fecha: '2026-02-30' }), fixedNow).error, /AAAA-MM-DD/);
   assert.match(parseReservation(reservationText({ ...validMessage(), Fecha: '2026-11-10', Hora: '13:00' }), fixedNow).error,
-    /al menos 2 horas de anticipación.*hora mínima permitida hoy es 14:00/);
+    /al menos 2 horas de anticipación.*fecha y hora mínima permitida es 2026-11-10 14:00/);
+  const lateEvening = new Date('2026-11-12T03:20:00.000Z'); // 22:20 del 11 nov. en Lima
+  const nextDayMinimum = parseReservation(reservationText({ ...validMessage(), Fecha: '2026-11-11', Hora: '22:30' }), lateEvening);
+  assert.match(nextDayMinimum.error, /fecha y hora mínima permitida es 2026-11-12 00:20/);
+  const quickReservation = parseReservation(reservationText({ ...validMessage(), Fecha: '2026-11-11', Hora: '22:36' }), lateEvening, 5);
+  assert.equal(quickReservation.ok, true);
   assert.match(parseReservation(reservationText({ ...validMessage(), Hora: '25:00' }), fixedNow).error, /AAAA-MM-DD/);
   assert.match(parseReservation(reservationText({ ...validMessage(), Hora: '9:00' }), fixedNow).error, /AAAA-MM-DD/);
   for (const guests of ['0', '41']) {
@@ -361,7 +366,8 @@ test('El máximo de reservas abiertas se configura desde Agente y alertas y se a
   try {
     const config = (await r.call('config')).data;
     assert.equal(config.maxOpenReservationsPerPhone, 3);
-    await r.call('agent/settings', JSON.stringify({ ...config, maxOpenReservationsPerPhone: 2 }));
+    assert.equal(config.settingsDefaults.minReservationNoticeMinutes, 120);
+    await r.call('agent/settings', JSON.stringify({ ...config, maxOpenReservationsPerPhone: 2, minReservationNoticeMinutes: 5 }));
     const sender = '51922222222';
     for (let index = 0; index < 3; index++) {
       const result = await r.answer({ from: sender, text: { body: integrationText({ Hora: `${20 + index}:00` }, futureLimaDate(index + 2)) } },
@@ -371,6 +377,7 @@ test('El máximo de reservas abiertas se configura desde Agente y alertas y se a
     }
     assert.equal((await r.orders()).filter(order => order.phone === sender).length, 2);
     const saved = (await r.call('config')).data;
+    assert.equal(saved.minReservationNoticeMinutes, 5);
     await assert.rejects(() => r.call('agent/settings', JSON.stringify({ ...saved, maxOpenReservationsPerPhone: 0 })), /Revisa los importes y plazos/);
   } finally { await r.close(); }
 });

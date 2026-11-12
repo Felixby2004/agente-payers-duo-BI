@@ -144,7 +144,7 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     assert.match(sent[0].interactive.action.parameters.url, /^https:\/\/establo\.example\/pago\//);
     assert.equal(preference.auto_return, 'approved');
     assert.match(sent[0].interactive.action.parameters.url, /^https:\/\/establo\.example\/pago\//);
-    assert.match(sent[0].interactive.body.text, /Yape.*Plin/);
+    assert.doesNotMatch(sent[0].interactive.body.text, /Yape|Plin/);
     assert.equal(preference.items[0].unit_price, 40);
     assert.equal(preference.items[0].currency_id, 'PEN');
     assert.equal(Object.hasOwn(preference, 'payer'), false);
@@ -201,7 +201,7 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     const { data: rule } = await call('config', undefined, 200);
     await call('agent/settings', JSON.stringify({ ...rule, deadlineMinutes: 1 }), 200);
     const { data: demo } = await call('orders', JSON.stringify({
-      agreed: true, payer: 'Demo Plin', synthetic: true, guests: 2,
+      agreed: true, payer: 'Demo checkout', synthetic: true, guests: 2,
       visitAt: limaDateTime(new Date(Date.now() + 3 * 86400000 - 5 * 3600000).toISOString().slice(0, 10), '12:00'),
       items: [{ name: 'Parrilla familiar', price: 14900, quantity: 1 }],
     }), 201);
@@ -211,10 +211,9 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
       assert.equal((await call('internal/agent/alerts', '{}', 200, worker)).data.escalated, 1);
       assert.equal((await call('internal/agent/alerts', '{}', 200, worker)).data.escalated, 0);
     } finally { Date.now = clock; }
-    const { data: demoLink } = await call('orders/' + demo.id + '/link', JSON.stringify({ method: 'plin' }), 200);
-    await call('payment/' + demoLink.intent.id, JSON.stringify({ outcome: 'approved' }), 200);
-    const { data: all } = await call('orders', undefined, 200);
-    assert.equal(all.find(o => o.id === demo.id).payments[0].channel, 'plin_demo');
+    await call('orders/' + demo.id + '/link', JSON.stringify({ method: 'plin' }), 409);
+    const { data: demoLink } = await call('orders/' + demo.id + '/link', JSON.stringify({ method: 'checkout' }), 200);
+    assert.equal(demoLink.intent.method, 'checkout');
 
     const { data: balanceOrder } = await call('orders', JSON.stringify({
       agreed: true, payer: 'Saldo Mercado Pago', phone: '+51999999999', consent: true, guests: 1,

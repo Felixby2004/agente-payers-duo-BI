@@ -151,7 +151,10 @@ export function reschedule(order, value) {
 export function endReservation(order, action, reason, graceMs) {
   requireThat(['awaiting_deposit', 'confirmed'].includes(order.stage), 'La reserva ya no admite esta acción.', 409);
   requireThat(String(reason || '').trim().length >= 3, 'Registra el motivo de la decisión.');
-  if (action === 'no_show') requireThat(Date.now() >= +new Date(order.visitAt) + graceMs && order.stage === 'confirmed', 'Espera el final de la tolerancia para registrar la inasistencia.');
+  if (action === 'no_show') {
+    requireThat(Date.now() >= +new Date(order.visitAt) + graceMs && order.stage === 'confirmed', 'Espera el final de la tolerancia para registrar la inasistencia.');
+    requireThat(!order.attendance?.reportedAt, 'El cliente avisó que llegó. Verifica su asistencia antes de registrar la inasistencia.', 409);
+  }
   order.stage = action;
   addEvent(order, action === 'cancelled' ? 'Reserva cancelada' : 'Inasistencia registrada', String(reason).slice(0, 300), 'Operador');
   if (paid(order) > 0) openIssue(order, 'Anticipo por resolver', 'Verifica la política de devolución antes de disponer del anticipo.');

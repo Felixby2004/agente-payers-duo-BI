@@ -84,16 +84,17 @@ test('De formulario a cierre de caja, con rechazos, confirmación duplicada y de
     assert.equal(deposited(refunded), 0);
 
     const config = await call('config');
-    await call('agent/settings', { ...config, depositPerPerson: 2500, plinDemo: false });
+    await call('agent/settings', { ...config, depositPerPerson: 2500 });
     const withNewRule = await call('orders', seed, 201);
     assert.equal(withNewRule.deposit, 10000);
     const z = 'orders/' + withNewRule.id + '/';
     await call(z + 'link', { method: 'plin' }, 409);
-    const yape = await call(z + 'link', { method: 'yape' });
-    assert.equal((await call('payment/' + yape.intent.id)).method, 'yape');
-    await call('payment/' + yape.intent.id, { outcome: 'approved' });
+    await call(z + 'link', { method: 'yape' }, 409);
+    const online = await call(z + 'link', { method: 'checkout' });
+    assert.equal((await call('payment/' + online.intent.id)).method, 'checkout');
+    await call('payment/' + online.intent.id, { outcome: 'approved' });
     const list = await call('orders');
-    assert.equal(list.find(o => o.id === withNewRule.id).payments[0].channel, 'yape_demo');
+    assert.equal(list.find(o => o.id === withNewRule.id).payments[0].channel, 'simulation');
     assert.equal(list.find(o => o.id === order.id).deposit, 8000);
   } finally {
     await new Promise(resolve => server.close(resolve));

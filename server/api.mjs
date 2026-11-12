@@ -174,9 +174,8 @@ export async function makeApi(env, options = {}) {
     return next.finally(() => { if (locks.get(id) === next) locks.delete(id); });
   }
   async function checkout(id, method = 'checkout', purpose = 'deposit', forceNew = false, staff = null) {
-    requireThat(['checkout', 'yape', 'plin'].includes(method), 'Elige un medio de anticipo válido.');
+    requireThat(method === 'checkout', 'Solo está disponible el pago en línea con Mercado Pago.', 409);
     const rule = await settings();
-    requireThat(method === 'checkout' || rule[method + 'Demo'], 'Ese medio de demostración está desactivado.', 409);
     if (portal) method = 'checkout';
     const mode = method === 'checkout' ? config.paymentMode : 'local';
     return lock(id, async () => {
@@ -307,7 +306,8 @@ export async function makeApi(env, options = {}) {
       : (receipt.paymentBreakdown || []).map(item => (item.purpose === 'deposit' ? 'Anticipo' : 'Saldo') + ' ' + money(item.amount)
         + ' (' + (item.channel === 'mercadopago' ? 'Mercado Pago' : item.channel === 'cash' ? 'efectivo' : item.channel === 'pos' ? 'POS' : item.channel === 'wallet' ? 'billetera' : item.channel) + ')').join(' · ')
         + (allPayments.some(item => item.channel === 'mercadopago') ? ' · Comprobante oficial: consultar cada operación en Mercado Pago' : '');
-    const amount = receipt.purpose === 'deposit' ? 'Anticipo ' + money(receipt.amount) : 'Total ' + money(order.total) + ' · ' + summary;
+    const amount = receipt.purpose === 'deposit' ? 'Anticipo ' + money(receipt.amount) : 'Total ' + money(order.total) + ' · ' + summary
+      + (receipt.purpose === 'settlement' ? '\n\n🙏 ¡Gracias por elegir El Establo! Esperamos verte pronto.' : '');
     const message = receipt.purpose === 'deposit'
       ? confirmationCta(order, messageUrl, new Date(), officialUrl ? 'Comprobante oficial de Mercado Pago.' : '')
       : receipt.purpose === 'balance' && officialUrl
@@ -511,6 +511,9 @@ export async function makeApi(env, options = {}) {
           && incident.key === 'balance-link-send' && !incident.resolvedAt) {
           incident.resolvedAt = instant(); incident.resolution = 'El enlace se envió correctamente.';
         }
+        for (const incident of data.incidents) if (incident.type === 'Solicitud de pago en línea' && !incident.resolvedAt) {
+          incident.resolvedAt = instant(); incident.resolution = 'Se envió el enlace solicitado por el cliente.';
+        }
       });
       if (staff) return (await update(result.id, data => addEvent(data, 'Enlace de saldo enviado por caja', intent.id, staff.name))).order;
       return result;
@@ -521,21 +524,81 @@ export async function makeApi(env, options = {}) {
       throw error;
     }
   }
-  async function autoPayOrder(order) {
-    if (order.stage === 'arrived' && balance(order) > 0) {
-      return sendBalanceLink(order, { reply: true });
+  async function sendAttendanceConfirmation(order) {
+    const claimed = await update(order.id, data => {
+      if (!data.attendance?.at || data.attendance.state !== 'confirmed' || data.attendance.customerConfirmationStatus === 'sent') return false;
+      if (data.chat.some(message => message.direction === 'out' && /Asistencia confirmada/.test(message.text || ''))) {
+        data.attendance.customerConfirmationStatus = 'sent';
+        data.attendance.customerConfirmationAt ||= instant();
+        return false;
+      }
+      if (data.attendance.customerConfirmationStatus === 'sending'
+        && Date.now() - +new Date(data.attendance.customerConfirmationAttemptAt) < 5 * 60000) return false;
+      data.attendance.customerConfirmationStatus = 'sending';
+      data.attendance.customerConfirmationAttemptAt = instant();
+      return true;
+    });
+    if (!claimed.result) return false;
+    const current = (await store.get(order.id))?.data || order;
+    const message = '✅ *Asistencia confirmada*\nReserva: *' + current.ref + '*\nEl personal registró tu llegada. ¡Que disfrutes tu visita!';
+    try {
+      if (!current.phone || !config.isPhoneAllowed(current.phone) || config.isPhoneBlocked(current.phone) || await optedOut(current.phone)) {
+        throw new Problem('No se pudo avisar al cliente: el número no admite mensajes.', 409);
+      }
+      await send(current, message, { reply: true });
+      await update(current.id, data => {
+        data.attendance.customerConfirmationStatus = 'sent';
+        data.attendance.customerConfirmationAt = instant();
+        for (const issue of data.incidents) if (issue.type === 'Confirmación de asistencia pendiente'
+          && !issue.resolvedAt) { issue.resolvedAt = instant(); issue.resolution = 'WhatsApp aceptó la confirmación.'; }
+        addEvent(data, 'Asistencia confirmada por WhatsApp al cliente', '', 'Sistema');
+      });
+      return true;
+    } catch (error) {
+      await update(current.id, data => {
+        data.attendance.customerConfirmationStatus = 'failed';
+        openIssue(data, 'Confirmación de asistencia pendiente', error.message, 'attendance-confirmation:' + current.visitAt);
+      });
+      return false;
     }
-    if (order.stage === 'awaiting_deposit' && depositDue(order) > 0) {
-      if (new Date(order.deadline) <= new Date()) return sendReply(order, reservationMenu(order));
-      const intent = await checkout(order.id);
-      return send(order, paymentCta(order, intent, 'checkout', linkFor(intent), await settings()), { template: 'deposit', intent, reply: true });
+  }
+  async function sendNoShowNotification(order) {
+    const claimed = await update(order.id, data => {
+      if (data.stage !== 'no_show' || data.noShowNoticeStatus === 'sent') return false;
+      if (data.chat.some(message => message.direction === 'out' && /Inasistencia registrada/i.test(message.text || ''))) {
+        data.noShowNoticeStatus = 'sent'; data.noShowNoticeAt ||= instant();
+        return false;
+      }
+      if (data.noShowNoticeStatus === 'sending'
+        && Date.now() - +new Date(data.noShowNoticeAttemptAt) < 5 * 60000) return false;
+      data.noShowNoticeStatus = 'sending'; data.noShowNoticeAttemptAt = instant();
+      return true;
+    });
+    if (!claimed.result) return false;
+    const current = (await store.get(order.id))?.data || order;
+    const message = '📌 *Inasistencia registrada*\nReserva: *' + current.ref + '*\nEl personal registró que no pudiste asistir a tu visita de '
+      + friendlyDate(current.visitAt, new Date(), true) + '. Si sí acudiste o necesitas revisar el anticipo, responde a este mensaje para que podamos ayudarte.';
+    try {
+      if (!current.phone || !current.consent || !config.isPhoneAllowed(current.phone)
+        || config.isPhoneBlocked(current.phone) || await optedOut(current.phone)) {
+        throw new Problem('No se pudo avisar al cliente: falta autorización o el número no admite mensajes.', 409);
+      }
+      await send(current, message, { template: 'noShow', templateValues: [current.payer, current.ref,
+        friendlyDate(current.visitAt, new Date(), true)] });
+      await update(current.id, data => {
+        data.noShowNoticeStatus = 'sent'; data.noShowNoticeAt = instant();
+        for (const issue of data.incidents) if (issue.type === 'Aviso de inasistencia pendiente'
+          && !issue.resolvedAt) { issue.resolvedAt = instant(); issue.resolution = 'WhatsApp aceptó el aviso.'; }
+        addEvent(data, 'Aviso de inasistencia enviado al cliente', '', 'Sistema');
+      });
+      return true;
+    } catch (error) {
+      await update(current.id, data => {
+        data.noShowNoticeStatus = 'failed';
+        openIssue(data, 'Aviso de inasistencia pendiente', error.message, 'no-show-notice:' + current.visitAt);
+      });
+      return false;
     }
-    if (order.stage === 'confirmed') return send(order, 'El saldo se habilita cuando recepción registre tu llegada. Por ahora no generaré un enlace de saldo.', { reply: true });
-    const receipt = order.receipts.find(item => item.purpose === 'settlement') || order.receipts.at(-1);
-    if (['paid', 'closed'].includes(order.stage) && receipt) {
-      return send(order, portal ? portalText : receiptCta(order, receiptLink(receipt)), { reply: true });
-    }
-    return send(order, reservationMenu(order), { reply: true });
   }
   async function notifyRejectedPayment(order, rejectedIntent) {
     if (portal) {
@@ -722,6 +785,10 @@ export async function makeApi(env, options = {}) {
       await update(order.id, data => openIssue(data, 'Revisión de inasistencia solicitada por cliente', String(text || 'El cliente consultó una reserva marcada como no asistió.').slice(0, 500), 'no-show-customer:' + order.ref));
       return reservationMenu(order);
     }
+    if (/^(?:yape|plin)$/i.test(String(text || '').trim())
+      || (/\b(?:pagar|pago|enlace|link)\b/i.test(String(text || '')) && /\b(?:yape|plin)\b/i.test(String(text || '')))) {
+      return 'Por ahora, el pago en línea de esta reserva se realiza con Mercado Pago. Usa «Pagar anticipo» para continuar.';
+    }
     const { intent: intentType, method } = forced || await ai.classify(text);
     switch (intentType) {
       case 'link': {
@@ -729,9 +796,8 @@ export async function makeApi(env, options = {}) {
         if (new Date(order.deadline) <= new Date()) return summary + ' El plazo del anticipo venció. Puedo derivar la revisión al personal.';
         if (/\befectivo\b/i.test(text)) return 'El anticipo de ' + order.ref + ' se paga en línea. Puedes pagar el saldo en efectivo cuando llegues al restaurante.';
         const rule = await settings();
-        if (method !== 'checkout' && !rule[method + 'Demo']) return 'Ese medio de demostración está desactivado. Puedes escribir «tarjeta» para abrir el checkout disponible.';
         const intent = await checkout(order.id, method);
-        return paymentCta(order, intent, portal ? 'checkout' : method, linkFor(intent), rule);
+        return paymentCta(order, intent, linkFor(intent));
       }
       case 'paid': {
         if (depositDue(order) === 0) return summary + ' El anticipo figura verificado.';
@@ -855,10 +921,9 @@ export async function makeApi(env, options = {}) {
   }
 
   async function actionReply(order, action) {
-    const forced = { pay: { intent: 'link', method: 'checkout' }, yape: { intent: 'link', method: 'yape' },
-      plin: { intent: 'link', method: 'plin' }, bal: { intent: 'balance' }, rcp: { intent: 'receipt' },
+    const forced = { pay: { intent: 'link', method: 'checkout' }, bal: { intent: 'balance' }, rcp: { intent: 'receipt' },
       chg: { intent: 'change' }, hum: { intent: 'human' } }[action];
-    const phrase = { pay: 'anticipo', yape: 'yape', plin: 'plin', bal: 'saldo', rcp: 'comprobante',
+    const phrase = { pay: 'anticipo', bal: 'saldo', rcp: 'comprobante',
       chg: 'reprogramar', hum: 'ayuda' }[action];
     return replyTo(order, phrase || '', undefined, forced);
   }
@@ -877,7 +942,7 @@ export async function makeApi(env, options = {}) {
     try {
       const intent = await checkout(current.id);
       const fresh = (await store.get(current.id))?.data || current;
-      await send(fresh, paymentCta(fresh, intent, 'checkout', linkFor(intent), rule), { template: 'deposit', intent, reply: true });
+      await send(fresh, paymentCta(fresh, intent, linkFor(intent)), { template: 'deposit', intent, reply: true });
     } catch (error) {
       await update(current.id, data => openIssue(data, 'Enlace de anticipo pendiente', error.message, 'renewed-deposit-link:' + current.id));
       await sendReply(current, 'El plazo se renovó, pero no pude enviar el enlace de anticipo. Ya avisé al personal para que lo revise.');
@@ -921,10 +986,37 @@ export async function makeApi(env, options = {}) {
       }
       return 'pending';
     });
-    const message = result.result === 'confirmed' ? 'Caja ya confirmó tu llegada.'
+    const message = result.result === 'confirmed' ? '✅ Caja ya confirmó tu asistencia para ' + order.ref + '.'
       : result.result === 'changed' ? 'La reserva cambió. Confirma la referencia con caja.'
-        : 'Avisé a caja de tu llegada para ' + order.ref + '. Acércate para que verifiquen tu asistencia.';
+        : '📍 Ya avisé al personal de tu llegada para ' + order.ref + '. Espera su confirmación; te escribiré por aquí cuando registren tu asistencia.';
     return sendReply(order, message);
+  }
+  function recentConversationOrder(orders, at = Date.now()) {
+    const mentions = [];
+    for (const order of orders) for (const message of order.chat || []) {
+      if (message.direction !== 'out' || at - +new Date(message.at) > 30 * 60000 || at < +new Date(message.at)) continue;
+      const refs = [...new Set((String(message.text || '').match(/EST-[A-F0-9]{8}/gi) || []).map(value => value.toUpperCase()))];
+      if (refs.length === 1 && refs[0] === order.ref) mentions.push({ order, at: +new Date(message.at) });
+    }
+    return mentions.sort((a, b) => b.at - a.at)[0]?.order || null;
+  }
+  async function requestOnlinePayment(orderId, phone, text) {
+    const current = (await store.get(orderId))?.data;
+    if (!current || current.phone !== phone) return 'No pude validar esta reserva desde tu número. Escribe «ver mis reservas» para actualizar la lista.';
+    const fresh = await update(orderId, data => {
+      if (data.phone !== phone) return false;
+      if (['confirmed', 'arrived'].includes(data.stage) && balance(data) > 0) {
+        openIssue(data, 'Solicitud de pago en línea', 'El cliente solicita el enlace para pagar el saldo. Solicitud por WhatsApp: ' + String(text || '').slice(0, 250), 'customer-online-payment-request');
+        return data.stage === 'arrived' ? 'balance' : 'balance-after-arrival';
+      }
+      return 'unavailable';
+    });
+    const purpose = fresh.result;
+    if (purpose === 'unavailable') return 'No hay un pago en línea pendiente para la reserva ' + current.ref + '. Si necesitas ayuda, escribe «hablar con alguien».';
+    if (purpose === 'balance-after-arrival') return '🧾 Registré tu solicitud de pago en línea para ' + current.ref
+      + '. El saldo se habilita cuando el personal confirme tu llegada; ya dejé el aviso en el panel.';
+    return '🧾 Registré tu solicitud de pago en línea para ' + current.ref
+      + '. El personal la verá en el panel y te enviará el enlace por WhatsApp cuando lo prepare.';
   }
 
   async function incoming(message) {
@@ -952,7 +1044,11 @@ export async function makeApi(env, options = {}) {
 
     // Baja y alta se evalúan antes de clasificar la intención.
     const command = commandText(text);
-    const balanceShortcut = new Set(['pagar', 'cuenta', 'pagar comida', 'saldo', 'pagar saldo']).has(command);
+    const customerPaymentRequest = new Set(['pagar', 'cuenta', 'pagar comida', 'saldo', 'pagar saldo', 'quiero pagar',
+      'quiero pagar en linea', 'quiero pagar online', 'pagar en linea', 'pagar online', 'quiero el link de pago',
+      'quiero el enlace de pago']).has(command)
+      || /\b(?:quiero|quisiera|deseo|necesito|puedo)\b.{0,24}\b(?:pagar|pago)\b/.test(command)
+      || /\b(?:pagar|pago)\b.{0,28}\b(?:en linea|online|por internet|saldo|anticipo)\b/.test(command);
     const balanceDetailsRequest = /^saldo\s+EST-[a-f0-9]{8}$/i.test(String(text).trim());
     if (optOutPhrases.has(command)) {
       await store.setOptOut(phone, true);
@@ -981,7 +1077,8 @@ export async function makeApi(env, options = {}) {
 
     // Alta por mensaje estructurado: solo cuando el modo lo permite y la palabra RESERVA abre el texto.
     if (config.canReserve(phone) && !attachment) {
-      const reservation = parseReservation(text);
+      const rule = await settings();
+      const reservation = parseReservation(text, new Date(), rule.minReservationNoticeMinutes);
       if (reservation) {
         await registerReservation(phone, text, reservation, timestamp, message.id);
         return;
@@ -992,6 +1089,8 @@ export async function makeApi(env, options = {}) {
     // inicia el restaurante exigen order.consent y un número no dado de baja.
     const orders = await store.phone(phone);
     const ref = text.match(/\bEST-[a-f0-9]{8}\b/i)?.[0]?.toUpperCase();
+    const conversationOrder = customerPaymentRequest && !action
+      ? orders.find(item => item.ref === ref) || recentConversationOrder(orders, timestamp) : null;
     const wantsOrders = action?.action === 'orders' || reservationListRequest(text);
     // La consulta de reservas prevalece sobre el detector genérico del portal.
     // Se muestra siempre la lista dentro de WhatsApp, incluso si solo hay una reserva.
@@ -1017,7 +1116,7 @@ export async function makeApi(env, options = {}) {
     const staffFocus = action?.action === 'staff' ? (reservationFocus(orders) || orders[0]) : null;
     const actionFocus = action?.ref ? orders.find(order => order.ref === action.ref) : null;
     const active = orders.filter(order => !terminal(order));
-    const candidates = actionFocus ? [actionFocus] : staffFocus ? [staffFocus]
+    const candidates = actionFocus ? [actionFocus] : staffFocus ? [staffFocus] : conversationOrder ? [conversationOrder]
       : ref ? orders.filter(order => order.ref === ref) : (active.length ? active : orders);
     if (!candidates.length) {
       await replyWithoutReservation(phone, text, action);
@@ -1143,24 +1242,24 @@ export async function makeApi(env, options = {}) {
         catch (error) { response = 'No pude cancelar la reserva: ' + error.message; }
       } else if (target && action?.action === 'cx') {
         response = reservationMenu((await store.get(target.id))?.data || target);
-      } else if (action?.action === 'payb' || action?.action === 'selb') {
-        const selected = (target && (await store.get(target.id))?.data) || target || order;
-        if (selected.phone !== phone) { response = 'No pude validar esta reserva desde tu número. Escribe «ver mis reservas» para actualizar la lista.'; }
+      } else if (action?.action === 'payb' || action?.action === 'selb' || (!action && customerPaymentRequest)) {
+        const selected = target || textTarget || conversationOrder || (active.length === 1 ? active[0] : null);
+        if (!selected && active.length > 1) {
+          response = reservationList(active, new Date(), 'selb');
+          recipient = reservationFocus(orders) || order;
+        } else if (!selected) response = 'No encontré una reserva para asociar a tu solicitud. Escribe «ver mis reservas» para elegir una.';
         else {
-        recipient = selected;
-        await autoPayOrder(selected);
-        return;
+          recipient = selected;
+          const latest = (await store.get(selected.id))?.data;
+          if (!latest || latest.phone !== phone) response = 'No pude validar esta reserva desde tu número. Escribe «ver mis reservas» para actualizar la lista.';
+          else if (!action && latest.stage === 'awaiting_deposit' && depositDue(latest) > 0) {
+            // El flujo normal conserva el enlace automático del anticipo pendiente.
+            response = await replyTo(latest, 'anticipo', undefined, { intent: 'link', method: 'checkout' });
+          } else response = await requestOnlinePayment(latest.id, phone, text);
         }
       } else if (!action && balanceDetailsRequest && textTarget) {
         recipient = textTarget;
         response = await replyTo(textTarget, text, undefined, 'balance');
-      } else if (!action && balanceShortcut && !ref && orders.length > 1) {
-        const eligibles = active.length ? active : orders;
-        response = reservationList(eligibles, new Date(), 'selb');
-        recipient = reservationFocus(orders) || order;
-      } else if (!action && balanceShortcut) {
-        await autoPayOrder(order);
-        return;
       } else if (action && (action.action === 'menu' || (action.ref && !target))) {
         response = reservationPrompt(orders);
         recipient = reservationFocus(orders) || order;
@@ -1342,12 +1441,14 @@ export async function makeApi(env, options = {}) {
       }
       const before = +new Date(order.visitAt) - now;
       const issue = order.stage === 'awaiting_deposit' && now >= +new Date(order.deadline) ? ['Anticipo vencido', 'Revisa el pago y el cupo antes de renovar.', 'deadline:' + order.deadline]
-        : order.stage === 'confirmed' && before <= -rule.graceMinutes * 60000 ? ['Verificar llegada', 'Pasó la tolerancia. Recepción debe verificar si asistió.', 'arrival:' + order.visitAt]
+        : order.stage === 'confirmed' && !order.attendance?.reportedAt && before <= -rule.graceMinutes * 60000 ? ['Verificar llegada', 'Pasó la tolerancia sin aviso de llegada. Recepción debe verificar si asistió antes de registrar una inasistencia.', 'arrival:' + order.visitAt]
           : order.stage === 'arrived' && balance(order) > 0 && now - +new Date(order.attendance.at) >= rule.counterAlertMinutes * 60000
             ? ['Saldo por verificar', 'El cliente ya llegó y caja aún no confirmó el saldo.', 'counter:' + order.attendance.at] : null;
       if (rule.internalAlerts && issue && !order.incidents.some(i => i.key === issue[2])) {
         const { result: created } = await update(order.id, data => {
-          if (data.stage === order.stage && data.deadline === order.deadline && data.visitAt === order.visitAt && !data.incidents.some(i => i.key === issue[2])) {
+          if (data.stage === order.stage && data.deadline === order.deadline && data.visitAt === order.visitAt
+            && (!String(issue[2]).startsWith('arrival:') || !data.attendance?.reportedAt)
+            && !data.incidents.some(i => i.key === issue[2])) {
             openIssue(data, ...issue);
             return true;
           }
@@ -1489,7 +1590,7 @@ export async function makeApi(env, options = {}) {
               await skipStaleClaims(claimed);
               continue;
             }
-            await send(current, paymentCta(current, intent, 'checkout', linkFor(intent), rule), { template: 'deposit', intent });
+            await send(current, paymentCta(current, intent, linkFor(intent)), { template: 'deposit', intent });
           }
         } else {
           current = (await store.get(current.id))?.data;
@@ -1668,8 +1769,7 @@ export async function makeApi(env, options = {}) {
       }
       const method = intent.method || 'checkout';
       const purpose = intent.purpose || 'deposit';
-      const ruleForPayment = await settings();
-      const methodEnabled = method === 'checkout' || ruleForPayment[method + 'Demo'];
+      const methodEnabled = method === 'checkout';
       if (isGet) {
         const expected = purpose === 'deposit' ? depositDue(target) : balance(target);
         const rightStage = purpose === 'deposit' ? target.stage === 'awaiting_deposit' && new Date(target.deadline) > new Date()
@@ -1684,16 +1784,14 @@ export async function makeApi(env, options = {}) {
               ? 'expired' : !rightStage ? 'reservation_changed' : null;
         return json(res, 200, { ref: target.ref, amount: intent.amount, status: intent.status, mode: intent.mode, purpose,
           stage: target.stage, requiresReview, unusableReason,
-          method, options: portal && usable && method === 'checkout' ? ['checkout', ...['yape','plin'].filter(key => methodEnabled && ruleForPayment[key + 'Demo'])] : undefined,
-          usable: usable && safeCheckout, checkoutUrl: usable && safeCheckout ? intent.checkoutUrl : null });
+        method, usable: usable && safeCheckout, checkoutUrl: usable && safeCheckout ? intent.checkoutUrl : null });
       }
       if (isPost) {
         const input = parse(await readBody(req));
-        if (portal && input.method !== undefined) requireThat(['checkout','yape','plin'].includes(input.method), 'Selecciona un medio de pago digital.');
-        const selected = portal && method === 'checkout' && ['yape', 'plin'].includes(input.method) ? input.method : method;
-        const demoMethod = portal && selected !== 'checkout' && ruleForPayment[selected + 'Demo'];
-        requireThat(demoMethod || (methodEnabled && intent.mode === 'local' && (method !== 'checkout' || config.paymentMode === 'local')),
-          'Este pago se confirma desde el medio autorizado.', 409);
+        if (portal && input.method !== undefined) requireThat(input.method === 'checkout', 'Solo está disponible el pago en línea con Mercado Pago.', 409);
+        const selected = method;
+        requireThat(methodEnabled && intent.mode === 'local' && config.paymentMode === 'local',
+          'Este pago se confirma desde Mercado Pago.', 409);
         const token = randomUUID();
         const { order, result } = await update(target.id, data => {
           const row = data.intents.find(i => i.id === intent.id);
@@ -1791,7 +1889,7 @@ export async function makeApi(env, options = {}) {
     if (path === '/api/config' && isGet) return json(res, 200, {
       database: store.label, paymentMode: config.paymentMode, whatsapp: config.waMode, protected: Boolean(config.adminPassword),
       role: staff.role, portalEnabled: Boolean(portal),
-      agent: config.orchestration, ai: ai.enabled, ...await settings(),
+      agent: config.orchestration, ai: ai.enabled, ...await settings(), settingsDefaults: initialSettings,
     });
     if (path === '/api/agent/settings' && isPost) {
       const next = validateSettings(parse(await readBody(req)), initialSettings);
@@ -1868,16 +1966,31 @@ export async function makeApi(env, options = {}) {
         if (await optedOut(order.phone) && !(await sessionOpen(order.phone))) {
           const error = new Problem('El cliente se dio de baja de los mensajes', 409);
           const type = input.type === 'balance' ? 'Envío del link de saldo pendiente'
-            : input.type === 'receipt' ? 'Envío de constancia pendiente' : 'Recordatorio pendiente';
-          await update(id, data => openIssue(data, type, error.message, 'manual-message:' + input.type));
+            : input.type === 'receipt' ? 'Envío de constancia pendiente'
+              : input.type === 'arrival' ? 'Confirmación de asistencia pendiente'
+                : input.type === 'no_show' ? 'Aviso de inasistencia pendiente' : 'Recordatorio pendiente';
+          await update(id, data => openIssue(data, type, error.message,
+            input.type === 'arrival' ? 'attendance-confirmation:' + order.visitAt
+              : input.type === 'no_show' ? 'no-show-notice:' + order.visitAt : 'manual-message:' + input.type));
           throw error;
         }
         try {
           if (input.type === 'deposit') {
             const intent = await checkout(id, input.method);
-            order = await send(order, paymentCta(order, intent, input.method || 'checkout', linkFor(intent), await settings()), { template: 'deposit', intent });
+            order = await send(order, paymentCta(order, intent, linkFor(intent)), { template: 'deposit', intent });
+            await update(id, data => { for (const incident of data.incidents) if (incident.type === 'Solicitud de pago en línea'
+              && !incident.resolvedAt) { incident.resolvedAt = instant(); incident.resolution = 'Se envió el enlace de anticipo solicitado por el cliente.'; } });
           } else if (input.type === 'balance') {
             order = await sendBalanceLink(order, { forceNew: Boolean(input.newLink), staff: staff.id ? staff : null });
+          } else if (input.type === 'arrival') {
+            requireThat(order.attendance?.state === 'confirmed' && order.attendance?.at,
+              'Primero confirma la asistencia de la reserva.', 409);
+            requireThat(await sendAttendanceConfirmation(order), 'No se pudo enviar el aviso al cliente. Revisa la incidencia abierta.', 409);
+            order = (await store.get(id))?.data || order;
+          } else if (input.type === 'no_show') {
+            requireThat(order.stage === 'no_show', 'Primero registra la inasistencia de la reserva.', 409);
+            requireThat(await sendNoShowNotification(order), 'No se pudo enviar el aviso al cliente. Revisa la incidencia abierta.', 409);
+            order = (await store.get(id))?.data || order;
           } else if (input.type === 'visit') {
             requireThat(order.stage === 'confirmed', 'La visita debe estar confirmada.', 409);
             order = await send(order, emojis.visit + ' *Próxima visita*\nReserva: *' + order.ref + '*\n'
@@ -1896,9 +2009,11 @@ export async function makeApi(env, options = {}) {
             order = (await store.get(id)).data;
           } else throw new Problem('Selecciona un mensaje válido.');
         } catch (error) {
-          if (input.type !== 'balance') {
+          if (!['balance', 'arrival', 'no_show'].includes(input.type)) {
             const type = input.type === 'receipt' ? 'Envío de constancia pendiente'
-              : input.type === 'deposit' ? 'Envío del link de anticipo pendiente' : 'Recordatorio pendiente';
+              : input.type === 'deposit' ? 'Envío del link de anticipo pendiente'
+                : input.type === 'arrival' ? 'Confirmación de asistencia pendiente'
+                  : input.type === 'no_show' ? 'Aviso de inasistencia pendiente' : 'Recordatorio pendiente';
             await update(id, data => openIssue(data, type, error.message, 'manual-message:' + input.type));
           }
           throw error;
@@ -1968,6 +2083,7 @@ export async function makeApi(env, options = {}) {
       }
       const receiptToken = randomUUID();
       const rule = await settings();
+      const arrivalReported = kind === 'arrive' && Boolean((await store.get(id))?.data.attendance?.reportedAt);
       const result = await update(id, data => {
         if (kind === 'arrive') {
           if (portal) requireThat(limaDateKey(data.visitAt) === limaDateKey(new Date()) && typeof input.titularPresente === 'boolean',
@@ -2025,6 +2141,8 @@ export async function makeApi(env, options = {}) {
         }
         throw new Problem('Acción no disponible.', 404);
       });
+      if (kind === 'arrive' && arrivalReported) await sendAttendanceConfirmation(result.order);
+      if (kind === 'no-show') await sendNoShowNotification(result.order);
       if (['counter', 'arrive'].includes(kind) && balance(result.order) === 0) await deliverPendingReceipts(result.order);
       if (kind === 'resolve') {
         await deliverPendingReceipts(result.order);

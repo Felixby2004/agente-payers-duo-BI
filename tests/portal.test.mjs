@@ -69,8 +69,8 @@ test('Portal OTP, caja y PDF operan con permisos separados y asistencia verifica
     assert.equal(order.total, 24000);
     async function approveDeposit(target) {
       const link = (await post('orders/' + target.id + '/link', {}, cashier)).data.intent;
-      assert.equal((await call('payment/' + link.id)).data.options.includes('yape'), true);
-      return post('payment/' + link.id, { outcome: 'approved', method: 'yape' });
+      assert.equal(Object.hasOwn((await call('payment/' + link.id)).data, 'options'), false);
+      return post('payment/' + link.id, { outcome: 'approved', method: 'checkout' });
     }
     await approveDeposit(order);
     await approveDeposit(other);
@@ -152,7 +152,7 @@ test('El anticipo reutiliza el enlace vigente, limita nuevas emisiones y vence d
       assert.equal(link.status, 200);
       assert.equal(link.data.intent.number, i);
       assert.equal((await post(endpoint, {})).data.intent.id, link.data.intent.id);
-      assert.equal((await post('payment/' + link.data.intent.id, { outcome: 'rejected', method: 'plin' })).status, 200);
+    assert.equal((await post('payment/' + link.data.intent.id, { outcome: 'rejected', method: 'checkout' })).status, 200);
     }
     assert.equal((await post(endpoint, {})).status, 409);
     const stored = await store.get(order.id);

@@ -71,7 +71,6 @@ function PublicPage({ type, token }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const [digitalMethod, setDigitalMethod] = useState('checkout');
   const [returnPaymentId, setReturnPaymentId] = useState(() => {
     if (type !== 'payment') return '';
     const query = new URLSearchParams(location.search);
@@ -121,18 +120,8 @@ function PublicPage({ type, token }) {
           ? 'Este pago ya figura registrado. No necesitas volver a pagar; puedes cerrar esta página.'
           : data.unusableReason === 'reservation_changed' ? 'La reserva cambió y este enlace dejó de estar activo. Consulta el estado actualizado en WhatsApp.'
             : 'Este enlace de pago venció. Solicita uno nuevo si todavía tienes un importe pendiente.'}</p>
-        : data.options ? <>
-          <label>Medio de pago<select value={digitalMethod} onChange={event => setDigitalMethod(event.target.value)}>
-            <option value="checkout">{data.mode === 'mercado_pago' ? 'Tarjeta · Mercado Pago de prueba' : 'Tarjeta de demostración'}</option>
-            {data.options.includes('yape') && <option value="yape">Yape simulado</option>}
-            {data.options.includes('plin') && <option value="plin">Plin simulado</option>}
-          </select></label>
-          {digitalMethod === 'checkout' && data.mode === 'mercado_pago' ? (data.checkoutUrl &&
-            <a className="button primary full" href={data.checkoutUrl} rel="noreferrer">Ir a Mercado Pago <ExternalLink size={17} /></a>)
-            : <div className="button-row"><button className="button primary" disabled={busy} onClick={() => simulate('approved', digitalMethod)}>Aprobar pago de prueba</button>
-              <button className="button outline" disabled={busy} onClick={() => simulate('rejected', digitalMethod)}>Simular rechazo</button></div>}
-        </> : data.mode === 'local' ? <>
-          <p>{data.method === 'plin' ? 'Plin simulado' : data.method === 'yape' ? 'Yape simulado' : 'Tarjeta de demostración'}. Elige el resultado para ensayar la confirmación del anticipo.</p>
+        : data.mode === 'local' ? <>
+          <p>Pago de demostración. Elige el resultado para ensayar la confirmación.</p>
           <div className="button-row"><button className="button primary" disabled={busy} onClick={() => simulate('approved')}>Aprobar pago de prueba</button>
             <button className="button outline" disabled={busy} onClick={() => simulate('rejected')}>Simular rechazo</button></div>
         </> : <>

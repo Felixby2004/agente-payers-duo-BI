@@ -18,6 +18,7 @@ export function defaults(config) {
     paymentRetryMinutes: 0,
     maxDepositLinks: 3,
     maxOpenReservationsPerPhone: 3,
+    minReservationNoticeMinutes: 120,
     visitReminder: true,
     firstVisitHours: 24,
     lastVisitHours: 3,
@@ -34,8 +35,6 @@ export function defaults(config) {
     internalAlerts: true,
     contactStart: '08:00',
     contactEnd: '22:00',
-    yapeDemo: true,
-    plinDemo: true,
     automaticConfirmation: true,
   };
 }
@@ -64,6 +63,7 @@ export function validateSettings(input, initial) {
     depositReminderMinutes: [1, 43200], firstVisitHours: [1, 168], lastVisitHours: [1, 168], counterAlertMinutes: [1, 1440],
     depositLinkExpiryMinutes: [1, 43200], paymentRetryMinutes: [0, 1440], maxDepositLinks: [1, 3],
     maxOpenReservationsPerPhone: [1, 100],
+    minReservationNoticeMinutes: [1, 43200],
     balanceLinkExpiryMinutes: [1, 1440], maxBalanceLinks: [1, 3], slotMinutes: [15, 240], capacityPerSlot: [1, 1000],
     autoCancelExpiredHours: [0, 720], depositRenewalsMax: [0, 10], renewDepositMinutes: [1, 43200],
     minRescheduleHours: [1, 720], maxCustomerReschedules: [0, 10], offerWindowDays: [1, 90] };

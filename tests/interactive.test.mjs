@@ -143,19 +143,17 @@ test('El agente usa botones, listas y CTA con ids seguros y fallback de texto', 
     assert.equal(out.length, 1);
     assert.equal(out[0].interactive.type, 'cta_url');
     assert.match(out[0].interactive.action.parameters.url, /^https:\/\/establo\.example\/pago\//);
-    assert.match(bodyOf(out[0]), /Yape.*Plin/);
+    assert.doesNotMatch(bodyOf(out[0]), /Yape|Plin/);
     stored = await findOrder(order.id);
     assert.equal(stored.incidents.length, 0);
     assert.equal(stored.payments.length, 0);
     assert.ok(stored.intents.length >= 1);
 
-    // Yape sigue disponible si la persona lo escribe.
+    // No ofrecer medios simulados que el local ya no acepta.
     out = await answer({ from: '51999999999', type: 'text', text: { body: 'Yape' } });
     assert.equal(out.length, 1);
-    assert.equal(out[0].interactive.type, 'cta_url');
-    assert.match(bodyOf(out[0]), /Anticipo listo/);
-    assert.match(out[0].interactive.action.parameters.display_text, /Yape/);
-    assert.match(out[0].interactive.action.parameters.url, /^https:\/\/establo\.example\/pago\//);
+    assert.equal(out[0].type, 'text');
+    assert.match(bodyOf(out[0]), /pago en línea.*Mercado Pago/i);
 
     // Ver saldo.
     out = await answer({ from: '51999999999', type: 'interactive', interactive: { type: 'button_reply',

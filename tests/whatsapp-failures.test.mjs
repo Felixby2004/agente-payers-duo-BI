@@ -22,7 +22,7 @@ function harness(api) {
 }
 
 test('La llegada no envía saldo y el fallo del envío manual abre incidencia para caja', async () => {
-  const env = { ...base, PAYERS_PORTAL: 'true' };
+  const env = { ...base, PAYERS_PORTAL: 'false' };
   const store = await openStore(readConfig(env), { memory: true });
   const api = await makeApi(env, { store });
   try {
@@ -31,9 +31,10 @@ test('La llegada no envía saldo y el fallo del envío manual abre incidencia pa
     const created = await call('orders', { method: 'POST', cookie: admin, body: { agreed: true, payer: 'Cliente', phone: '51911111111',
       consent: true, guests: 1, visitAt: new Date(Date.now() + 3600000).toISOString(), items: [{ name: 'Parrilla', price: 10000, quantity: 1 }] } });
     const link = (await call('orders/' + created.data.id + '/link', { method: 'POST', cookie: admin, body: {} })).data.intent;
-    await call('payment/' + link.id, { method: 'POST', body: { outcome: 'approved', method: 'yape' } });
+    const paid = await call('payment/' + link.id, { method: 'POST', body: { outcome: 'approved', method: 'checkout' } });
+    assert.equal(paid.status, 200, JSON.stringify(paid.data));
     const arrived = await call('orders/' + created.data.id + '/arrive', { method: 'POST', cookie: admin, body: { count: 1, titularPresente: true } });
-    assert.equal(arrived.status, 200);
+    assert.equal(arrived.status, 200, JSON.stringify(arrived.data));
     const current = (await store.get(created.data.id)).data;
     assert.equal(current.intents.filter(item => item.purpose === 'balance').length, 0);
     assert.equal(current.incidents.some(item => item.type === 'Envío del link de saldo pendiente'), false);
@@ -56,11 +57,11 @@ test('Pago rechazado con portal y ventana cerrada crea incidencia y el recordato
     const created = await call('orders', { method: 'POST', cookie: admin, body: { agreed: true, payer: 'Cliente', phone: '51911111111',
       consent: true, guests: 1, visitAt: new Date(Date.now() + 3 * 3600000).toISOString(), items: [{ name: 'Parrilla', price: 10000, quantity: 1 }] } });
     const link = (await call('orders/' + created.data.id + '/link', { method: 'POST', cookie: admin, body: {} })).data.intent;
-    const rejected = await call('payment/' + link.id, { method: 'POST', body: { outcome: 'rejected', method: 'plin' } });
+    const rejected = await call('payment/' + link.id, { method: 'POST', body: { outcome: 'rejected', method: 'checkout' } });
     assert.equal(rejected.status, 200, JSON.stringify(rejected.data));
     let current = (await store.get(created.data.id)).data;
     assert.ok(current.incidents.some(item => item.type === 'Aviso de pago no aprobado pendiente'), JSON.stringify(current.incidents));
-    await call('payment/' + link.id, { method: 'POST', body: { outcome: 'approved', method: 'yape' } });
+    await call('payment/' + link.id, { method: 'POST', body: { outcome: 'approved', method: 'checkout' } });
     const failed = await call('orders/' + created.data.id + '/message', { method: 'POST', cookie: admin, body: { type: 'visit' } });
     assert.equal(failed.status, 409);
     current = (await store.get(created.data.id)).data;
@@ -88,7 +89,7 @@ test('Recordatorio fallido reintenta tras 15 minutos, se entrega al abrir ventan
     const linked = await call('orders/' + created.data.id + '/link', { method: 'POST', cookie: admin, body: {} });
     assert.equal(linked.status, 200, JSON.stringify(linked.data));
     const link = linked.data.intent;
-    await call('payment/' + link.id, { method: 'POST', body: { outcome: 'approved', method: 'yape' } });
+    await call('payment/' + link.id, { method: 'POST', body: { outcome: 'approved', method: 'checkout' } });
     const row = await store.get(created.data.id);
     const key = 'visit:' + row.data.visitAt + ':last';
     row.data.reminders[key] = { at: new Date(Date.now() - 16 * 60000).toISOString(), status: 'failed', attempts: 1 };

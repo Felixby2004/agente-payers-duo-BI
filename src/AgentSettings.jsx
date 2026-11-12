@@ -1,39 +1,62 @@
 import { useEffect, useState } from 'react';
-import { Activity, MessageSquare, Save, Settings2, Trash2, CalendarDays } from 'lucide-react';
+import { Activity, MessageSquare, Save, Settings2, Trash2, CalendarDays, RotateCcw, CreditCard, Bell, CalendarClock, Users, RefreshCw, Zap } from 'lucide-react';
 import { api } from './client.mjs';
 import { visitText } from '../shared/orders.mjs';
 
-const numbers = [
-  ['deadlineMinutes', 'Vencimiento del anticipo (minutos)', 1, 43200],
-  ['autoCancelExpiredHours', 'Cancelar reservas sin pago (horas después del vencimiento; 0 desactiva)', 0, 720],
-  ['depositRenewalsMax', 'Renovaciones de plazo permitidas al cliente', 0, 10],
-  ['renewDepositMinutes', 'Duración del nuevo plazo (minutos)', 1, 43200],
-  ['depositLinkExpiryMinutes', 'Vigencia de cada enlace de anticipo (minutos)', 1, 43200],
-  ['paymentRetryMinutes', 'Espera para volver a emitir un enlace (minutos)', 0, 1440],
-  ['maxDepositLinks', 'Máximo de enlaces de anticipo por reserva', 1, 3],
-  ['maxOpenReservationsPerPhone', 'Máximo de reservas abiertas por cliente (últimos 30 días)', 1, 100],
-  ['depositReminderMinutes', 'Aviso de anticipo a los (minutos)', 1, 43200],
-  ['firstVisitHours', 'Primer aviso antes de la visita (horas)', 1, 168],
-  ['lastVisitHours', 'Segundo aviso antes de la visita (horas)', 1, 168],
-  ['graceMinutes', 'Tolerancia de llegada (minutos)', 0, 1440],
-  ['counterAlertMinutes', 'Aviso de saldo pendiente en caja (minutos)', 1, 1440],
-  ['balanceLinkExpiryMinutes', 'Vencimiento del link de saldo (minutos)', 1, 1440],
-  ['maxBalanceLinks', 'Máximo de links de saldo por reserva', 1, 3],
-  ['slotMinutes', 'Duración de cada franja (minutos)', 15, 240],
-  ['capacityPerSlot', 'Aforo por franja (personas)', 1, 1000],
-  ['minRescheduleHours', 'Margen mínimo para reprogramar (horas)', 1, 720],
-  ['maxCustomerReschedules', 'Máximo de cambios iniciados por cliente', 0, 10],
-  ['offerWindowDays', 'Días máximos ofrecidos para reprogramar', 1, 90],
+const fields = {
+  booking: [
+    ['minReservationNoticeMinutes', 'Anticipación mínima para nuevas reservas por WhatsApp (minutos)', 1, 43200],
+    ['deadlineMinutes', 'Vencimiento del anticipo (minutos)', 1, 43200],
+    ['autoCancelExpiredHours', 'Cancelar sin pago (horas después del vencimiento; 0 desactiva)', 0, 720],
+    ['depositRenewalsMax', 'Renovaciones de plazo permitidas al cliente', 0, 10],
+    ['renewDepositMinutes', 'Duración del nuevo plazo (minutos)', 1, 43200],
+    ['maxOpenReservationsPerPhone', 'Máximo de reservas abiertas por cliente (últimos 30 días)', 1, 100],
+  ],
+  deposit: [
+    ['depositLinkExpiryMinutes', 'Vigencia del enlace de anticipo (minutos)', 1, 43200],
+    ['paymentRetryMinutes', 'Espera para volver a emitir un enlace (minutos)', 0, 1440],
+    ['maxDepositLinks', 'Máximo de enlaces de anticipo por reserva', 1, 3],
+  ],
+  alerts: [
+    ['depositReminderMinutes', 'Recordatorio de anticipo después de (minutos)', 1, 43200],
+    ['firstVisitHours', 'Primer recordatorio de visita (horas antes)', 1, 168],
+    ['lastVisitHours', 'Segundo recordatorio de visita (horas antes)', 1, 168],
+    ['graceMinutes', 'Tolerancia de llegada (minutos)', 0, 1440],
+    ['counterAlertMinutes', 'Aviso de saldo pendiente en caja (minutos)', 1, 1440],
+  ],
+  balance: [
+    ['balanceLinkExpiryMinutes', 'Vigencia del enlace de saldo (minutos)', 1, 1440],
+    ['maxBalanceLinks', 'Máximo de enlaces de saldo por reserva', 1, 3],
+  ],
+  reschedule: [
+    ['minRescheduleHours', 'Anticipación mínima para reprogramar (horas)', 1, 720],
+    ['maxCustomerReschedules', 'Máximo de cambios iniciados por cliente', 0, 10],
+    ['offerWindowDays', 'Días máximos ofrecidos al reprogramar', 1, 90],
+  ],
+  availability: [
+    ['slotMinutes', 'Duración de cada franja (minutos)', 15, 240],
+    ['capacityPerSlot', 'Aforo por franja (personas)', 1, 1000],
+  ],
+};
+const toggleGroups = [
+  { group: 'alerts', items: [
+    ['reminders', 'Activar recordatorios por WhatsApp'],
+    ['initialRequest', 'Enviar solicitud de anticipo al registrar el pedido'],
+    ['depositReminder', 'Recordar el anticipo pendiente'],
+    ['visitReminder', 'Recordar las visitas confirmadas'],
+    ['internalAlerts', 'Alertar al personal por vencimiento, retraso o saldo pendiente'],
+  ] },
+  { group: 'reschedule', items: [
+    ['whatsappRescheduling', 'Permitir reprogramación automática por WhatsApp'],
+  ] },
 ];
-const toggles = [
-  ['reminders', 'Enviar recordatorios por WhatsApp'],
-  ['initialRequest', 'Enviar solicitud de anticipo al registrar el pedido'],
-  ['depositReminder', 'Recordar el anticipo pendiente'],
-  ['visitReminder', 'Recordar las visitas confirmadas'],
-  ['internalAlerts', 'Alertar al personal por vencimiento, retraso o saldo pendiente'],
-  ['yapeDemo', 'Ofrecer Yape simulado'],
-  ['plinDemo', 'Ofrecer Plin simulado'],
-  ['whatsappRescheduling', 'Permitir reprogramación automática por WhatsApp'],
+const settingGroups = [
+  ['Reservas y anticipos', 'Anticipación de nuevas reservas y reglas del primer pago.', 'booking', CalendarClock],
+  ['Enlaces de anticipo', 'Vigencia y cantidad de enlaces para el primer pago.', 'deposit', CreditCard],
+  ['Recordatorios y llegada', 'Cuándo se contacta al cliente y cuándo se avisa a caja.', 'alerts', Bell],
+  ['Saldo y comprobantes', 'Vigencia del enlace para pagar el saldo.', 'balance', CreditCard],
+  ['Reprogramación', 'Condiciones para cambiar la fecha de una reserva existente.', 'reschedule', RefreshCw],
+  ['Franjas y aforo', 'Duración y capacidad de cada horario disponible.', 'availability', Users],
 ];
 const states = { queued: 'En espera', processing: 'Procesando', done: 'Procesado', failed: 'Requiere revisión' };
 const weekdays = [['mon', 'Lunes'], ['tue', 'Martes'], ['wed', 'Miércoles'], ['thu', 'Jueves'], ['fri', 'Viernes'], ['sat', 'Sábado'], ['sun', 'Domingo']];
@@ -59,7 +82,8 @@ export function AgentSettings({ config, onSave }) {
   const [blockForm, setBlockForm] = useState({ kind: 'day', local_date: today(), startTime: '12:00', endTime: '13:00', reason: '' });
   const [blockError, setBlockError] = useState('');
   const [error, setError] = useState('');
-  const change = (key, value) => setDraft(v => ({ ...v, [key]: value }));
+  const [notice, setNotice] = useState('');
+  const change = (key, value) => { setNotice(''); setDraft(v => ({ ...v, [key]: value })); };
   async function refresh() {
     try { setStatus(await api('agent/activity')); setActivityError(''); }
     catch (e) { setActivityError(e.message); }
@@ -81,11 +105,41 @@ export function AgentSettings({ config, onSave }) {
     event.preventDefault();
     setBusy(true);
     setError('');
+    setNotice('');
     try {
       const next = await api('agent/settings', { ...draft, depositPerPerson: Math.round(Number(draft.rate) * 100) });
       onSave(next);
+      setNotice('Configuración guardada.');
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
+  }
+  function restoreDefaults() {
+    const base = config.settingsDefaults;
+    if (!base) { setError('No se pudieron cargar los valores predeterminados. Actualiza el panel e inténtalo de nuevo.'); return; }
+    setError('');
+    setDraft({ ...structuredClone(base), rate: Number(base.depositPerPerson) / 100 });
+    setNotice('Valores predeterminados cargados. El horario volverá al horario amplio de demostración (00:00–23:59); revísalo antes de guardar.');
+  }
+  function prepareQuickTest() {
+    setError('');
+    setDraft(value => ({ ...value,
+      minReservationNoticeMinutes: 5,
+      deadlineMinutes: 30,
+      depositLinkExpiryMinutes: 30,
+      depositReminderMinutes: 1,
+      counterAlertMinutes: 1,
+      balanceLinkExpiryMinutes: 30,
+      firstVisitHours: 2,
+      lastVisitHours: 1,
+      reminders: true,
+      initialRequest: true,
+      depositReminder: true,
+      visitReminder: true,
+      contactStart: '00:00',
+      contactEnd: '23:59',
+      slotMinutes: 15,
+    }));
+    setNotice('Prueba rápida cargada en el formulario. Revisa el horario de hoy y pulsa “Guardar configuración”; los cambios afectan todas las reservas mientras estén activos.');
   }
   async function saveBlock(event) {
     event.preventDefault(); setBlockError('');
@@ -100,31 +154,44 @@ export function AgentSettings({ config, onSave }) {
   return <>
     <section className="panel form-panel">
       <div className="panel-head"><div><h2>Agente y alertas</h2>
-        <p>Los avisos consultan estas reglas al ejecutarse. Links de saldo y constancias se automatizan según el estado del pedido.</p></div>
+        <p>Configura por separado reservas, cobros, recordatorios, reprogramaciones y aforo. Los avisos toman estas reglas en cada ciclo.</p></div>
         <span className="label-chip"><Settings2 size={14} /> {config.agent === 'n8n' ? 'Orquestación n8n' : 'Modo servidor'}</span></div>
       <form onSubmit={save}>
-        <div className="form-grid">
-          <label>Anticipo por persona (S/)<input type="number" min="0.01" max="1000" step="0.01" required value={draft.rate}
-            onChange={e => change('rate', e.target.value)} /></label>
-          {numbers.map(([key, name, min, max]) => <label key={key}>{name}
-            <input type="number" required min={min} max={max} value={draft[key]} onChange={e => change(key, e.target.value === '' ? '' : Number(e.target.value))} />
-          </label>)}
-          <label>Inicio de avisos (hora de Lima)<input type="time" required value={draft.contactStart} onChange={e => change('contactStart', e.target.value)} /></label>
-          <label>Fin de avisos (hora de Lima)<input type="time" required value={draft.contactEnd} onChange={e => change('contactEnd', e.target.value)} /></label>
-          {toggles.map(([key, label]) => <label className="check" key={key}><input type="checkbox" checked={draft[key]}
-            onChange={e => change(key, e.target.checked)} />{label}</label>)}
-        </div>
-        <section className="action-panel"><h3><CalendarDays size={18} /> Horario semanal de atención</h3>
-          <p>El aforo se calcula por franja en personas; la hora se interpreta en Lima.</p>
-          {weekdays.map(([day, label]) => { const hours = draft.weeklySchedule?.[day]; return <div className="action-line" key={day}>
-            <label className="check"><input type="checkbox" checked={Boolean(hours)} onChange={e => change('weeklySchedule', { ...draft.weeklySchedule, [day]: e.target.checked ? { open: '00:00', close: '23:59' } : null })} />{label}</label>
-            {hours && <><label>Apertura<input type="time" value={hours.open} onChange={e => change('weeklySchedule', { ...draft.weeklySchedule, [day]: { ...hours, open: e.target.value } })} /></label>
-              <label>Cierre<input type="time" value={hours.close} onChange={e => change('weeklySchedule', { ...draft.weeklySchedule, [day]: { ...hours, close: e.target.value } })} /></label></>}
-          </div>; })}
-        </section>
+        {settingGroups.map(([title, description, group, Icon]) => <section className="action-panel settings-group" key={group}>
+          <h3><Icon size={18} /> {title}</h3><p>{description}</p>
+          <div className="settings-grid">
+            {group === 'booking' && <label>Anticipo por persona (S/)<input type="number" min="0.01" max="1000" step="0.01" required value={draft.rate}
+              onChange={e => change('rate', e.target.value)} /></label>}
+            {fields[group].map(([key, name, min, max]) => <label key={key}>{name}
+              <input type="number" required min={min} max={max} value={draft[key]} onChange={e => change(key, e.target.value === '' ? '' : Number(e.target.value))} />
+              {key === 'minReservationNoticeMinutes' && <small>Predeterminado: 120. Para probar una reserva cercana, redúcelo temporalmente y restáuralo al terminar.</small>}
+            </label>)}
+            {group === 'alerts' && <>
+              <label>Inicio de avisos (hora de Lima)<input type="time" required value={draft.contactStart} onChange={e => change('contactStart', e.target.value)} /></label>
+              <label>Fin de avisos (hora de Lima)<input type="time" required value={draft.contactEnd} onChange={e => change('contactEnd', e.target.value)} /></label>
+            </>}
+            {toggleGroups.filter(item => item.group === group)
+              .flatMap(item => item.items).map(([key, label]) => <label className="check" key={key}><input type="checkbox" checked={draft[key]}
+                onChange={e => change(key, e.target.checked)} />{label}</label>)}
+          </div>
+          {group === 'availability' && <div className="weekly-schedule">
+            <h4><CalendarDays size={17} /> Horario semanal de atención</h4>
+            <p>La disponibilidad usa este horario junto con las franjas, el aforo y los bloqueos.</p>
+            {weekdays.map(([day, label]) => { const hours = draft.weeklySchedule?.[day]; return <div className="action-line" key={day}>
+              <label className="check"><input type="checkbox" checked={Boolean(hours)} onChange={e => change('weeklySchedule', { ...draft.weeklySchedule, [day]: e.target.checked ? { open: '00:00', close: '23:59' } : null })} />{label}</label>
+              {hours && <><label>Apertura<input type="time" value={hours.open} onChange={e => change('weeklySchedule', { ...draft.weeklySchedule, [day]: { ...hours, open: e.target.value } })} /></label>
+                <label>Cierre<input type="time" value={hours.close} onChange={e => change('weeklySchedule', { ...draft.weeklySchedule, [day]: { ...hours, close: e.target.value } })} /></label></>}
+            </div>; })}
+          </div>}
+        </section>)}
         <div className="config-footer">
           {error && <p className="error" role="alert">{error}</p>}
-          <button className="button primary" disabled={busy}><Save size={16} />{busy ? 'Guardando…' : 'Guardar configuración del agente'}</button>
+          {notice && <p className="inline-note" role="status">{notice}</p>}
+          <div className="agent-settings-actions">
+            <button type="button" className="button outline" disabled={busy} onClick={prepareQuickTest}><Zap size={16} /> Preparar prueba rápida (30 min)</button>
+            <button type="button" className="button outline" disabled={busy} onClick={restoreDefaults}><RotateCcw size={16} /> Volver a valores predeterminados</button>
+            <button className="button primary" disabled={busy}><Save size={16} />{busy ? 'Guardando…' : 'Guardar configuración del agente'}</button>
+          </div>
         </div>
       </form>
     </section>
