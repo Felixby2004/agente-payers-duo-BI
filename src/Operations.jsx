@@ -100,13 +100,12 @@ export function Register({ config, created, notify }) {
         <section className="panel form-panel"><div className="panel-head"><div><h2>Detalle del pedido</h2><p>Usa los precios pactados con el cliente.</p></div></div>
           <div className="items-toolbar"><select aria-label="Producto de carta" value={product} onChange={e => setProduct(e.target.value)}>
             {menu.map((item, i) => <option key={item.name} value={i}>{item.name} · {money(item.price)}</option>)}
-          </select><button type="button" className="button outline" onClick={() => set('items', [...form.items, { ...menu[Number(product)], quantity: 1 }])}><Plus size={16} /> Añadir</button>
-          <button type="button" className="text-button" onClick={() => set('items', [...form.items, { name: '', price: 0, quantity: 1 }])}>Otro producto</button></div>
+          </select><button type="button" className="button outline" onClick={() => set('items', [...form.items, { ...menu[Number(product)], quantity: 1 }])}><Plus size={16} /> Añadir</button></div>
           {!form.items.length ? <Empty icon={ClipboardList} title="Agrega el primer producto" detail="Los importes se calcularán a partir de las líneas del pedido." /> :
             <div className="item-rows with-discount">{form.items.map((item, i) => <div className="item-row" key={i}>
-              <label>Producto<input required value={item.name} onChange={e => changeItem(i, 'name', e.target.value)} /></label>
+              <label>Producto<input required value={item.name} readOnly /></label>
               <label>Cantidad<input aria-label={'Cantidad de línea ' + (i + 1)} required type="number" min="1" max="100" value={item.quantity} onChange={e => changeItem(i, 'quantity', e.target.value === '' ? '' : Number(e.target.value))} /></label>
-              <label>Precio S/<input aria-label={'Precio de línea ' + (i + 1)} required type="number" min="0" max="10000" step="0.01" value={item.price === '' ? '' : item.price / 100} onChange={e => changeItem(i, 'price', e.target.value === '' ? '' : Math.round(Number(e.target.value) * 100))} /></label>
+              <label>Precio S/<input aria-label={'Precio de línea ' + (i + 1)} required type="number" value={item.price / 100} readOnly /></label>
               <label>Descuento S/<input aria-label={'Descuento total de línea ' + (i + 1)} type="number" min="0"
                 max={(Number(item.price || 0) * Number(item.quantity || 0)) / 100} step="0.01" value={item.discount == null ? '' : item.discount / 100}
                 onChange={e => changeItem(i, 'discount', e.target.value === '' ? undefined : Math.round(Number(e.target.value) * 100))} /></label>
@@ -238,8 +237,8 @@ export function Detail({ order, config, close, reload, notify }) {
               <a className="button primary" href={'/pago/' + activeLink.id} target="_blank" rel="noreferrer">Abrir pago de prueba <ExternalLink size={15} /></a>
               <button className="button outline" onClick={() => copyLink(activeLink)}><Copy size={16} /> Copiar enlace</button></>
               : expired ? <button className="button outline" disabled={Boolean(busy) || depositDue(order) <= 0} onClick={() => {
-                if (confirm('¿Confirmas que el cupo sigue disponible para renovar el plazo?')) run('renew', {}, 'Plazo renovado.');
-              }}>Renovar plazo</button> : <button className="button primary" disabled={Boolean(busy) || depositDue(order) <= 0} onClick={() => run('link', { method: depositMethod }, 'Enlace de anticipo preparado.')}>Generar enlace</button>}
+                if (confirm('¿Confirmas que el cupo sigue disponible para reabrir el plazo?')) run('renew', {}, 'Plazo reabierto.');
+              }}>Reabrir plazo</button> : <button className="button primary" disabled={Boolean(busy) || depositDue(order) <= 0} onClick={() => run('link', { method: depositMethod }, 'Enlace de anticipo preparado.')}>Generar enlace</button>}
               {config.whatsapp === 'cloud' && <button className="button outline" disabled={Boolean(busy) || expired || depositDue(order) <= 0} onClick={() => run('message', { type: 'deposit', method: depositMethod }, 'WhatsApp aceptó el envío.')}><MessageCircle size={16} /> Enviar anticipo</button>}</div>
             {config.paymentMode === 'mercado_pago' && <div className="action-line"><input aria-label="Número de operación de Mercado Pago" value={paymentId} onChange={e => setPaymentId(e.target.value)} placeholder="N.º de operación" />
               <button className="button outline" disabled={Boolean(busy) || !paymentId} onClick={() => run('sync', { paymentId }, 'Consulta de pago completada.')}>Consultar pago</button></div>}

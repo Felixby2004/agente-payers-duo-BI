@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { openStore } from '../server/store.mjs';
 import { createOrder } from '../server/domain.mjs';
-import { checkRescheduleEligibility, defaultWeeklySchedule, getAvailableSlots, limaDateKey, limaDateTime } from '../server/availability.mjs';
+import { checkRescheduleEligibility, defaultWeeklySchedule, getAvailableSlots, getDayOccupancy, limaDateKey, limaDateTime } from '../server/availability.mjs';
 import { limits, parseAction, rescheduleDaysMessage, rescheduleTimesMessage } from '../server/interactive.mjs';
 
 const dayAfter = (days) => new Date(Date.now() + days * 86400000).toLocaleDateString('en-CA', { timeZone: 'America/Lima' });
@@ -122,5 +122,88 @@ test('El RPC bloquea al cliente sin disponibilidad, pero permite el cambio manua
     assert.equal((await store.get(order.id)).data.visitAt, order.visitAt);
     const moved = await store.rescheduleAtomic(order.id, target, settings, false, 'Operador', order.visitAt);
     assert.equal(moved.data.visitAt, target);
+  } finally { await store.close(); }
+});
+
+const sqlAvailabilitySettings = () => ({
+  weeklySchedule: defaultWeeklySchedule(), slotMinutes: 60, capacityPerSlot: 1,
+  minRescheduleHours: 24, maxCustomerReschedules: 2, offerWindowDays: 30,
+  whatsappRescheduling: true, availabilityConfigured: true,
+  deadlineMinutes: 60, renewDepositMinutes: 90, depositRenewalsMax: 1,
+});
+
+function sqlOrder(visitAt, phone) {
+  return createOrder({ agreed: true, payer: 'Reserva de prueba', phone, guests: 1, visitAt,
+    items: [{ name: 'Prueba', price: 10000, quantity: 1 }] }, { depositPerPerson: 2000, deadlineMs: 3600000 });
+}
+
+test('El aforo excluye vencidas sin pagos, pero conserva las que tienen anticipo pagado (servidor y RPC)', async () => {
+  const settings = sqlAvailabilitySettings(), date = dayAfter(4), now = new Date();
+  const slot = limaDateTime(date, '12:00');
+  const expiredUnpaid = sqlOrder(slot, '51911111111');
+  expiredUnpaid.deadline = new Date(Date.now() - 3600000).toISOString();
+  const expiredPaid = sqlOrder(slot, '51911111112');
+  expiredPaid.deadline = new Date(Date.now() - 3600000).toISOString();
+  expiredPaid.payments = [{ ref: 'MP-PAID', purpose: 'deposit', amount: expiredPaid.deposit, at: now.toISOString() }];
+
+  const free = getAvailableSlots({ orders: [expiredUnpaid], settings, fromDate: date, toDate: date, now });
+  assert.ok(free.flatMap(day => day.slots).some(candidate => candidate.time === '12:00'));
+  const full = getDayOccupancy({ orders: [expiredPaid], blocks: [], settings, date });
+  assert.equal(full.slots.find(candidate => candidate.time === '12:00').occupied, 1);
+
+  const store = await openStore({ env: {} }, { memory: true });
+  try {
+    const movingUnpaid = sqlOrder(limaDateTime(date, '13:00'), '51911111113');
+    movingUnpaid.stage = 'confirmed';
+    movingUnpaid.payments = [{ ref: 'MP-MOVE-1', purpose: 'deposit', amount: movingUnpaid.deposit, at: now.toISOString() }];
+    await store.insert(expiredUnpaid);
+    await store.insert(movingUnpaid);
+    const moved = await store.rescheduleAtomic(movingUnpaid.id, slot, settings, false, 'Cliente', movingUnpaid.visitAt);
+    assert.equal(moved.changed, true, 'el RPC debe ignorar la reserva vencida sin pagos al calcular el cupo');
+
+    const paidDate = dayAfter(5), paidSlot = limaDateTime(paidDate, '12:00');
+    const paidStale = sqlOrder(paidSlot, '51911111114');
+    paidStale.deadline = new Date(Date.now() - 3600000).toISOString();
+    paidStale.payments = [{ ref: 'MP-PAID-RPC', purpose: 'deposit', amount: paidStale.deposit, at: now.toISOString() }];
+    const movingPaid = sqlOrder(limaDateTime(paidDate, '13:00'), '51911111115');
+    movingPaid.stage = 'confirmed';
+    movingPaid.payments = [{ ref: 'MP-MOVE-2', purpose: 'deposit', amount: movingPaid.deposit, at: now.toISOString() }];
+    await store.insert(paidStale);
+    await store.insert(movingPaid);
+    await assert.rejects(store.rescheduleAtomic(movingPaid.id, paidSlot, settings, false, 'Cliente', movingPaid.visitAt), /cupo/i,
+      'una reserva vencida con pago debe seguir ocupando el aforo');
+  } finally { await store.close(); }
+});
+
+test('Renovar escribe deadline ISO UTC y rechaza p_phone nulo; renovación y reprogramación compiten por el mismo cupo', async () => {
+  const store = await openStore({ env: {} }, { memory: true });
+  try {
+    const settings = sqlAvailabilitySettings(), date = dayAfter(4), now = new Date();
+    const target = limaDateTime(date, '12:00');
+    const expired = sqlOrder(target, '51922222221');
+    expired.deadline = new Date(Date.now() - 3600000).toISOString();
+    await store.insert(expired);
+    await assert.rejects(store.renewDepositAtomic(expired.id, settings, 'Cliente', expired.visitAt, null), /número/i,
+      'NULL no debe omitir la verificación del teléfono del cliente');
+    const renewed = await store.renewDepositAtomic(expired.id, settings, 'Cliente', expired.visitAt, expired.phone);
+    assert.match(renewed.data.deadline, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    assert.ok(Number.isFinite(Date.parse(renewed.data.deadline)));
+    assert.match(renewed.data.events.at(-1).at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+
+    const raceDate = dayAfter(6), raceTarget = limaDateTime(raceDate, '12:00');
+    const raceExpired = sqlOrder(raceTarget, '51922222222');
+    raceExpired.deadline = new Date(Date.now() - 3600000).toISOString();
+    const mover = sqlOrder(limaDateTime(raceDate, '13:00'), '51922222223');
+    mover.stage = 'confirmed';
+    mover.payments = [{ ref: 'MP-RACE', purpose: 'deposit', amount: mover.deposit, at: now.toISOString() }];
+    await store.insert(raceExpired);
+    await store.insert(mover);
+    const results = await Promise.allSettled([
+      store.renewDepositAtomic(raceExpired.id, settings, 'Cliente', raceExpired.visitAt, raceExpired.phone),
+      store.rescheduleAtomic(mover.id, raceTarget, settings, false, 'Cliente', mover.visitAt),
+    ]);
+    assert.equal(results.filter(result => result.status === 'fulfilled').length, 1,
+      'solo una operación debe reservar el último cupo de la franja');
+    assert.equal(results.filter(result => result.status === 'rejected').length, 1);
   } finally { await store.close(); }
 });

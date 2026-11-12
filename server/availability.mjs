@@ -1,4 +1,5 @@
 import { Problem, requireThat } from './domain.mjs';
+import { depositDue } from '../shared/orders.mjs';
 
 const DAY_KEYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 const ACTIVE = new Set(['awaiting_deposit', 'confirmed', 'arrived', 'paid']);
@@ -61,6 +62,8 @@ export function getAvailableSlots({ orders = [], blocks = [], settings, fromDate
       const startAt = limaDateTime(key, time), startMs = +new Date(startAt), endMs = startMs + duration * MINUTE;
       if (startMs <= +now || blocks.some(block => overlaps(block, startMs, endMs, key))) continue;
       const occupied = orders.filter(order => order.id !== excludeOrderId && ACTIVE.has(order.stage)
+        && !(order.stage === 'awaiting_deposit' && +new Date(order.deadline) <= +new Date(now)
+          && (order.payments || []).length === 0)
         && Number.isFinite(+new Date(order.visitAt)) && +new Date(order.visitAt) >= startMs && +new Date(order.visitAt) < endMs)
         .reduce((sum, order) => sum + Number(order.guests || 0), 0);
       if (capacity - occupied >= guests) slots.push({ date: key, time, visitAt: startAt, remaining: capacity - occupied });
@@ -79,7 +82,10 @@ export function getDayOccupancy({ orders = [], blocks = [], settings, date }) {
   for (let minutes = oh * 60 + om; minutes + duration <= ch * 60 + cm; minutes += duration) {
     const time = `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`;
     const start = +new Date(limaDateTime(date, time)), end = start + duration * MINUTE;
-    const occupied = orders.filter(order => ACTIVE.has(order.stage) && +new Date(order.visitAt) >= start && +new Date(order.visitAt) < end)
+    const occupied = orders.filter(order => ACTIVE.has(order.stage)
+      && !(order.stage === 'awaiting_deposit' && +new Date(order.deadline) <= Date.now()
+        && (order.payments || []).length === 0)
+      && +new Date(order.visitAt) >= start && +new Date(order.visitAt) < end)
       .reduce((sum, order) => sum + Number(order.guests || 0), 0);
     slots.push({ time, occupied, capacity, blocked: blocks.some(block => overlaps(block, start, end, date)) });
   }
@@ -90,6 +96,8 @@ export function checkRescheduleEligibility(order, settings, fromPhone = null, no
   requireThat(settings.whatsappRescheduling, 'La reprogramación por WhatsApp está desactivada.', 409);
   requireThat(availabilityConfigured(settings), 'La disponibilidad aún no está configurada. El personal te ayudará con el cambio.', 409);
   requireThat(['awaiting_deposit', 'confirmed'].includes(order.stage), 'Esta reserva ya no se puede reprogramar por WhatsApp.', 409);
+  if (order.stage === 'awaiting_deposit' && depositDue(order) > 0)
+    requireThat(+new Date(order.deadline) > +new Date(now), 'El plazo del anticipo venció. Renueva el plazo o cancela la reserva antes de cambiar la fecha.', 409);
   if (fromPhone !== null) requireThat(String(order.phone) === String(fromPhone), 'Esta reserva no pertenece a este número.', 403);
   const remaining = +new Date(order.visitAt) - +now;
   requireThat(remaining >= Number(settings.minRescheduleHours) * 3600000, `Solo puedes cambiar la visita con al menos ${settings.minRescheduleHours} horas de anticipación.`, 409);

@@ -8,7 +8,7 @@ $pidsFile = Join-Path $demoDirectory 'pids.json'
 try {
   if (-not (Test-Path -LiteralPath $pidsFile -PathType Leaf)) {
     Write-Host 'No hay procesos de la demo registrados en .demo/pids.json.'
-    Write-Host 'El archivo .env se dejó sin cambios. La próxima ejecución de start-demo.ps1 pondrá direcciones nuevas.'
+    Write-Host 'El archivo .env se dejó sin cambios. ngrok mantiene el mismo dominio entre arranques.'
     exit 0
   }
 
@@ -36,6 +36,12 @@ try {
       Write-Warning ('Se omitió el PID {0}: ahora pertenece a otra ejecución.' -f $processId)
       continue
     }
+    if (($entry.processName -eq 'cloudflared') -or ($entry.name -match 'cloudflared')) {
+      if ($process.ProcessName -ne 'cloudflared') {
+        Write-Warning ('Entrada antigua de cloudflared PID {0}: el proceso ya no se llama cloudflared; no se detuvo.' -f $processId)
+        continue
+      }
+    }
 
     Write-Host ('Deteniendo solo el proceso registrado PID {0} y sus hijos...' -f $processId)
     $null = & $taskkill.Source /PID $processId /T /F 2>&1
@@ -46,7 +52,7 @@ try {
 
   Remove-Item -LiteralPath $pidsFile -Force
   Write-Host 'Se eliminó .demo/pids.json.'
-  Write-Host 'El archivo .env se dejó sin cambios. La próxima ejecución de start-demo.ps1 pondrá direcciones nuevas.'
+  Write-Host 'El archivo .env se dejó sin cambios. ngrok mantiene el mismo dominio entre arranques.'
 } catch {
   Write-Error ('No se pudieron detener los procesos de la demo: {0}' -f $_.Exception.Message)
   exit 1

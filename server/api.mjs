@@ -9,9 +9,10 @@ import { reportKinds, reportPdf } from './reports.mjs';
 import { completeSettings, contactTime, defaults, validateSettings } from './agent-settings.mjs';
 import { balance, depositDue, money, terminal, stageLabels } from '../shared/orders.mjs';
 import { displayText, emojis, friendlyDate, parseAction, reservationFocus, reservationMenu, reservationPrompt, reservationList,
-  paymentCta, balancePaymentCta, paymentRejectedCta, receiptCta, confirmationCta, requestMessage, noReservationMessage, reservationHelpMessage,
-  reservationRequest, parseReservation, reservationKey, reservationConfirmation, reservationRepeatedMessage, rescheduleDaysMessage,
-  rescheduleTimesMessage, rescheduleConfirmMessage, texts } from './interactive.mjs';
+  paymentCta, balancePaymentCta, paymentRejectedCta, receiptCta, paymentReceiptCta, confirmationCta, requestMessage, noReservationMessage,
+  customerMainMenu, customerReservationsEmptyMessage, reservationInstructionsMessage, reservationRequest, reservationListRequest,
+  parseReservation, reservationKey, reservationConfirmation, reservationRepeatedMessage, rescheduleDaysMessage,
+  rescheduleTimesMessage, rescheduleConfirmMessage, cancelReservationConfirmMessage, buttonsMessage, texts } from './interactive.mjs';
 import { Problem, requireThat, createOrder, addEvent, openIssue, applyPayment, arrive, recordCounterPayment, issueReceipt, reschedule, endReservation, digits } from './domain.mjs';
 import { availabilityConfigured, checkRescheduleEligibility, getAvailableSlots, getDayOccupancy, isSlotBlocked, limaDateKey, limaDateTime, limaFormatDay, validateSlotInput } from './availability.mjs';
 
@@ -47,7 +48,7 @@ export async function makeApi(env, options = {}) {
   const config = readConfig(env);
   const store = options.store || await openStore(config, options);
   const service = providers(config);
-  const portal = config.portalEnabled ? createPortal(config, store, service, options) : null;
+  const portal = config.portalEnabled ? createPortal(config, store, service, { ...options, sessionOpen, isOptedOut: optedOut }) : null;
   const portalUrl = config.publicUrl + '/cliente';
   const portalText = 'Consulta tus pedidos, reservas, carta y comprobantes en el portal de El Establo: ' + portalUrl;
   const ai = agentAI(config, service);
@@ -66,6 +67,26 @@ export async function makeApi(env, options = {}) {
   const reservationListRepliedAt = new Map();
   const seenMessages = new Set();
   const optOutPhrases = new Set(['stop', 'baja', 'darme de baja', 'no quiero mensajes']);
+  let lastN8nWakeWarningAt = 0;
+
+  function warnWakeFailure(message) {
+    const now = Date.now();
+    if (now - lastN8nWakeWarningAt < 60_000) return;
+    lastN8nWakeWarningAt = now;
+    console.warn(message);
+  }
+
+  function wakeN8n() {
+    if (config.orchestration !== 'n8n' || !config.env.N8N_WAKE_URL) return;
+    void Promise.resolve().then(() => fetch(config.env.N8N_WAKE_URL, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + config.env.N8N_AGENT_TOKEN },
+      redirect: 'error',
+      signal: AbortSignal.timeout(5000),
+    })).then(response => {
+      if (!response.ok) warnWakeFailure('No se pudo despertar n8n (HTTP ' + response.status + '); continuará el ciclo programado.');
+    }).catch(() => warnWakeFailure('No se pudo despertar n8n; continuará el ciclo programado.'));
+  }
 
   function rateCheck(phone) {
     const now = Date.now();
@@ -100,9 +121,10 @@ export async function makeApi(env, options = {}) {
     return Number(expiry) > Date.now() && matches(sign(expiry + '.' + nonce), signature);
   }
   const attempts = new Map();
+  const unsupportedTypeRepliedAt = new Map();
   const update = (id, apply) => updateOrder(store, id, apply);
   const linkFor = (intent) => config.publicUrl + '/pago/' + intent.id;
-  const receiptLink = (receipt) => portal ? portalUrl : config.publicUrl + '/comprobante/' + receipt.token;
+  const receiptLink = (receipt) => config.publicUrl + '/comprobante/' + receipt.token;
   const datePlus = (key, days) => new Date(+new Date(key + 'T12:00:00Z') + days * 86400000).toISOString().slice(0, 10);
   async function availableDays({ fromDate = limaDateKey(new Date()), toDate, guests = 1, excludeOrderId = null } = {}) {
     const rule = await settings();
@@ -121,6 +143,29 @@ export async function makeApi(env, options = {}) {
     const exact = days.flatMap(day => day.slots).some(slot => +new Date(slot.visitAt) === +new Date(visitAt));
     requireThat(exact || forceCapacity, 'Ese horario no tiene cupo suficiente o está bloqueado.', 409);
     return exact;
+  }
+  function reservationAvailabilityMessage(error, visitAt, guests, rule) {
+    if (!availabilityConfigured(rule)) return error.message;
+    if (Number(guests) > Number(rule.capacityPerSlot))
+      return `Ese grupo supera el máximo de ${rule.capacityPerSlot} personas por horario. Escribe 'hablar con alguien' para coordinarlo.`;
+    const local = new Date(+new Date(visitAt) - 5 * 3600000);
+    const key = local.toISOString().slice(0, 10), weekday = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'][local.getUTCDay()];
+    const hours = rule.weeklySchedule?.[weekday];
+    const day = new Intl.DateTimeFormat('es-PE', { timeZone: 'America/Lima', weekday: 'long' }).format(new Date(visitAt));
+    if (!hours) return `El ${day} el restaurante está cerrado según el horario de atención configurado.`;
+    const [oh, om] = hours.open.split(':').map(Number), [ch, cm] = hours.close.split(':').map(Number);
+    const duration = Number(rule.slotMinutes || 60), minute = local.getUTCHours() * 60 + local.getUTCMinutes();
+    if (minute < oh * 60 + om || minute + duration > ch * 60 + cm)
+      return `El horario de atención del ${day} es de ${hours.open} a ${hours.close}.`;
+    if ((minute - (oh * 60 + om)) % duration !== 0) {
+      const slots = [];
+      for (let value = oh * 60 + om; value + duration <= ch * 60 + cm; value += duration)
+        slots.push(String(Math.floor(value / 60)).padStart(2, '0') + ':' + String(value % 60).padStart(2, '0'));
+      return `La hora no coincide con las franjas del ${day}. Franjas válidas: ${slots.join(', ')}.`;
+    }
+    if (/bloquead/i.test(error.message)) return 'Ese horario no está disponible.';
+    if (/cerrado/i.test(error.message)) return `El horario de atención del ${day} es de ${hours.open} a ${hours.close}.`;
+    return 'No hay cupo en ese horario. Puedes volver a enviar el bloque con otra fecha u hora.';
   }
   function lock(id, execute) {
     const previous = locks.get(id) || Promise.resolve();
@@ -214,11 +259,19 @@ export async function makeApi(env, options = {}) {
     return 'https://www.mercadopago.com.pe/ccap/file-viewer/receipt?' + new URLSearchParams({
       flow: 'cow_payment_receipts', origin: 'feedback-screen', payment_id: payment.ref.slice(3) });
   }
+  function paymentForReceipt(order, receipt) {
+    const activePayments = order.payments.filter(item => item.amount > 0
+      && !order.payments.some(adjustment => adjustment.original === item.ref && adjustment.amount < 0));
+    return activePayments.find(item => item.ref === receipt.paymentRef)
+      || activePayments.find(item => receipt.intentId && item.intentId === receipt.intentId)
+      || activePayments.filter(item => (item.purpose || 'deposit') === receipt.purpose && item.amount === receipt.amount)
+        .sort((a, b) => +new Date(b.at || 0) - +new Date(a.at || 0))[0]
+      || null;
+  }
   const openPaymentIssue = order => order.incidents.some(item => !item.resolvedAt
     && ['Pago por revisar', 'Reverso por revisar'].includes(item.type));
-  async function deliverReceipt(order, receipt, { force = false, related = [] } = {}) {
-    const receipts = [receipt, ...related].filter(Boolean);
-    const keyList = receipts.map(item => item.token + ':' + item.purpose);
+  async function deliverReceipt(order, receipt, { force = false } = {}) {
+    const keyList = [receipt].map(item => item.token + ':' + item.purpose);
     const stamp = instant();
     const { result: claimed } = await update(order.id, data => {
       data.receiptDeliveries ||= {};
@@ -240,6 +293,9 @@ export async function makeApi(env, options = {}) {
       return;
     }
     const allPayments = order.payments.filter(item => item.amount > 0 && !order.payments.some(adjustment => adjustment.original === item.ref && adjustment.amount < 0));
+    const receiptPayment = receipt.purpose === 'settlement' ? null : paymentForReceipt(order, receipt);
+    const officialUrl = paymentReceiptUrl(receiptPayment);
+    const messageUrl = receipt.purpose !== 'settlement' && officialUrl ? officialUrl : receiptLink(receipt);
     const depositPayment = allPayments.find(item => (item.purpose || 'deposit') === 'deposit');
     const depositMethod = depositPayment?.channel === 'mercadopago' ? 'Mercado Pago'
       : depositPayment?.channel === 'cash' ? 'efectivo' : depositPayment?.channel === 'pos' ? 'POS'
@@ -247,14 +303,16 @@ export async function makeApi(env, options = {}) {
     const summary = receipt.purpose === 'deposit'
       ? 'Anticipo ' + money(receipt.amount) + ' · ' + depositMethod + ' · '
         + new Intl.DateTimeFormat('es-PE', { timeZone: 'America/Lima', dateStyle: 'short', timeStyle: 'short' }).format(new Date(depositPayment?.at || receipt.at))
-        + (paymentReceiptUrl(depositPayment) ? ' · Comprobante oficial: consultar en Mercado Pago' : '')
+        + (officialUrl ? ' · Comprobante oficial de Mercado Pago' : '')
       : (receipt.paymentBreakdown || []).map(item => (item.purpose === 'deposit' ? 'Anticipo' : 'Saldo') + ' ' + money(item.amount)
         + ' (' + (item.channel === 'mercadopago' ? 'Mercado Pago' : item.channel === 'cash' ? 'efectivo' : item.channel === 'pos' ? 'POS' : item.channel === 'wallet' ? 'billetera' : item.channel) + ')').join(' · ')
         + (allPayments.some(item => item.channel === 'mercadopago') ? ' · Comprobante oficial: consultar cada operación en Mercado Pago' : '');
     const amount = receipt.purpose === 'deposit' ? 'Anticipo ' + money(receipt.amount) : 'Total ' + money(order.total) + ' · ' + summary;
     const message = receipt.purpose === 'deposit'
-      ? confirmationCta(order, receiptLink(receipt), new Date(), paymentReceiptUrl(depositPayment) ? 'Comprobante oficial: consulta la operación en Mercado Pago.' : '')
-      : receiptCta(order, receiptLink(receipt), amount);
+      ? confirmationCta(order, messageUrl, new Date(), officialUrl ? 'Comprobante oficial de Mercado Pago.' : '')
+      : receipt.purpose === 'balance' && officialUrl
+        ? paymentReceiptCta(order, receipt, messageUrl)
+        : receiptCta(order, messageUrl, amount);
     try {
       if (config.waMode !== 'cloud') {
         await update(order.id, data => {
@@ -262,10 +320,14 @@ export async function makeApi(env, options = {}) {
           for (const key of keyList) Object.assign(data.receiptDeliveries[key], { status: 'simulated', at: instant(), messageId: null });
         });
       } else {
-        const result = await send(order, message, { template: receipt.purpose === 'deposit' ? 'confirmation' : 'settlement',
-          receiptToken: portal ? 'portal' : receipt.token, templateValues: receipt.purpose === 'deposit'
+        const template = receipt.purpose === 'deposit' && officialUrl ? 'confirmation'
+          : receipt.purpose === 'balance' && officialUrl ? 'balanceReceipt' : 'settlement';
+        const result = await send(order, message, { template,
+          receiptUrlSuffix: officialUrl ? receiptPayment.ref.slice(3) : receipt.token,
+          templateValues: template === 'confirmation'
             ? [order.payer, order.ref, friendlyDate(order.visitAt, new Date(), true), money(receipt.amount), summary]
-            : [order.payer, order.ref, money(order.total), amount] });
+            : template === 'balanceReceipt' ? [order.payer, order.ref, 'Saldo', money(receipt.amount)]
+              : [order.payer, order.ref, money(order.total), amount] });
         const outbound = result.chat.at(-1);
         await update(order.id, data => { for (const key of keyList) Object.assign(data.receiptDeliveries[key],
           { status: 'sent', at: outbound?.at || instant(), messageId: outbound?.id || null });
@@ -293,13 +355,9 @@ export async function makeApi(env, options = {}) {
       const result = await update(fresh.id, data => issueReceipt(data, 'settlement', token));
       fresh = result.order;
     }
-    const settlement = fresh.receipts.find(item => item.purpose === 'settlement');
-    const balanceReceipts = fresh.receipts.filter(item => item.purpose === 'balance');
-    if (settlement && balanceReceipts.length) await deliverReceipt(fresh, settlement, { related: balanceReceipts });
-    else {
-      const pending = fresh.receipts.find(item => !['sent', 'simulated', 'suppressed'].includes(fresh.receiptDeliveries?.[item.token + ':' + item.purpose]?.status));
-      if (pending) await deliverReceipt(fresh, pending);
-    }
+    const pending = fresh.receipts.filter(item => !['sent', 'simulated', 'suppressed'].includes(
+      fresh.receiptDeliveries?.[item.token + ':' + item.purpose]?.status));
+    for (const receipt of pending) await deliverReceipt(fresh, receipt);
   }
   async function registerReservation(phone, text, parsed, timestamp, messageId) {
     const excerpt = String(text || '').slice(0, 200);
@@ -311,9 +369,9 @@ export async function makeApi(env, options = {}) {
     if (!parsed.ok) return refuse(parsed.error);
 
     const value = parsed.value;
-    const payerPhone = value.phone || phone;
+    const payerPhone = phone;
     return lock('reservation:' + payerPhone, async () => {
-      const operator = payerPhone !== phone;
+      const operator = false;
       const rule = await settings();
       const previous = await store.phone(payerPhone);
       const key = reservationKey({ ...value, phone: payerPhone });
@@ -330,7 +388,9 @@ export async function makeApi(env, options = {}) {
         const age = now - +new Date(order.createdAt);
         return !terminal(order) && age >= 0 && age <= 30 * 86400000;
       });
-      if (open.length >= 3) return refuse(texts.reservationLimit);
+      if (open.length >= rule.maxOpenReservationsPerPhone) {
+        return refuse(texts.reservationLimit.replace('{limit}', String(rule.maxOpenReservationsPerPhone)));
+      }
 
       let order;
       try {
@@ -349,7 +409,7 @@ export async function makeApi(env, options = {}) {
       order.chat.push({ id: messageId, direction: 'in', from: phone, at: new Date(timestamp).toISOString(),
         text: String(text || '').slice(0, 1000) });
       try { await ensureAvailable(order.visitAt, order.guests, null, rule); }
-      catch (error) { return refuse('No se registró la reserva porque no hay disponibilidad para ese horario.'); }
+      catch (error) { return refuse(reservationAvailabilityMessage(error, order.visitAt, order.guests, rule)); }
       await store.insert(order);
 
       let intent = null;
@@ -378,6 +438,27 @@ export async function makeApi(env, options = {}) {
   async function replyWithoutReservation(phone, text, action) {
     const excerpt = String(text || '').slice(0, 200);
     let staff = action?.action === 'staff';
+    const bookingRequest = action?.action === 'book' || reservationRequest(text) || /^\s*RESERVA(?:\s|$)/i.test(String(text || ''));
+    if (bookingRequest) {
+      if (config.canReserve(phone)) await service.sendWhatsAppReply(phone, reservationInstructionsMessage());
+      else {
+        await store.noteQuery(phone, excerpt, true);
+        await service.sendWhatsAppReply(phone, texts.reservationUnavailable);
+      }
+      return;
+    }
+    if (action?.action === 'orders' || reservationListRequest(text)) {
+      await service.sendWhatsAppReply(phone, customerReservationsEmptyMessage());
+      return;
+    }
+    if (action?.action === 'menu' || isGreeting(text)
+      || new Set(['ayuda', 'menu', 'menu principal', 'inicio']).has(commandText(text))) {
+      const last = noReservationReplied.get(phone) || 0;
+      if (Date.now() - last < 12 * 3600000) return;
+      noReservationReplied.set(phone, Date.now());
+      await service.sendWhatsAppReply(phone, noReservationMessage());
+      return;
+    }
     // Los saludos y «ayuda» de un desconocido solo muestran el aviso, sin clasificar.
     const greeting = isGreeting(text) || new Set(['ayuda', 'menu', 'menu principal', 'inicio']).has(commandText(text));
     // Solo texto libre sin acción ni saludo: se evita clasificar pedidos de reserva y botones ajenos.
@@ -425,9 +506,16 @@ export async function makeApi(env, options = {}) {
       const text = balancePaymentCta(current, intent, linkFor(intent));
       const result = await send(current, text, { template: 'balance', intent, reply,
         templateValues: [current.payer, current.ref, money(intent.amount)] });
+      await update(order.id, data => {
+        for (const incident of data.incidents) if (incident.type === 'Envío del link de saldo pendiente'
+          && incident.key === 'balance-link-send' && !incident.resolvedAt) {
+          incident.resolvedAt = instant(); incident.resolution = 'El enlace se envió correctamente.';
+        }
+      });
       if (staff) return (await update(result.id, data => addEvent(data, 'Enlace de saldo enviado por caja', intent.id, staff.name))).order;
       return result;
     } catch (error) {
+      await update(order.id, data => openIssue(data, 'Envío del link de saldo pendiente', error.message, 'balance-link-send'));
       if (/máximo de enlaces/i.test(error.message)) await update(order.id, data => openIssue(data,
         'Máximo de enlaces de saldo alcanzado', 'No se generó otro enlace; el personal debe acercarse.', 'balance-link-limit'));
       throw error;
@@ -435,7 +523,6 @@ export async function makeApi(env, options = {}) {
   }
   async function autoPayOrder(order) {
     if (order.stage === 'arrived' && balance(order) > 0) {
-      if (portal) return sendReply(order, 'El saldo es ' + money(balance(order)) + '. Pide a caja que te envíe el enlace de pago.');
       return sendBalanceLink(order, { reply: true });
     }
     if (order.stage === 'awaiting_deposit' && depositDue(order) > 0) {
@@ -453,9 +540,16 @@ export async function makeApi(env, options = {}) {
   async function notifyRejectedPayment(order, rejectedIntent) {
     if (portal) {
       if (await sessionOpen(order.phone)) {
-        await sendReply(order, rejectedIntent.purpose === 'balance'
-          ? 'El pago fue rechazado. Pide a caja otro enlace si necesitas reintentar.'
-          : 'El pago fue rechazado. Escribe «anticipo» si quieres solicitar un nuevo enlace.');
+        try {
+          await sendReply(order, rejectedIntent.purpose === 'balance'
+            ? 'El pago fue rechazado. Pide a caja otro enlace si necesitas reintentar.'
+            : 'El pago fue rechazado. Escribe «anticipo» si quieres solicitar un nuevo enlace.');
+        } catch (error) {
+          await update(order.id, data => openIssue(data, 'Aviso de pago no aprobado pendiente', error.message, 'payment-rejected-notice:' + rejectedIntent.id));
+        }
+      } else {
+        await update(order.id, data => openIssue(data, 'Aviso de pago no aprobado pendiente',
+          'La ventana de WhatsApp está cerrada y no se envió el aviso. Pide al cliente que escriba «hola» para abrirla.', 'payment-rejected-notice:' + rejectedIntent.id));
       }
       return;
     }
@@ -465,7 +559,7 @@ export async function makeApi(env, options = {}) {
     const templateName = rejectedIntent.purpose === 'balance' ? config.env.WA_TEMPLATE_BALANCE : config.env.WA_TEMPLATE_PAYMENT_REJECTED;
     if (!activeSession && !templateName) {
       await update(order.id, data => openIssue(data, 'Aviso de pago no aprobado pendiente',
-        'Fuera de la ventana de WhatsApp se necesita una plantilla aprobada. Configura ' + (rejectedIntent.purpose === 'balance' ? 'WA_TEMPLATE_BALANCE.' : 'WA_TEMPLATE_PAYMENT_REJECTED.'), rejectedIntent.id));
+        'Fuera de la ventana de WhatsApp se necesita una plantilla aprobada. Configura ' + (rejectedIntent.purpose === 'balance' ? 'WA_TEMPLATE_BALANCE.' : 'WA_TEMPLATE_PAYMENT_REJECTED.'), 'payment-rejected-notice:' + rejectedIntent.id));
       return;
     }
     try {
@@ -477,7 +571,7 @@ export async function makeApi(env, options = {}) {
         await send(order, paymentRejectedCta(order, intent, linkFor(intent)), { template: 'paymentRejected', intent });
       }
     } catch (error) {
-      await update(order.id, data => openIssue(data, 'Aviso de pago no aprobado pendiente', error.message, rejectedIntent.id));
+      await update(order.id, data => openIssue(data, 'Aviso de pago no aprobado pendiente', error.message, 'payment-rejected-notice:' + rejectedIntent.id));
     }
   }
   async function notifyPaymentReview(order, payment) {
@@ -623,6 +717,11 @@ export async function makeApi(env, options = {}) {
     const summary = order.ref + ' · ' + stageLabels[order.stage] + '. Visita: '
       + friendlyDate(order.visitAt, new Date(), true) + '. Saldo: ' + money(balance(order)) + '.';
     const forced = typeof forcedIntent === 'string' ? { intent: forcedIntent, method: 'checkout' } : forcedIntent;
+    if (order.stage === 'cancelled' && forced?.intent !== 'receipt' && forced?.intent !== 'human') return reservationMenu(order);
+    if (order.stage === 'no_show' && forced?.intent !== 'receipt') {
+      await update(order.id, data => openIssue(data, 'Revisión de inasistencia solicitada por cliente', String(text || 'El cliente consultó una reserva marcada como no asistió.').slice(0, 500), 'no-show-customer:' + order.ref));
+      return reservationMenu(order);
+    }
     const { intent: intentType, method } = forced || await ai.classify(text);
     switch (intentType) {
       case 'link': {
@@ -674,6 +773,12 @@ export async function makeApi(env, options = {}) {
     const rule = await settings();
     try { checkRescheduleEligibility(order, rule, phone); }
     catch (error) {
+      if (order.stage === 'awaiting_deposit' && depositDue(order) > 0 && +new Date(order.deadline) <= Date.now()) {
+        return { response: buttonsMessage('El plazo del anticipo venció. Primero renueva el plazo o cancela la reserva *' + order.ref + '*.', [
+          { id: 'ren:' + order.ref, title: 'Pedir nuevo plazo' }, { id: 'can:' + order.ref, title: 'Cancelar reserva' },
+          { id: 'hum:' + order.ref, title: 'Hablar con alguien' },
+        ]) };
+      }
       await update(order.id, data => openIssue(data, 'Solicitud de reprogramación', error.message, 'reschedule:' + order.ref));
       return { response: '📅 No puedo reprogramar esta reserva: ' + error.message + ' Ya avisé al personal.' };
     }
@@ -687,6 +792,9 @@ export async function makeApi(env, options = {}) {
   }
 
   async function rescheduleReply(order, action, phone) {
+    const latest = (await store.get(order.id))?.data;
+    if (!latest || latest.phone !== phone) return { response: 'No pude validar esta reserva desde tu número. Escribe «ver mis reservas» para actualizar la lista.' };
+    order = latest;
     const rule = await settings();
     if (action.action === 'rsx') return { response: reservationMenu(order) };
     if (action.action === 'rsc') {
@@ -700,6 +808,12 @@ export async function makeApi(env, options = {}) {
     if (action.action === 'chg' || action.action === 'selc') return startReschedule(order, null, phone);
     try { checkRescheduleEligibility(order, rule, phone); }
     catch (error) {
+      if (order.stage === 'awaiting_deposit' && depositDue(order) > 0 && +new Date(order.deadline) <= Date.now()) {
+        return { response: buttonsMessage('El plazo del anticipo venció. Primero renueva el plazo o cancela la reserva *' + order.ref + '*.', [
+          { id: 'ren:' + order.ref, title: 'Pedir nuevo plazo' }, { id: 'can:' + order.ref, title: 'Cancelar reserva' },
+          { id: 'hum:' + order.ref, title: 'Hablar con alguien' },
+        ]) };
+      }
       await update(order.id, data => openIssue(data, 'Solicitud de reprogramación', error.message, 'reschedule:' + order.ref));
       return { response: '📅 No puedo reprogramar esta reserva: ' + error.message + ' Ya avisé al personal.' };
     }
@@ -748,6 +862,48 @@ export async function makeApi(env, options = {}) {
       chg: 'reprogramar', hum: 'ayuda' }[action];
     return replyTo(order, phrase || '', undefined, forced);
   }
+  async function renewDepositForCustomer(orderId, phone) {
+    const rule = await settings();
+    let current = (await store.get(orderId))?.data;
+    requireThat(current && current.phone === phone, 'Esta reserva no pertenece a este número.', 403);
+    requireThat(current.stage === 'awaiting_deposit' && +new Date(current.deadline) <= Date.now(), 'El anticipo ya no está vencido o la reserva cambió. Actualiza tus reservas.', 409);
+    requireThat(!(current.payments || []).length, 'La reserva ya tiene un pago registrado. El personal debe revisar el caso.', 409);
+    requireThat(Number(current.depositRenewals || 0) < rule.depositRenewalsMax, 'Ya pediste el nuevo plazo permitido para esta reserva. Hablaré con el personal.', 409);
+    requireThat(+new Date(current.visitAt) > Date.now() + 2 * 3600000, 'La visita debe estar a más de 2 horas para pedir un nuevo plazo.', 409);
+    requireThat(availabilityConfigured(rule), 'La disponibilidad no está configurada; el personal debe revisar el cupo antes de renovar.', 409);
+    await ensureAvailable(current.visitAt, current.guests, current.id, rule);
+    const saved = await store.renewDepositAtomic(current.id, rule, 'Cliente', current.visitAt, phone);
+    current = saved.data || saved;
+    try {
+      const intent = await checkout(current.id);
+      const fresh = (await store.get(current.id))?.data || current;
+      await send(fresh, paymentCta(fresh, intent, 'checkout', linkFor(intent), rule), { template: 'deposit', intent, reply: true });
+    } catch (error) {
+      await update(current.id, data => openIssue(data, 'Enlace de anticipo pendiente', error.message, 'renewed-deposit-link:' + current.id));
+      await sendReply(current, 'El plazo se renovó, pero no pude enviar el enlace de anticipo. Ya avisé al personal para que lo revise.');
+    }
+  }
+
+  async function cancelCustomerReservation(orderId, phone, confirm = false) {
+    const { data: current } = await store.get(orderId) || {};
+    requireThat(current && current.phone === phone, 'Esta reserva no pertenece a este número.', 403);
+    requireThat(current.stage === 'awaiting_deposit' && +new Date(current.deadline) <= Date.now(), 'Esta reserva ya cambió o el plazo sigue vigente. Actualiza tus reservas.', 409);
+    if ((current.payments || []).length) {
+      await update(orderId, data => openIssue(data, 'Solicitud de cancelación o devolución', 'El cliente pidió cancelar una reserva con pagos registrados.', 'customer-cancel:' + orderId));
+      return buttonsMessage('La reserva tiene un pago registrado. No haré una devolución ni la cancelaré automáticamente; ya avisé al personal.', [
+        { id: 'hum:' + current.ref, title: 'Hablar con alguien' },
+      ]);
+    }
+    if (!confirm) return cancelReservationConfirmMessage(current);
+    const { result } = await update(orderId, data => {
+      requireThat(data.phone === phone && data.stage === 'awaiting_deposit' && +new Date(data.deadline) <= Date.now() && !(data.payments || []).length,
+        'La reserva cambió o tiene un pago registrado. Actualiza tus reservas.', 409);
+      data.stage = 'cancelled';
+      addEvent(data, 'Reserva cancelada por el cliente', 'Cancelación confirmada por WhatsApp.', 'Cliente');
+      return true;
+    });
+    return result ? 'La reserva ' + current.ref + ' quedó cancelada.' : reservationMenu(current);
+  }
   async function reportArrival(phone, orders, ref, timestamp, messageId, text) {
     const eligible = orders.filter(order => ['confirmed', 'arrived', 'paid', 'closed'].includes(order.stage)
       && limaDateKey(order.visitAt) === limaDateKey(new Date(timestamp)) && (!ref || ref === order.ref));
@@ -777,6 +933,7 @@ export async function makeApi(env, options = {}) {
     const timestamp = Number(message.timestamp) * 1000;
     if (!Number.isFinite(timestamp) || timestamp < Date.now() - 24 * 3600000 || timestamp > Date.now() + 60000) return;
     if (seenMessages.has(message.id)) return;
+    if (message.type === 'reaction') return;
     seenMessages.add(message.id);
     if (seenMessages.size > 5000) seenMessages.delete(seenMessages.values().next().value);
 
@@ -785,7 +942,8 @@ export async function makeApi(env, options = {}) {
     const action = parseAction(reply?.id);
     let text = String(message.text?.body || message.interactive?.button_reply?.title || message.interactive?.list_reply?.title
       || message.button?.text || attachment?.caption || '').slice(0, 1000);
-    if (!text && !attachment) return;
+    const unsupportedType = ['sticker', 'location', 'contacts', 'contact'].includes(message.type);
+    if (!text && !attachment && !unsupportedType) return;
     // Los saludos antiguos no deben producir menús atrasados tras una caída o una cola acumulada.
     if (isGreeting(text) && Date.now() - timestamp > 90_000) {
       console.info('WhatsApp: se omitió un saludo atrasado; ageSeconds=' + Math.round((Date.now() - timestamp) / 1000));
@@ -812,9 +970,17 @@ export async function makeApi(env, options = {}) {
       if (rate.warn) await service.sendWhatsAppReply(phone, texts.rate);
       return;
     }
+    if (unsupportedType) {
+      const previous = unsupportedTypeRepliedAt.get(phone) || 0;
+      if (timestamp - previous >= 3600000) {
+        unsupportedTypeRepliedAt.set(phone, timestamp);
+        await service.sendWhatsAppReply(phone, 'Solo puedo leer mensajes de texto e imágenes de comprobantes.');
+      }
+      return;
+    }
 
     // Alta por mensaje estructurado: solo cuando el modo lo permite y la palabra RESERVA abre el texto.
-    if (config.canReserve(phone)) {
+    if (config.canReserve(phone) && !attachment) {
       const reservation = parseReservation(text);
       if (reservation) {
         await registerReservation(phone, text, reservation, timestamp, message.id);
@@ -826,7 +992,20 @@ export async function makeApi(env, options = {}) {
     // inicia el restaurante exigen order.consent y un número no dado de baja.
     const orders = await store.phone(phone);
     const ref = text.match(/\bEST-[a-f0-9]{8}\b/i)?.[0]?.toUpperCase();
-    if (portal && (action?.action === 'rcp' || wantsPortal(text) || /^(?:comprobante|constancia|portal|carta)$/.test(command))) {
+    const wantsOrders = action?.action === 'orders' || reservationListRequest(text);
+    // La consulta de reservas prevalece sobre el detector genérico del portal.
+    // Se muestra siempre la lista dentro de WhatsApp, incluso si solo hay una reserva.
+    if (wantsOrders) {
+      if (!orders.length) return replyWithoutReservation(phone, text, action);
+      const recipient = reservationFocus(orders) || orders[0];
+      await update(recipient.id, data => {
+        if (!data.chat.some(item => item.id === message.id)) data.chat.push({ id: message.id, from: phone,
+          direction: 'in', at: new Date(timestamp).toISOString(), text });
+      });
+      await sendReply((await store.get(recipient.id))?.data || recipient, reservationList(orders));
+      return;
+    }
+    if (portal && !wantsOrders && (action?.action === 'rcp' || wantsPortal(text) || /^(?:comprobante|constancia|portal|carta)$/.test(command))) {
       return service.sendWhatsAppReply(phone, portalText);
     }
     const ownsRef = !ref || orders.some(order => order.ref === ref);
@@ -846,7 +1025,7 @@ export async function makeApi(env, options = {}) {
     }
 
     let proof, mediaError;
-    if (attachment) {
+    if (attachment && ['image', 'audio'].includes(message.type)) {
       try {
         if (message.type === 'document') throw new Problem('Documento recibido para revisión del personal.');
         const result = await ai.readMedia(message.type, attachment.id);
@@ -856,11 +1035,11 @@ export async function makeApi(env, options = {}) {
       } catch (error) { mediaError = error.message; }
     }
 
-    if (portal && (action?.action === 'sela' || isArrivalReport(text))) {
+    if (!attachment && (action?.action === 'sela' || isArrivalReport(text))) {
       return reportArrival(phone, orders, action?.ref || ref, timestamp, message.id, text);
     }
-    if (portal && attachment && !proof && wantsPortal(text)) return service.sendWhatsAppReply(phone, portalText);
-    const promise = portal && !proof && !action ? paymentPromise(text, new Date(timestamp)) : null;
+    if (!attachment && portal && wantsPortal(text)) return service.sendWhatsAppReply(phone, portalText);
+    const promise = portal && !attachment && !proof && !action ? paymentPromise(text, new Date(timestamp)) : null;
     if (promise) {
       const unpaid = candidates.filter(item => item.stage === 'awaiting_deposit' && depositDue(item) > 0);
       if (unpaid.length > 1) return service.sendWhatsAppReply(phone, 'Indica la referencia de la reserva y repite la hora en el mismo mensaje.');
@@ -890,6 +1069,19 @@ export async function makeApi(env, options = {}) {
     });
     if (!isNew) return;
 
+    // Los adjuntos solo abren una revisión. El texto extraído de una imagen no ejecuta acciones.
+    if (attachment && ['image', 'document'].includes(message.type)) {
+      const reviewDetails = proof ? [
+        'Datos visibles extraídos para revisión manual.',
+        'Importe: ' + (proof.amount || 'ilegible'),
+        'Operación: ' + (proof.operation || 'ilegible'),
+        'Medio: ' + (proof.provider || 'sin identificar'),
+      ].join(' · ') : 'El adjunto requiere revisión del personal.';
+      await update(order.id, data => openIssue(data, 'Adjunto por revisar', mediaError || reviewDetails, message.id));
+      await sendReply(order, 'Recibí el adjunto para ' + order.ref + '. El personal lo revisará; las imágenes no actualizan pagos ni reservas.');
+      return;
+    }
+
     // El botón sin referencia solo existe para derivar al personal.
     if (action?.action === 'staff') {
       await update(order.id, data => openIssue(data, 'Ayuda del personal', text.slice(0, 500) || message.id));
@@ -897,10 +1089,28 @@ export async function makeApi(env, options = {}) {
       return;
     }
 
-    // El agente no ofrece ni gestiona reservas nuevas: deriva al personal con un texto fijo.
-    if (reservationRequest(text)) {
-      await update(order.id, data => openIssue(data, 'Ayuda del personal', text.slice(0, 500) || message.id));
-      await sendReply(order, reservationHelpMessage());
+    const bookingRequest = action?.action === 'book' || reservationRequest(text) || /^\s*RESERVA(?:\s|$)/i.test(text);
+    if (bookingRequest) {
+      if (config.canReserve(phone)) await sendReply(order, reservationInstructionsMessage());
+      else {
+        await update(order.id, data => openIssue(data, 'Ayuda del personal', text.slice(0, 500) || message.id));
+        await sendReply(order, texts.reservationUnavailable);
+      }
+      return;
+    }
+    if (action?.action === 'menu' || isGreeting(text)
+      || new Set(['ayuda', 'menu', 'menu principal', 'inicio']).has(command)) {
+      // Un saludo abre el menú principal; la lista se muestra solo cuando el cliente la solicita.
+      await sendReply(reservationFocus(orders) || order, customerMainMenu());
+      return;
+    }
+    if (order.stage === 'cancelled' && !['rcp', 'hum'].includes(action?.action)) {
+      await sendReply(order, reservationMenu(order));
+      return;
+    }
+    if (order.stage === 'no_show' && action?.action !== 'rcp') {
+      await update(order.id, data => openIssue(data, 'Revisión de inasistencia solicitada por cliente', text.slice(0, 500) || 'Consulta del cliente.', 'no-show-customer:' + order.ref));
+      await sendReply(order, reservationMenu(order));
       return;
     }
 
@@ -911,7 +1121,7 @@ export async function makeApi(env, options = {}) {
       let response;
       const exactChange = new Set(['reprogramar', 'cambiar fecha']).has(command);
       const inChangeFlow = ['chg', 'selc', 'rsd', 'rsm', 'rsh', 'rst', 'rsc', 'rsx'].includes(action?.action);
-      if ((action?.action === 'chg' || (!action && exactChange)) && active.length > 1) {
+      if ((action?.action === 'chg' || (!action && exactChange)) && active.length > 1 && !target) {
         response = reservationList(active, new Date(), 'selc');
         recipient = reservationFocus(orders) || order;
       } else if (inChangeFlow || (!action && exactChange)) {
@@ -919,11 +1129,28 @@ export async function makeApi(env, options = {}) {
         recipient = selected;
         const result = await rescheduleReply(selected, action || { action: 'chg' }, phone);
         response = result.next?.response || result.response;
+      } else if (target && action?.action === 'ren') {
+        try { await renewDepositForCustomer(target.id, phone); return; }
+        catch (error) {
+          await update(target.id, data => openIssue(data, 'Solicitud de renovación de anticipo', error.message, 'renewal:' + target.id));
+          response = 'No pude renovar el plazo: ' + error.message + ' Ya avisé al personal.';
+        }
+      } else if (target && action?.action === 'can') {
+        try { response = await cancelCustomerReservation(target.id, phone, false); }
+        catch (error) { response = 'No pude continuar: ' + error.message; }
+      } else if (target && action?.action === 'cnf') {
+        try { response = await cancelCustomerReservation(target.id, phone, true); }
+        catch (error) { response = 'No pude cancelar la reserva: ' + error.message; }
+      } else if (target && action?.action === 'cx') {
+        response = reservationMenu((await store.get(target.id))?.data || target);
       } else if (action?.action === 'payb' || action?.action === 'selb') {
-        const selected = target || order;
+        const selected = (target && (await store.get(target.id))?.data) || target || order;
+        if (selected.phone !== phone) { response = 'No pude validar esta reserva desde tu número. Escribe «ver mis reservas» para actualizar la lista.'; }
+        else {
         recipient = selected;
         await autoPayOrder(selected);
         return;
+        }
       } else if (!action && balanceDetailsRequest && textTarget) {
         recipient = textTarget;
         response = await replyTo(textTarget, text, undefined, 'balance');
@@ -943,7 +1170,11 @@ export async function makeApi(env, options = {}) {
       } else if (action?.action === 'sel') {
         response = target ? reservationMenu(target) : reservationPrompt(orders);
         recipient = target || reservationFocus(orders) || order;
-      } else if (target) response = await actionReply(target, action.action);
+      } else if (target) {
+        const latest = (await store.get(target.id))?.data;
+        if (!latest || latest.phone !== phone) response = 'No pude validar esta reserva desde tu número. Escribe «ver mis reservas» para actualizar la lista.';
+        else response = await actionReply(latest, action.action);
+      }
       else if (!ref && orders.length > 1) {
         if (isGreeting(text)) {
           const previous = reservationListRepliedAt.get(phone) || 0;
@@ -1032,28 +1263,88 @@ export async function makeApi(env, options = {}) {
     try { return await processAlerts(); }
     finally { alertsRunning = false; }
   }
+  function reminderStillRelevant(order, plan, rule, now, claimedAttempt = null) {
+    if (!order || order.stage !== plan.snapshot.stage || order.stage !== plan.order.stage
+      || order.visitAt !== plan.snapshot.visitAt || order.deadline !== plan.snapshot.deadline
+      || (order.attendance?.at || null) !== plan.snapshot.attendanceAt
+      || (order.attendance?.reportedAt || null) !== plan.snapshot.attendanceReportedAt
+      || depositDue(order) !== plan.snapshot.depositDue || balance(order) !== plan.snapshot.balance
+      || !contactTime(rule, new Date(now))) return false;
+    if (claimedAttempt !== null) {
+      const claim = order.reminders?.[plan.key];
+      if (claim?.status !== 'pending' || claim.attempts !== claimedAttempt) return false;
+    }
+    const before = +new Date(order.visitAt) - now;
+    if (plan.reason === 'visit') {
+      const key = 'visit:' + order.visitAt + ':' + (before <= rule.lastVisitHours * 3600000 ? 'last' : 'first');
+      return rule.visitReminder && order.stage === 'confirmed' && !order.attendance?.at && !order.attendance?.reportedAt
+        && before > 0 && before <= rule.firstVisitHours * 3600000 && balance(order) > 0 && key === plan.key;
+    }
+    if (order.stage !== 'awaiting_deposit' || depositDue(order) <= 0 || +new Date(order.deadline) <= now) return false;
+    const promise = portal && order.depositPromise;
+    if (plan.reason === 'promise') return Boolean(promise && promise.messageId === plan.snapshot.promiseMessageId
+      && +new Date(promise.at) <= now && +new Date(promise.muteUntil) > now && plan.key === 'promise:' + promise.messageId);
+    if (portal && +new Date(order.depositPromise?.muteUntil) > now) return false;
+    if (plan.reason === 'initial') {
+      const latestLink = [...order.chat].reverse().find(message => message.direction === 'out'
+        && (message.paymentLink || message.text?.includes('/pago/')));
+      return rule.initialRequest && !latestLink && plan.key === 'initial:' + order.deadline;
+    }
+    if (plan.reason === 'deposit') {
+      const latestLink = [...order.chat].reverse().find(message => message.direction === 'out'
+        && (message.paymentLink || message.text?.includes('/pago/')));
+      const initialKey = 'initial:' + order.deadline;
+      const lastRequest = latestLink?.at || order.reminders?.[initialKey]?.at || order.createdAt;
+      return rule.depositReminder && now - +new Date(lastRequest) >= rule.depositReminderMinutes * 60000
+        && plan.key === 'deposit:' + order.deadline;
+    }
+    return false;
+  }
+  async function skipStaleReminder(plan) {
+    await update(plan.order.id, data => {
+      const current = data.reminders?.[plan.key];
+      if (current?.status === 'pending' && current.attempts === plan.attempt) {
+        current.status = 'skipped'; current.at = instant();
+      }
+    });
+  }
+  async function skipStaleClaims(plans) {
+    for (const plan of plans) await skipStaleReminder(plan);
+  }
   async function processAlerts() {
     const rule = await settings();
     const now = Date.now();
     const orders = await store.list();
-    let sent = 0, escalated = 0, attempted = 0;
+    let sent = 0, escalated = 0, attempted = 0, retriedThisCycle = false;
     for (const order of orders) {
       if (terminal(order)) continue;
+      const cancelHours = Number(rule.autoCancelExpiredHours ?? 24);
+      if (cancelHours > 0 && order.stage === 'awaiting_deposit' && (order.payments || []).length === 0
+        && now >= +new Date(order.deadline) + cancelHours * 3600000) {
+        const { result: cancelled } = await update(order.id, data => {
+          if (data.stage !== 'awaiting_deposit' || (data.payments || []).length !== 0
+            || now < +new Date(data.deadline) + cancelHours * 3600000) return false;
+          data.stage = 'cancelled';
+          addEvent(data, 'Cancelada por falta de anticipo', 'El plazo venció hace al menos ' + cancelHours + ' horas y no había pagos registrados.');
+          return true;
+        });
+        if (cancelled) {
+          escalated++;
+          const fresh = (await store.get(order.id))?.data;
+          try {
+            if (fresh?.phone && config.waMode === 'cloud' && config.isPhoneAllowed(fresh.phone)
+              && !config.isPhoneBlocked(fresh.phone) && !(await optedOut(fresh.phone)) && await sessionOpen(fresh.phone)) {
+              await send(fresh, 'La reserva ' + fresh.ref + ' se canceló porque venció el plazo del anticipo sin pagos.', { reply: true });
+            }
+          } catch { /* El evento deja constancia; si la ventana no admite respuesta, no se escala ni se usa plantilla. */ }
+          continue;
+        }
+      }
       const before = +new Date(order.visitAt) - now;
       const issue = order.stage === 'awaiting_deposit' && now >= +new Date(order.deadline) ? ['Anticipo vencido', 'Revisa el pago y el cupo antes de renovar.', 'deadline:' + order.deadline]
         : order.stage === 'confirmed' && before <= -rule.graceMinutes * 60000 ? ['Verificar llegada', 'Pasó la tolerancia. Recepción debe verificar si asistió.', 'arrival:' + order.visitAt]
           : order.stage === 'arrived' && balance(order) > 0 && now - +new Date(order.attendance.at) >= rule.counterAlertMinutes * 60000
             ? ['Saldo por verificar', 'El cliente ya llegó y caja aún no confirmó el saldo.', 'counter:' + order.attendance.at] : null;
-      if (portal && issue?.[0] === 'Anticipo vencido' && rule.cancelExpiredDeposits !== false
-        && depositDue(order) > 0 && !depositNeedsReview(order)) {
-        const result = await update(order.id, data => {
-          if (data.stage !== 'awaiting_deposit' || +new Date(data.deadline) > now
-            || depositDue(data) <= 0 || depositNeedsReview(data)) return false;
-          endReservation(data, 'cancelled', 'Venció el plazo del anticipo.', 0);
-          return true;
-        });
-        if (result.result) { escalated++; continue; }
-      }
       if (rule.internalAlerts && issue && !order.incidents.some(i => i.key === issue[2])) {
         const { result: created } = await update(order.id, data => {
           if (data.stage === order.stage && data.deadline === order.deadline && data.visitAt === order.visitAt && !data.incidents.some(i => i.key === issue[2])) {
@@ -1099,13 +1390,22 @@ export async function makeApi(env, options = {}) {
         const promise = portal && order.depositPromise;
         const promised = needsDeposit && promise && +new Date(promise.at) <= now && +new Date(promise.muteUntil) > now;
         const muted = promisedDay;
-        const initial = withinHours && !muted && rule.initialRequest && needsDeposit && !latestLink && !order.reminders[initialKey];
+        const initial = withinHours && !muted && rule.initialRequest && needsDeposit && !latestLink;
         const sinceRequest = now - +new Date(latestLink?.at || order.reminders[initialKey]?.at || order.createdAt);
         const deposit = withinHours && !muted && rule.depositReminder && needsDeposit && sinceRequest >= rule.depositReminderMinutes * 60000;
         const visit = withinHours && rule.visitReminder && !order.attendance?.reportedAt && order.stage === 'confirmed' && before > 0 && before <= rule.firstVisitHours * 3600000;
+        const reason = promised ? 'promise' : initial ? 'initial' : deposit ? 'deposit' : visit ? 'visit' : null;
         const key = promised ? 'promise:' + promise.messageId : initial ? initialKey : deposit ? 'deposit:' + order.deadline
           : visit ? 'visit:' + order.visitAt + ':' + (before <= rule.lastVisitHours * 3600000 ? 'last' : 'first') : null;
-        if (key && !order.reminders[key]) plans.push({ order, key, kind: promised || initial || deposit ? 'deposit' : 'visit', promised });
+        const previous = key && order.reminders[key];
+        const retryable = previous?.status === 'failed' && (previous.attempts || 1) < 3
+          && now - +new Date(previous.at) >= 15 * 60000;
+        if (key && (!previous || retryable)) plans.push({ order, key, reason,
+          kind: promised || initial || deposit ? 'deposit' : 'visit', promised, retry: Boolean(previous),
+          snapshot: { stage: order.stage, visitAt: order.visitAt, deadline: order.deadline,
+            attendanceAt: order.attendance?.at || null, attendanceReportedAt: order.attendance?.reportedAt || null,
+            depositDue: depositDue(order), balance: balance(order), promiseMessageId: promise?.messageId || null,
+            previousAt: previous?.at || null, previousAttempts: previous?.attempts || (previous ? 1 : 0) } });
       }
       if (!plans.length) continue;
 
@@ -1118,14 +1418,24 @@ export async function makeApi(env, options = {}) {
       const chosenPlans = priority ? [priority] : paymentAlert ? deposits : visits;
       const claimed = [];
       for (const plan of chosenPlans) {
+        if (plan.retry && retriedThisCycle) continue;
         const { result: didClaim } = await update(plan.order.id, data => {
-          if (data.reminders[plan.key] || data.stage !== plan.order.stage || data.visitAt !== plan.order.visitAt
-            || data.deadline !== plan.order.deadline || (plan.promised && data.depositPromise?.messageId !== plan.order.depositPromise?.messageId)
-            || (!plan.promised && plan.kind === 'deposit' && +new Date(data.depositPromise?.muteUntil) > now)) return false;
-          data.reminders[plan.key] = { at: instant(), status: 'pending' };
+          const previous = data.reminders[plan.key];
+          const retryable = previous?.status === 'failed' && (previous.attempts || 1) < 3
+            && now - +new Date(previous.at) >= 15 * 60000;
+          if (plan.retry
+            ? !retryable || previous.at !== plan.snapshot.previousAt
+              || (previous.attempts || 1) !== plan.snapshot.previousAttempts
+            : Boolean(previous)) return false;
+          if (!reminderStillRelevant(data, plan, rule, Date.now())) return false;
+          plan.attempt = (previous?.attempts || (previous ? 1 : 0)) + 1;
+          data.reminders[plan.key] = { at: instant(), status: 'pending', attempts: plan.attempt };
           return true;
         });
-        if (didClaim) claimed.push(plan);
+        if (didClaim) {
+          claimed.push(plan);
+          if (plan.retry) retriedThisCycle = true;
+        }
       }
       if (!claimed.length) continue;
       attempted++;
@@ -1133,16 +1443,26 @@ export async function makeApi(env, options = {}) {
       try {
         const activeSession = await sessionOpen(phone);
         let current = (await store.get(messagePlan.order.id))?.data;
+        if (!reminderStillRelevant(current, messagePlan, rule, Date.now(), messagePlan.attempt)) {
+          await skipStaleClaims(claimed);
+          continue;
+        }
         const pendingPayments = group.filter(order => order.consent && order.stage === 'awaiting_deposit'
           && depositDue(order) > 0 && now < +new Date(order.deadline));
 
-        if (paymentAlert && !messagePlan.promised && activeSession && pendingPayments.length > 1) {
+        if (paymentAlert && !messagePlan.promised && activeSession && pendingPayments.length > 1
+          && claimed.length === chosenPlans.length) {
           const freshOrders = await store.phone(phone);
           const currentPayments = freshOrders.filter(order => order.consent && order.stage === 'awaiting_deposit'
             && depositDue(order) > 0 && now < +new Date(order.deadline));
+          current = (await store.get(messagePlan.order.id))?.data;
+          if (!reminderStillRelevant(current, messagePlan, rule, Date.now(), messagePlan.attempt)) {
+            await skipStaleClaims(claimed);
+            continue;
+          }
           await send(current, reservationList(currentPayments, new Date(now)));
           for (const plan of claimed) await update(plan.order.id, data => {
-            if (data.reminders[plan.key]?.status === 'pending') data.reminders[plan.key].status = 'sent';
+            if (data.reminders[plan.key]?.status === 'pending' && data.reminders[plan.key].attempts === plan.attempt) data.reminders[plan.key].status = 'sent';
           });
           for (const plan of visits) await update(plan.order.id, data => {
             if (!data.reminders[plan.key]) data.reminders[plan.key] = { at: instant(), status: 'skipped' };
@@ -1156,20 +1476,36 @@ export async function makeApi(env, options = {}) {
           try { intent = await checkout(current.id); }
           catch (error) {
             if (!messagePlan.promised || !activeSession || error.status !== 409) throw error;
+            current = (await store.get(current.id))?.data;
+            if (!reminderStillRelevant(current, messagePlan, rule, Date.now(), messagePlan.attempt)) {
+              await skipStaleClaims(claimed);
+              continue;
+            }
             await send(current, 'Es la hora acordada para revisar el anticipo de ' + current.ref + '. Si necesitas otro enlace, comunícate con caja.');
           }
           if (intent) {
             current = (await store.get(current.id))?.data;
+            if (!reminderStillRelevant(current, messagePlan, rule, Date.now(), messagePlan.attempt)) {
+              await skipStaleClaims(claimed);
+              continue;
+            }
             await send(current, paymentCta(current, intent, 'checkout', linkFor(intent), rule), { template: 'deposit', intent });
           }
         } else {
+          current = (await store.get(current.id))?.data;
+          if (!reminderStillRelevant(current, messagePlan, rule, Date.now(), messagePlan.attempt)) {
+            await skipStaleClaims(claimed);
+            continue;
+          }
           const visit = emojis.visit + ' *Próxima visita*\nReserva: *' + current.ref + '*\n'
             + friendlyDate(current.visitAt, new Date(now), true) + '\nSaldo en el local: *' + money(balance(current)) + '*';
           await send(current, visit, { template: 'visit' });
         }
 
         for (const plan of claimed) await update(plan.order.id, data => {
-          if (data.reminders[plan.key]?.status === 'pending') data.reminders[plan.key].status = plan === messagePlan ? 'sent' : 'skipped';
+          if (data.reminders[plan.key]?.status === 'pending' && data.reminders[plan.key].attempts === plan.attempt) {
+            data.reminders[plan.key].status = plan === messagePlan ? 'sent' : 'skipped';
+          }
         });
         const secondary = paymentAlert ? visits : chosenPlans.slice(1);
         for (const plan of secondary) await update(plan.order.id, data => {
@@ -1178,9 +1514,13 @@ export async function makeApi(env, options = {}) {
         sent++;
       } catch (error) {
         for (const plan of claimed) await update(plan.order.id, data => {
-          if (data.reminders[plan.key]?.status === 'pending') data.reminders[plan.key].status = plan === messagePlan ? 'failed' : 'skipped';
+          if (data.reminders[plan.key]?.status === 'pending') {
+            data.reminders[plan.key].status = plan === messagePlan ? 'failed' : 'skipped';
+            data.reminders[plan.key].at = instant();
+          }
         });
-        await update(messagePlan.order.id, data => openIssue(data, 'Recordatorio pendiente', error.message, messagePlan.key));
+        if (messagePlan.attempt >= 3) await update(messagePlan.order.id, data => openIssue(data,
+          'Recordatorio pendiente', 'No se pudo entregar tras 3 intentos. Último motivo: ' + error.message, 'reminder:' + messagePlan.key));
       }
     }
     return { sent, escalated };
@@ -1282,9 +1622,9 @@ export async function makeApi(env, options = {}) {
         const queuedMessages = queue.filter(job => job.kind === 'message').length;
         const queuedStatuses = queue.length - queuedMessages;
         if (queue.length) console.info('WhatsApp webhook: mensajes=' + queuedMessages + '; estados=' + queuedStatuses);
-        // Atiende la cola desde el servidor en cuanto Meta entrega el webhook. n8n
-        // conserva la programación de alertas, pero no media la respuesta conversacional.
-        // Las pruebas con store en memoria vacían la cola explícitamente para evitar carreras.
+        if (queue.length) wakeN8n();
+        // PAYERS y el workflow pueden reclamar la misma cola a la vez; store.claim es atómico.
+        // El drenado directo mantiene la respuesta aun cuando n8n esté apagado.
         if (queue.length && !options.memory) void drainInbox().then(result => {
           if (result.failed) console.error('WhatsApp: falló el procesamiento de ' + result.failed + ' elemento(s) de la cola.');
         }).catch(error => console.error('WhatsApp: no se pudo vaciar la cola:', error.message));
@@ -1377,17 +1717,20 @@ export async function makeApi(env, options = {}) {
         });
         if (result.confirmed) await notifyConfirmation(order);
         else if (purpose === 'balance' && result.status === 'approved') await deliverPendingReceipts(order);
+        else if (result.status === 'rejected') {
+          const rejectedIntent = order.intents.find(item => item.id === intent.id);
+          if (rejectedIntent) await notifyRejectedPayment(order, rejectedIntent);
+        }
         return json(res, 200, { status: result.status });
       }
     }
     const publicReceipt = path.match(/^\/api\/receipt\/([a-f0-9-]+)$/);
     if (publicReceipt && isGet && uuid.test(publicReceipt[1])) {
-      const user = portal ? await portal.session(req) : null;
-      if (portal) requireThat(user, 'Inicia sesión para ver la constancia.', 401);
       const order = await store.find('receipts', { token: publicReceipt[1] });
-      requireThat(order && (user?.role !== 'client' || user.phone === order.phone), 'Comprobante no encontrado.', 404);
+      // El token aleatorio de la constancia es el acceso directo compartido por WhatsApp.
+      requireThat(order, 'Comprobante no encontrado.', 404);
       const receipt = order.receipts.find(r => r.token === publicReceipt[1]);
-      const payment = order.payments.filter(item => item.channel === 'mercadopago' && item.purpose === receipt.purpose
+      const payment = order.payments.filter(item => item.channel === 'mercadopago' && (item.purpose || 'deposit') === receipt.purpose
         && item.amount === receipt.amount && /^MP-\d+$/.test(String(item.ref || '')))
         .sort((a, b) => +new Date(b.at || 0) - +new Date(a.at || 0))
         .find(item => !order.payments.some(adjustment => adjustment.original === item.ref && adjustment.amount < 0));
@@ -1398,8 +1741,10 @@ export async function makeApi(env, options = {}) {
         ? (receipt.paymentBreakdown?.length
           ? receipt.paymentBreakdown.map(row => order.payments.find(item => item.ref === row.ref)).filter(Boolean)
           : order.payments.filter(item => item.amount > 0 && !order.payments.some(adjustment => adjustment.original === item.ref && adjustment.amount < 0)))
-        : order.payments.filter(item => item.ref === receipt.paymentRef || (receipt.intentId && item.intentId === receipt.intentId));
-      const mercadoPagoReceipts = receiptPayments.filter(item => !order.payments.some(adjustment => adjustment.original === item.ref && adjustment.amount < 0))
+        : order.payments.filter(item => item.ref === receipt.paymentRef || (receipt.intentId && item.intentId === receipt.intentId)
+          || (receipt.purpose === 'deposit' && (item.purpose || 'deposit') === 'deposit' && item.amount === receipt.amount));
+      const mercadoPagoReceipts = receiptPayments
+        .filter(item => !order.payments.some(adjustment => adjustment.original === item.ref && adjustment.amount < 0))
         .map(item => ({ paymentId: item.ref.slice(3), intentId: item.intentId || null, purpose: item.purpose || 'deposit', amount: item.amount,
           url: paymentReceiptUrl(item) })).filter(item => item.url);
       return json(res, 200, { ...receipt, ref: order.ref, payer: order.payer, total: order.total,
@@ -1521,28 +1866,43 @@ export async function makeApi(env, options = {}) {
         requireThat(order, 'Reserva no encontrada.', 404);
         // Un envío manual solo sale sin plantilla si la baja no está activa o hay sesión abierta.
         if (await optedOut(order.phone) && !(await sessionOpen(order.phone))) {
-          throw new Problem('El cliente se dio de baja de los mensajes', 409);
+          const error = new Problem('El cliente se dio de baja de los mensajes', 409);
+          const type = input.type === 'balance' ? 'Envío del link de saldo pendiente'
+            : input.type === 'receipt' ? 'Envío de constancia pendiente' : 'Recordatorio pendiente';
+          await update(id, data => openIssue(data, type, error.message, 'manual-message:' + input.type));
+          throw error;
         }
-        if (input.type === 'deposit') {
-          const intent = await checkout(id, input.method);
-          order = await send(order, paymentCta(order, intent, input.method || 'checkout', linkFor(intent), await settings()), { template: 'deposit', intent });
-        } else if (input.type === 'balance') {
-          order = await sendBalanceLink(order, { forceNew: Boolean(input.newLink), staff: staff.id ? staff : null });
-        } else if (input.type === 'visit') {
-          requireThat(order.stage === 'confirmed', 'La visita debe estar confirmada.', 409);
-          order = await send(order, emojis.visit + ' *Próxima visita*\nReserva: *' + order.ref + '*\n'
-            + friendlyDate(order.visitAt, new Date(), true) + '\nSaldo en el local: *' + money(balance(order)) + '*', { template: 'visit' });
-        } else if (input.type === 'receipt') {
-          const receipt = order.receipts.find(item => item.token === input.receiptToken) || order.receipts.at(-1);
-          requireThat(receipt, 'Aún no hay un comprobante emitido.', 409);
-          requireThat(!receipt.reversedAt, 'Esta liquidación fue revertida y no se puede reenviar.', 409);
-          const settlement = ['balance', 'settlement'].includes(receipt.purpose)
-            ? (receipt.purpose === 'settlement' && !receipt.reversedAt ? receipt : order.receipts.find(item => item.purpose === 'settlement' && !item.reversedAt)) : null;
-          if (receipt.purpose === 'balance') requireThat(settlement, 'La constancia final se habilitará al resolver las incidencias de pago.', 409);
-          await deliverReceipt(order, settlement || receipt, { force: true,
-            related: settlement ? order.receipts.filter(item => item.purpose === 'balance') : [] });
-          order = (await store.get(id)).data;
-        } else throw new Problem('Selecciona un mensaje válido.');
+        try {
+          if (input.type === 'deposit') {
+            const intent = await checkout(id, input.method);
+            order = await send(order, paymentCta(order, intent, input.method || 'checkout', linkFor(intent), await settings()), { template: 'deposit', intent });
+          } else if (input.type === 'balance') {
+            order = await sendBalanceLink(order, { forceNew: Boolean(input.newLink), staff: staff.id ? staff : null });
+          } else if (input.type === 'visit') {
+            requireThat(order.stage === 'confirmed', 'La visita debe estar confirmada.', 409);
+            order = await send(order, emojis.visit + ' *Próxima visita*\nReserva: *' + order.ref + '*\n'
+              + friendlyDate(order.visitAt, new Date(), true) + '\nSaldo en el local: *' + money(balance(order)) + '*', { template: 'visit' });
+          } else if (input.type === 'receipt') {
+            const receipt = order.receipts.find(item => item.token === input.receiptToken) || order.receipts.at(-1);
+            requireThat(receipt, 'Aún no hay un comprobante emitido.', 409);
+            requireThat(!receipt.reversedAt, 'Esta liquidación fue revertida y no se puede reenviar.', 409);
+            const settlement = ['balance', 'settlement'].includes(receipt.purpose)
+              ? (receipt.purpose === 'settlement' && !receipt.reversedAt ? receipt : order.receipts.find(item => item.purpose === 'settlement' && !item.reversedAt)) : null;
+            if (receipt.purpose === 'balance') requireThat(settlement, 'La constancia final se habilitará al resolver las incidencias de pago.', 409);
+            if (receipt.purpose === 'balance' && settlement) {
+              await deliverReceipt(order, receipt, { force: true });
+              await deliverReceipt(order, settlement, { force: true });
+            } else await deliverReceipt(order, settlement || receipt, { force: true });
+            order = (await store.get(id)).data;
+          } else throw new Problem('Selecciona un mensaje válido.');
+        } catch (error) {
+          if (input.type !== 'balance') {
+            const type = input.type === 'receipt' ? 'Envío de constancia pendiente'
+              : input.type === 'deposit' ? 'Envío del link de anticipo pendiente' : 'Recordatorio pendiente';
+            await update(id, data => openIssue(data, type, error.message, 'manual-message:' + input.type));
+          }
+          throw error;
+        }
         return json(res, 200, { order });
       }
       if (kind === 'sync') {
@@ -1577,6 +1937,8 @@ export async function makeApi(env, options = {}) {
         const row = await store.get(id), order = row?.data;
         requireThat(order, 'Reserva no encontrada.', 404);
         const oldVisitAt = order.visitAt, rule = await settings(), force = staff.role === 'admin' && input.forceCapacity === true;
+        requireThat(!(order.stage === 'awaiting_deposit' && depositDue(order) > 0 && +new Date(order.deadline) <= Date.now()) || force,
+          'El plazo del anticipo venció. Reabre el plazo antes de reprogramar.', 409);
         const hasCapacity = await ensureAvailable(input.visitAt, order.guests, id, rule, force);
         const saved = await store.rescheduleAtomic(id, new Date(input.visitAt).toISOString(), rule, force, 'Operador', oldVisitAt);
         const moved = saved.data || saved.order?.data || saved.order || saved;
@@ -1591,6 +1953,18 @@ export async function makeApi(env, options = {}) {
           }
         }
         return json(res, 200, { order: (await store.get(id))?.data || moved, result: { changed: saved.changed !== false, forced: force && !hasCapacity } });
+      }
+      if (kind === 'renew') {
+        const row = await store.get(id), order = row?.data, rule = await settings();
+        requireThat(order, 'Reserva no encontrada.', 404);
+        requireThat(order.stage === 'awaiting_deposit' && depositDue(order) > 0 && +new Date(order.deadline) <= Date.now(),
+          'Solo se pueden reabrir plazos de anticipos vencidos y pendientes.', 409);
+        requireThat(!(order.payments || []).length, 'No se puede reabrir el plazo porque hay un pago registrado.', 409);
+        requireThat(+new Date(order.visitAt) > Date.now() + 2 * 3600000, 'La visita debe estar a más de 2 horas; reprograma primero y revisa el cupo.', 409);
+        requireThat(availabilityConfigured(rule), 'La disponibilidad debe estar configurada para verificar el cupo.', 409);
+        await ensureAvailable(order.visitAt, order.guests, order.id, rule);
+        const saved = await store.renewDepositAtomic(id, rule, 'Operador', order.visitAt, null);
+        return json(res, 200, { order: saved.data || saved });
       }
       const receiptToken = randomUUID();
       const rule = await settings();
@@ -1651,17 +2025,9 @@ export async function makeApi(env, options = {}) {
         }
         throw new Problem('Acción no disponible.', 404);
       });
-      if (!portal && kind === 'arrive' && result.order.stage === 'arrived' && balance(result.order) > 0) {
-        try { await sendBalanceLink(result.order); }
-        catch (error) { await update(id, data => openIssue(data, 'Envío del link de saldo pendiente', error.message, 'balance-link:' + result.order.attendance.at)); }
-      }
       if (['counter', 'arrive'].includes(kind) && balance(result.order) === 0) await deliverPendingReceipts(result.order);
       if (kind === 'resolve') {
         await deliverPendingReceipts(result.order);
-        if (!portal && result.order.stage === 'arrived' && balance(result.order) > 0) {
-          try { await sendBalanceLink(result.order); }
-          catch (error) { await update(id, data => openIssue(data, 'Envío del link de saldo pendiente', error.message, 'balance-link-retry')); }
-        }
       }
       if (kind === 'receipt') await deliverPendingReceipts(result.order);
       return json(res, 200, { ...result, order: (await store.get(id))?.data || result.order });

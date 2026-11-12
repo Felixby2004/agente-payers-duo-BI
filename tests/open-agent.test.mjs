@@ -92,7 +92,7 @@ test('El teléfono permitido y bloqueado son opcionales y estrictos', () => {
 });
 
 test('Un número sin reserva recibe el aviso, deriva al personal y no ve datos ajenos', async () => {
-  const r = await runtime();
+  const r = await runtime({ WA_RESERVATION_MODE: 'open' });
   try {
     const owner = await r.createOrder('51999999999', 'Ana Demo', true);
     const foreign = await r.createOrder('51988888888', 'Luis Ajeno', true);
@@ -109,14 +109,12 @@ test('Un número sin reserva recibe el aviso, deriva al personal y no ve datos a
     await r.answer({ from: '51911111111', type: 'text', text: { body: 'buenas tardes' } });
     assert.equal(r.sent.length, before);
 
-    // Pedido de reserva sin reserva: mensaje fijo, sin invitar a reservar ni pedir datos.
+    // El modo abierto permite iniciar el alta y explica el formato estructurado.
+    const countBeforeIntake = (await orderList(r)).length;
     out = await r.answer({ from: '51922222222', type: 'text', text: { body: 'quiero reservar una mesa' } });
     assert.equal(out.length, 1);
-    assert.equal(out[0].interactive.body.text, texts.noReservation);
-    const combined = bodyOf(out[0]) + '\n' + out[0].fallback;
-    assert.equal(/reservar|reserva nueva|disponibilidad/i.test(combined), false);
-    assert.equal(/sábado|sabado|personas|cuántas|cuantas/i.test(combined), false);
-    assert.deepEqual(idsOf(out[0]), ['staff']);
+    assert.match(bodyOf(out[0]), /Copia solo el bloque desde RESERVA/);
+    assert.equal((await orderList(r)).length, countBeforeIntake, 'una petición de instrucciones no crea un pedido');
 
     // Los textos fijos tampoco invitan a reservar.
     const fixed = noReservationMessage();
@@ -125,13 +123,12 @@ test('Un número sin reserva recibe el aviso, deriva al personal y no ve datos a
     assert.equal(/reservar|reserva nueva|disponibilidad/i.test(fixed.body + fixed.fallback), false);
     assert.match(reservationHelpMessage().body, /solo gestiono los pagos de tu reserva/);
 
-    // Pedido de reserva con una reserva existente: deriva al personal y abre incidencia.
+    // La solicitud de otra reserva conserva la admisión y entrega el formato, sin crearla todavía.
     out = await r.answer({ from: '51999999999', type: 'text', text: { body: 'quiero hacer una reserva nueva' } });
     assert.equal(out.length, 1);
-    assert.equal(out[0].interactive.body.text, texts.reservation);
-    assert.deepEqual(idsOf(out[0]), ['staff']);
+    assert.match(bodyOf(out[0]), /Copia solo el bloque desde RESERVA/);
     const stored = (await orderList(r)).find(order => order.id === owner.id);
-    assert.ok(stored.incidents.some(incident => incident.type === 'Ayuda del personal' && !incident.resolvedAt));
+    assert.equal(stored.incidents.some(incident => incident.type === 'Ayuda del personal' && !incident.resolvedAt), false);
 
     // Referencia EST- ajena: se trata como número sin reserva y no revela la reserva.
     out = await r.answer({ from: '51911111112', type: 'text', text: { body: 'mi reserva es ' + foreign.ref } });

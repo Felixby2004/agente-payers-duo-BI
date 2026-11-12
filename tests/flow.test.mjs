@@ -101,7 +101,7 @@ test('De formulario a cierre de caja, con rechazos, confirmación duplicada y de
   }
 });
 
-test('El link de saldo aparece al registrar llegada; caja supersede el intento y el pago en línea cierra automáticamente', async () => {
+test('Registrar llegada no envía saldo; caja cobra sin enlace y el pago en línea cierra automáticamente', async () => {
   const api = await makeApi({}, { memory: true });
   const server = createServer((req, res) => api.middleware(req, res, () => res.end()));
   server.listen(0, '127.0.0.1');
@@ -120,28 +120,20 @@ test('El link de saldo aparece al registrar llegada; caja supersede el intento y
     const deposit = await call(prefix + 'link', {});
     await call('payment/' + deposit.intent.id, { outcome: 'approved' });
     const arrived = await call(prefix + 'arrive', { count: 1 });
-    const balanceIntent = arrived.order.intents.find(item => item.purpose === 'balance');
-    assert.ok(balanceIntent);
-    assert.equal(balanceIntent.amount, 4000);
-    assert.ok(+new Date(balanceIntent.expiresAt) > Date.now());
+    assert.equal(arrived.order.intents.some(item => item.purpose === 'balance'), false);
     const settledAtCounter = await call(prefix + 'counter', { channel: 'cash' });
-    assert.equal(settledAtCounter.order.intents.find(item => item.id === balanceIntent.id).status, 'superseded');
     assert.equal(settledAtCounter.order.stage, 'closed');
     assert.equal(settledAtCounter.order.receipts.filter(item => ['balance', 'settlement'].includes(item.purpose)).length, 2);
-    const staleLink = await fetch(root + 'payment/' + balanceIntent.id);
-    const staleLinkState = await staleLink.json();
-    assert.equal(staleLinkState.usable, false);
-    assert.equal(staleLinkState.unusableReason, 'already_paid');
-    await call('payment/' + balanceIntent.id, { outcome: 'approved' }, 409);
     assert.equal((await call('orders')).find(item => item.id === order.id).payments.filter(item => item.purpose === 'balance').length, 1);
 
     const online = await call('orders', seed, 201), onlinePrefix = 'orders/' + online.id + '/';
     const dep2 = await call(onlinePrefix + 'link', {});
     await call('payment/' + dep2.intent.id, { outcome: 'approved' });
     const arrival2 = await call(onlinePrefix + 'arrive', { count: 1 });
-    const bal2 = arrival2.order.intents.find(item => item.purpose === 'balance');
-    const paidOnline = await call('payment/' + bal2.id, { outcome: 'approved' });
-    assert.equal(paidOnline.status, 'approved');
+    assert.equal(arrival2.order.intents.some(item => item.purpose === 'balance'), false);
+    // Sin una solicitud del cliente, caja registra el saldo directamente.
+    const finishedAtCounter = await call(onlinePrefix + 'counter', { channel: 'cash' });
+    assert.equal(finishedAtCounter.order.stage, 'closed');
     const finished = (await call('orders')).find(item => item.id === online.id);
     assert.equal(finished.stage, 'closed');
     assert.deepEqual(finished.payments.map(item => item.purpose), ['deposit', 'balance']);

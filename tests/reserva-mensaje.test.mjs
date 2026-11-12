@@ -123,20 +123,54 @@ async function runtime(extra = {}) {
 
 const outgoingBody = payload => payload.text?.body || payload.interactive?.body?.text || '';
 
-test('parseReservation valida contrato, catálogo, hora Lima y errores sin aceptar importes', () => {
-  const complete = parseReservation(reservationText(validMessage({
-    Telefono: '+51 999 999 999',
-    Notas: 'Cumpleaños',
-    Consentimiento: 'sí',
-  })), fixedNow);
+test('Un saludo muestra el menú principal aunque el cliente tenga varias reservas activas', async () => {
+  const r = await runtime();
+  try {
+    for (let index = 1; index <= 3; index++) {
+      const visitAt = new Date(Date.now() + (index + 2) * 86400000).toISOString();
+      const input = { agreed: true, payer: 'Cliente de prueba', phone: '51911111111', consent: true,
+        guests: 1, visitAt, items: [{ name: 'Parrilla familiar', price: 3900, quantity: 1 }] };
+      await r.call('orders', JSON.stringify(input), 201);
+    }
+    const sent = await r.answer({ from: '51911111111', text: { body: 'Hola' } }, 'wamid.greeting-menu');
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].type, 'interactive');
+    assert.equal(sent[0].interactive.type, 'button');
+    assert.match(sent[0].interactive.body.text, /¿Qué te gustaría hacer\?/);
+    assert.deepEqual(sent[0].interactive.action.buttons.map(item => item.reply.title),
+      ['Ver mis reservas', 'Hacer una reserva', 'Hablar con alguien']);
+  } finally { await r.close(); }
+});
+
+test('Ver mis reservas desde el botón del flujo de alta abre una lista dentro de WhatsApp', async () => {
+  const r = await runtime();
+  try {
+    const input = { agreed: true, payer: 'Cliente de prueba', phone: '51911111111', consent: true,
+      guests: 2, visitAt: new Date(Date.now() + 3 * 86400000).toISOString(),
+      items: [{ name: 'Parrilla familiar', price: 3900, quantity: 2 }] };
+    const created = await r.call('orders', JSON.stringify(input), 201);
+    const sent = await r.answer({ from: '51911111111', text: { body: '' }, type: 'interactive',
+      interactive: { button_reply: { id: 'orders', title: 'Ver mis reservas' } } }, 'wamid.orders-list');
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].type, 'interactive');
+    assert.equal(sent[0].interactive.type, 'list');
+    assert.match(sent[0].interactive.body.text, /Mis reservas/);
+    const rows = sent[0].interactive.action.sections.flatMap(section => section.rows);
+    assert.ok(rows.some(row => row.title === created.data.ref));
+    assert.match(rows.find(row => row.title === created.data.ref).description, /📅/);
+    assert.doesNotMatch(JSON.stringify(sent[0]), /\/cliente/);
+  } finally { await r.close(); }
+});
+
+test('parseReservation valida el formato con remitente único, catálogo y hora Lima', () => {
+  const complete = parseReservation(reservationText(validMessage({ Notas: 'Cumpleaños' })), fixedNow);
   assert.equal(complete.ok, true);
   assert.equal(complete.value.name, 'Ana Cárdenas');
-  assert.equal(complete.value.phone, '51999999999');
+  assert.equal(complete.value.phone, undefined);
   assert.equal(complete.value.visitAt, '2026-11-13T01:00:00.000Z');
   assert.equal(complete.value.guests, 4);
   assert.equal(complete.value.items[0].price, menu.find(item => item.name === 'Parrilla familiar').price);
   assert.equal(complete.value.items[0].quantity, 2);
-  assert.equal(complete.value.consent, true);
 
   const tolerant = parseReservation(reservationText({
     nombre: 'Luis Demo',
@@ -167,7 +201,8 @@ test('parseReservation valida contrato, catálogo, hora Lima y errores sin acept
   assert.equal(parseReservation(reservationText(withoutItems), fixedNow).error, texts.reservationMissingItems);
   assert.match(parseReservation(reservationText({ ...validMessage(), Fecha: '31/12/2026' }), fixedNow).error, /AAAA-MM-DD/);
   assert.match(parseReservation(reservationText({ ...validMessage(), Fecha: '2026-02-30' }), fixedNow).error, /AAAA-MM-DD/);
-  assert.equal(parseReservation(reservationText({ ...validMessage(), Fecha: '2026-11-09' }), fixedNow).error, texts.reservationTooSoon);
+  assert.match(parseReservation(reservationText({ ...validMessage(), Fecha: '2026-11-10', Hora: '13:00' }), fixedNow).error,
+    /al menos 2 horas de anticipación.*hora mínima permitida hoy es 14:00/);
   assert.match(parseReservation(reservationText({ ...validMessage(), Hora: '25:00' }), fixedNow).error, /AAAA-MM-DD/);
   assert.match(parseReservation(reservationText({ ...validMessage(), Hora: '9:00' }), fixedNow).error, /AAAA-MM-DD/);
   for (const guests of ['0', '41']) {
@@ -176,9 +211,11 @@ test('parseReservation valida contrato, catálogo, hora Lima y errores sin acept
   assert.match(parseReservation(reservationText({ ...validMessage(), Items: '1x Producto inexistente' }), fixedNow).error, /No conozco el producto/);
   assert.match(parseReservation(reservationText({ ...validMessage(), Items: '0x Parrilla familiar' }), fixedNow).error, /entre 1 y 100/);
   assert.match(parseReservation(reservationText({ ...validMessage(), Items: '101x Parrilla familiar' }), fixedNow).error, /entre 1 y 100/);
-  assert.equal(parseReservation(reservationText({ ...validMessage(), Consentimiento: 'no' }), fixedNow).value.consent, false);
-  assert.match(parseReservation(reservationText({ ...validMessage(), Consentimiento: 'yes' }), fixedNow).error, /Consentimiento: si o no/);
-  assert.match(parseReservation(reservationText({ ...validMessage(), Telefono: 'abc' }), fixedNow).error, /código de país/);
+  for (const field of ['Telefono: 51999999999', 'Consentimiento: si']) {
+    const rejected = parseReservation(reservationText(validMessage()) + '\n' + field, fixedNow);
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.error, 'Las reservas se registran con el número desde el que escribes. Quita esas líneas y vuelve a enviar el bloque.');
+  }
   assert.match(parseReservation(reservationText({ ...validMessage(), Notas: 'x'.repeat(501) }), fixedNow).error, /500 caracteres/);
   assert.equal(parseReservation(reservationText({ ...validMessage(), Items: Array(31).fill('1x Parrilla familiar').join(', ') }), fixedNow).error, texts.reservationLineLimit);
   assert.match(parseReservation(reservationText({ ...validMessage(), Items: '1x Parrilla familiar,,' }), fixedNow).error, /formato "2x Producto"/);
@@ -252,29 +289,26 @@ test('Dedupe por message.id e idempotencia por teléfono/fecha/personas/items', 
   } finally { await r.close(); }
 });
 
-test('Operador crea pedido con consentimiento explícito; sin consentimiento no inicia mensajes al pagador', async () => {
+test('RESERVA rechaza Teléfono y Consentimiento y registra con el número remitente', async () => {
   const r = await runtime({
     ENABLE_REMINDERS: 'true',
     WA_TEMPLATE_DEPOSIT: 'anticipo_demo',
     WA_RESERVATION_MODE: 'open',
   });
   try {
-    const falsePayer = '51922222222';
-    const truePayer = '51933333333';
-    const text = (payer, consent) => integrationText({
-      Telefono: payer,
-      ...(consent === undefined ? {} : { Consentimiento: consent }),
-    });
-    await r.answer({ from: '51911111111', text: { body: text(falsePayer) } }, 'wamid.operator-no');
-    await r.answer({ from: '51911111111', text: { body: text(truePayer, 'si') } }, 'wamid.operator-yes');
+    const sender = '51911111111';
+    for (const field of ['Telefono: 51922222222', 'Consentimiento: si']) {
+      const out = await r.answer({ from: sender, text: { body: integrationText() + '\n' + field } });
+      assert.match(outgoingBody(out[0]), /Las reservas se registran con el número desde el que escribes/);
+    }
+    assert.equal((await r.orders()).length, 0);
+    const registered = await r.answer({ from: sender, text: { body: integrationText() } });
+    assert.match(outgoingBody(registered[0]), /Reserva registrada/);
     let orders = await r.orders();
-    const noConsent = orders.find(order => order.phone === falsePayer);
-    const consented = orders.find(order => order.phone === truePayer);
-    assert.equal(noConsent.consent, false);
-    assert.equal(consented.consent, true);
-    assert.equal(noConsent.chat.find(item => item.direction === 'in').from, '51911111111');
-    assert.ok(noConsent.events.some(event => event.title === 'Origen: operador'));
-    assert.deepEqual(r.sent.map(payload => payload.to), ['51911111111', '51911111111']);
+    const ownReservation = orders.find(order => order.phone === sender);
+    assert.ok(ownReservation);
+    assert.equal(orders.length, 1);
+    assert.equal(ownReservation.chat.find(item => item.direction === 'in').from, sender);
 
     const config = (await r.call('config')).data;
     await r.call('agent/settings', JSON.stringify({
@@ -288,11 +322,10 @@ test('Operador crea pedido con consentimiento explícito; sin consentimiento no 
       const alerts = (await r.call('internal/agent/alerts', '{}', 200, r.worker)).data;
       assert.equal(alerts.sent, 1);
       assert.equal(r.sent.length, before + 1);
-      assert.equal(r.sent.at(-1).to, truePayer);
-      assert.equal(r.sent.some(payload => payload.to === falsePayer), false);
+      assert.equal(r.sent.at(-1).to, sender);
     } finally { Date.now = originalNow; }
     orders = await r.orders();
-    assert.equal(orders.find(order => order.phone === falsePayer).reminders['deposit:' + noConsent.deadline], undefined);
+    assert.equal(orders.find(order => order.phone === sender).reminders['deposit:' + ownReservation.deadline]?.status, 'sent');
   } finally { await r.close(); }
 });
 
@@ -323,6 +356,25 @@ test('Validación fallida queda como consulta y los límites bloquean sin alta',
   } finally { await r.close(); }
 });
 
+test('El máximo de reservas abiertas se configura desde Agente y alertas y se aplica al alta WhatsApp', async () => {
+  const r = await runtime();
+  try {
+    const config = (await r.call('config')).data;
+    assert.equal(config.maxOpenReservationsPerPhone, 3);
+    await r.call('agent/settings', JSON.stringify({ ...config, maxOpenReservationsPerPhone: 2 }));
+    const sender = '51922222222';
+    for (let index = 0; index < 3; index++) {
+      const result = await r.answer({ from: sender, text: { body: integrationText({ Hora: `${20 + index}:00` }, futureLimaDate(index + 2)) } },
+        'wamid.max-config-' + index);
+      if (index < 2) assert.match(outgoingBody(result[0]), /Reserva registrada/);
+      else assert.match(outgoingBody(result[0]), /ya tiene 2 reservas abiertas/);
+    }
+    assert.equal((await r.orders()).filter(order => order.phone === sender).length, 2);
+    const saved = (await r.call('config')).data;
+    await assert.rejects(() => r.call('agent/settings', JSON.stringify({ ...saved, maxOpenReservationsPerPhone: 0 })), /Revisa los importes y plazos/);
+  } finally { await r.close(); }
+});
+
 test('Modos off y staff protegen el alta; alta de cliente consiente y texto libre sigue derivando', async () => {
   assert.equal(readConfig({}).reservationMode, 'off');
   assert.equal(readConfig({
@@ -335,14 +387,14 @@ test('Modos off y staff protegen el alta; alta de cliente consiente y texto libr
     const out = await off.answer({ from: '51911111111', text: { body: integrationText() } });
     assert.equal((await off.orders()).length, 0);
     assert.equal(out.length, 1);
-    assert.equal(out[0].interactive.body.text, texts.noReservation);
+    assert.equal(out[0].text.body, texts.reservationUnavailable);
   } finally { await off.close(); }
 
   const staff = await runtime({ WA_RESERVATION_MODE: 'staff', WA_RESERVATION_STAFF: '51900000001' });
   try {
     const out = await staff.answer({ from: '51911111111', text: { body: integrationText() } });
     assert.equal((await staff.orders()).length, 0);
-    assert.equal(out[0].interactive.body.text, texts.noReservation);
+    assert.equal(out[0].text.body, texts.reservationUnavailable);
     await staff.answer({ from: '51900000001', text: { body: integrationText() } });
     assert.equal((await staff.orders()).length, 1);
   } finally { await staff.close(); }
@@ -351,19 +403,18 @@ test('Modos off y staff protegen el alta; alta de cliente consiente y texto libr
   try {
     const freeText = await open.answer({ from: '51911111111', text: { body: 'quiero reservar una mesa' } });
     assert.equal((await open.orders()).length, 0);
-    assert.equal(freeText[0].interactive.body.text, texts.noReservation);
-    const own = await open.answer({ from: '51922222222', text: { body: integrationText({
-      Consentimiento: 'no',
-    }) } });
+    assert.equal(freeText[0].interactive.type, 'button');
+    assert.match(freeText[0].interactive.body.text, /Copia solo el bloque desde RESERVA/);
+    const own = await open.answer({ from: '51922222222', text: { body: integrationText() } });
     const order = (await open.orders()).find(item => item.phone === '51922222222');
-    assert.equal(order.consent, true);
+    assert.ok(order);
+    assert.equal(order.chat.find(item => item.direction === 'in').from, '51922222222');
     assert.equal(own[0].interactive.type, 'cta_url');
-    await open.answer({ from: '51933333333', text: { body: integrationText({
-      Telefono: '51933333333',
-      Consentimiento: 'no',
+    const rejected = await open.answer({ from: '51933333333', text: { body: integrationText({
+      Telefono: '51944444444',
     }) } });
-    const samePhone = (await open.orders()).find(item => item.phone === '51933333333');
-    assert.equal(samePhone.consent, true);
+    assert.match(outgoingBody(rejected[0]), /Las reservas se registran con el número desde el que escribes/);
+    assert.equal((await open.orders()).some(item => item.phone === '51944444444'), false);
   } finally { await open.close(); }
 });
 

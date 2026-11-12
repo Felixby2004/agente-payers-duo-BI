@@ -117,6 +117,15 @@ export async function openStore(config, { memory = false } = {}) {
         if (result.error) throw new Problem(result.error.message || 'No se pudo confirmar la disponibilidad.', result.error.code === '40001' ? 409 : 409);
         return result.data;
       },
+      async renewDepositAtomic(id, settingsData, actor, expectedVisitAt, phone = null) {
+        const row = await this.get(id);
+        if (!row) throw new Problem('Reserva no encontrada.', 404);
+        const result = await client.rpc('payers_renew_deposit_order', { p_order_id: id,
+          p_expected_version: row.version, p_expected_visit_at: expectedVisitAt || row.data.visitAt,
+          p_settings: settingsData, p_actor: actor, p_phone: phone });
+        if (result.error) throw new Problem(result.error.message || 'No se pudo reabrir el plazo.', 409);
+        return result.data;
+      },
       async find(collection, criteria) {
         return check(await table().select('data').contains('data', { [collection]: [criteria] }).limit(1).maybeSingle())?.data;
       },
@@ -135,7 +144,7 @@ export async function openStore(config, { memory = false } = {}) {
   await db.exec(await readFile(new URL('../supabase/migrations/003_contactos.sql', import.meta.url), 'utf8'));
   await db.exec(await readFile(new URL('../supabase/migrations/004_payers_availability.sql', import.meta.url), 'utf8'));
   await db.exec(await readFile(new URL('../supabase/migrations/005_availability_unconfigured.sql', import.meta.url), 'utf8'));
-  for (const migration of ['006_payers_portal.sql', '007_payers_reporting.sql', '008_payers_dimensional.sql', '009_payers_reprogramacion.sql']) {
+  for (const migration of ['006_payers_portal.sql', '007_payers_reporting.sql', '008_payers_dimensional.sql', '009_payers_reprogramacion.sql', '010_payers_expired_deposit_rules.sql']) {
     await db.exec(await readFile(new URL('../supabase/migrations/' + migration, import.meta.url), 'utf8'));
   }
   const queryRow = 'id,phone,state,message_count,excerpt,created_at,handled_at';
@@ -224,6 +233,15 @@ export async function openStore(config, { memory = false } = {}) {
           [id, visitAt, row.version, expectedVisitAt || row.data.visitAt, JSON.stringify(settingsData), forceCapacity, actor]);
         return result.rows[0].result;
       } catch (error) { throw new Problem(error.message || 'No se pudo confirmar la disponibilidad.', 409); }
+    },
+    async renewDepositAtomic(id, settingsData, actor, expectedVisitAt, phone = null) {
+      const row = await this.get(id);
+      if (!row) throw new Problem('Reserva no encontrada.', 404);
+      try {
+        const result = await db.query('select payers_renew_deposit_order($1,$2,$3::timestamptz,$4::jsonb,$5,$6) as result',
+          [id, row.version, expectedVisitAt || row.data.visitAt, JSON.stringify(settingsData), actor, phone]);
+        return result.rows[0].result;
+      } catch (error) { throw new Problem(error.message || 'No se pudo reabrir el plazo.', 409); }
     },
     async find(collection, criteria) {
       return (await db.query('select data from payers_orders where data @> $1::jsonb limit 1', [JSON.stringify({ [collection]: [criteria] })])).rows[0]?.data;

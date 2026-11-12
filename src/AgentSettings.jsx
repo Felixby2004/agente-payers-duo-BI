@@ -5,9 +5,13 @@ import { visitText } from '../shared/orders.mjs';
 
 const numbers = [
   ['deadlineMinutes', 'Vencimiento del anticipo (minutos)', 1, 43200],
+  ['autoCancelExpiredHours', 'Cancelar reservas sin pago (horas después del vencimiento; 0 desactiva)', 0, 720],
+  ['depositRenewalsMax', 'Renovaciones de plazo permitidas al cliente', 0, 10],
+  ['renewDepositMinutes', 'Duración del nuevo plazo (minutos)', 1, 43200],
   ['depositLinkExpiryMinutes', 'Vigencia de cada enlace de anticipo (minutos)', 1, 43200],
   ['paymentRetryMinutes', 'Espera para volver a emitir un enlace (minutos)', 0, 1440],
   ['maxDepositLinks', 'Máximo de enlaces de anticipo por reserva', 1, 3],
+  ['maxOpenReservationsPerPhone', 'Máximo de reservas abiertas por cliente (últimos 30 días)', 1, 100],
   ['depositReminderMinutes', 'Aviso de anticipo a los (minutos)', 1, 43200],
   ['firstVisitHours', 'Primer aviso antes de la visita (horas)', 1, 168],
   ['lastVisitHours', 'Segundo aviso antes de la visita (horas)', 1, 168],
@@ -25,7 +29,6 @@ const toggles = [
   ['reminders', 'Enviar recordatorios por WhatsApp'],
   ['initialRequest', 'Enviar solicitud de anticipo al registrar el pedido'],
   ['depositReminder', 'Recordar el anticipo pendiente'],
-  ['cancelExpiredDeposits', 'Cancelar anticipos vencidos después de verificar la pasarela'],
   ['visitReminder', 'Recordar las visitas confirmadas'],
   ['internalAlerts', 'Alertar al personal por vencimiento, retraso o saldo pendiente'],
   ['yapeDemo', 'Ofrecer Yape simulado'],

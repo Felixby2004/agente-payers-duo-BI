@@ -12,8 +12,12 @@ export function defaults(config) {
     cancelExpiredDeposits: true,
     depositReminderMinutes: 30,
     depositLinkExpiryMinutes: 60,
+    autoCancelExpiredHours: 24,
+    depositRenewalsMax: 1,
+    renewDepositMinutes: config.deadlineMs / 60000,
     paymentRetryMinutes: 0,
     maxDepositLinks: 3,
+    maxOpenReservationsPerPhone: 3,
     visitReminder: true,
     firstVisitHours: 24,
     lastVisitHours: 3,
@@ -59,7 +63,9 @@ export function validateSettings(input, initial) {
   const ranges = { depositPerPerson: [1, 100000], deadlineMinutes: [1, 43200], graceMinutes: [0, 1440],
     depositReminderMinutes: [1, 43200], firstVisitHours: [1, 168], lastVisitHours: [1, 168], counterAlertMinutes: [1, 1440],
     depositLinkExpiryMinutes: [1, 43200], paymentRetryMinutes: [0, 1440], maxDepositLinks: [1, 3],
+    maxOpenReservationsPerPhone: [1, 100],
     balanceLinkExpiryMinutes: [1, 1440], maxBalanceLinks: [1, 3], slotMinutes: [15, 240], capacityPerSlot: [1, 1000],
+    autoCancelExpiredHours: [0, 720], depositRenewalsMax: [0, 10], renewDepositMinutes: [1, 43200],
     minRescheduleHours: [1, 720], maxCustomerReschedules: [0, 10], offerWindowDays: [1, 90] };
   for (const [name, [min, max]] of Object.entries(ranges)) {
     const value = input?.[name];

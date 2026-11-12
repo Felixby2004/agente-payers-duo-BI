@@ -22,7 +22,7 @@
 
 La aplicación recibe eventos de WhatsApp Cloud API en el servidor Node, guarda los mensajes elegibles en una bandeja de entrada y ejecuta el agente para responder por WhatsApp. En el modo documentado para esta demo, n8n despierta el procesamiento de la bandeja y evalúa alertas; la lógica del agente y las llamadas a Meta siguen en el servidor.
 
-El agente atiende en **modo abierto** por defecto (`WA_ALLOWED_PHONES` vacía): responde a cualquier número, con el menú existente si tiene reservas o con un aviso de cobranza y el botón **Hablar con alguien** si no las tiene. No negocia ni ofrece disponibilidad: gestiona cobranza de reservas ya registradas y, si `WA_RESERVATION_MODE` está habilitado, registra un pedido ya acordado a partir del mensaje estructurado `RESERVA`. Un pedido de reserva en texto libre se deriva al personal. Las bajas y las consultas sin reserva se persisten y se ven en el panel.
+El agente atiende en **modo abierto** por defecto (`WA_ALLOWED_PHONES` vacía): responde a cualquier número. Al recibir **hola** muestra **Ver mis reservas**, **Hacer una reserva** y **Hablar con alguien**; también reconoce esas solicitudes en texto libre. Para reservar, primero entrega el formato `RESERVA`; el cliente debe enviar un segundo mensaje completado. PAYERS comprueba cupo al registrar, y luego sigue con el enlace de anticipo. No negocia fecha, personas ni precio mediante conversación libre. Las bajas y las consultas se persisten y se ven en el panel.
 
 | Pieza | Papel |
 |---|---|
@@ -67,7 +67,7 @@ La obligatoriedad de las variables se determina en `server/config.mjs`, función
 | `WA_APP_SECRET` | Obligatoria con `WHATSAPP_MODE=cloud`. | Se usa para verificar la firma HMAC de los POST de Meta. | Configuración de la app de Meta (secreto de la app). |
 | `WA_ALLOWED_PHONES` | Opcional. Vacía o ausente activa el **modo abierto**: el agente atiende a cualquier remitente. Con valores, funciona como restricción opcional para demos controladas. | Lista separada por comas de remitentes permitidos, en dígitos y con código de país. Se normaliza a solo dígitos al cargarla. | La define el operador; los destinatarios de prueba también se habilitan en Meta. Usa valores ficticios al documentar, por ejemplo `51XXXXXXXXX`. |
 | `WA_BLOCKED_PHONES` | Opcional. | Lista separada por comas de números que se ignoran por completo, con el mismo formato que `WA_ALLOWED_PHONES`. El bloqueo tiene prioridad sobre el modo abierto. | La define el operador. Usa valores ficticios al documentar. |
-| `WA_RESERVATION_MODE` | Opcional; predeterminado `off`. | Habilita el alta por mensaje estructurado: `off` no la permite, `staff` solo para los números de `WA_RESERVATION_STAFF` y `open` para cualquier remitente permitido. | Se define en el entorno del servidor. Para una demo controlada usa `staff`. |
+| `WA_RESERVATION_MODE` | Opcional; predeterminado `open`. | Habilita el alta estructurada: `off` la desactiva, `staff` solo permite los números de `WA_RESERVATION_STAFF` y `open` permite a cualquier remitente permitido. | Se define en el entorno del servidor. |
 | `WA_RESERVATION_STAFF` | Opcional; solo se usa con `WA_RESERVATION_MODE=staff`. | Lista separada por comas de números autorizados a dar de alta reservas, en dígitos y con código de país. | La define el operador; usa valores ficticios al documentar. |
 | `WA_RATE_LIMIT_MAX` | Opcional; predeterminado `20`. | Máximo de mensajes entrantes por número dentro de la ventana deslizante. Al superarlo se ignora el mensaje y se envía un solo aviso por ventana. | Se define en el entorno del servidor (entero mayor que 0). |
 | `WA_RATE_LIMIT_WINDOW_MS` | Opcional; predeterminado `600000` (10 minutos). | Duración de la ventana deslizante del límite de tasa, en milisegundos. | Se define en el entorno del servidor (mínimo 1000). |
@@ -80,7 +80,7 @@ La obligatoriedad de las variables se determina en `server/config.mjs`, función
 | `PUBLIC_URL` | Obligatoria si WhatsApp Cloud está activo. | Origen HTTPS público del servidor, sin ruta; se usa para enlaces y para que el servidor escuche públicamente. | URL del alojamiento o del túnel actual. |
 | `AGENT_ORCHESTRATION` | Opcional; predeterminado `server`. | El modo `n8n` delega a n8n el disparo de bandeja y alertas. | Se define en el entorno del servidor. |
 | `N8N_AGENT_TOKEN` | Obligatoria si `AGENT_ORCHESTRATION=n8n`. | Autentica las llamadas de n8n a las rutas internas; el servidor exige al menos 32 caracteres. | Se genera como secreto aleatorio y se configura en el servidor y la credencial Header Auth de n8n. |
-| `N8N_WAKE_URL` | Opcional; si se configura debe ser HTTPS. | URL Production del webhook de n8n que puede despertar el workflow cuando entra una cola nueva. | Nodo **Despertar por WhatsApp** de n8n. |
+| `N8N_WAKE_URL` | Opcional; se admite HTTP solo para loopback local. | URL Production del webhook de n8n que despierta el workflow cuando entra una cola nueva. La demo local usa `http://127.0.0.1:5678/webhook/establo-payers-despertar`. | Nodo **Despertar por WhatsApp** de n8n. |
 
 Los nombres `WA_TEMPLATE_*` deben corresponder a plantillas aprobadas y a los parámetros que construye el servidor. Tener configurado un nombre no demuestra que Meta haya aprobado esa plantilla; la aprobación debe verificarse en Meta.
 
@@ -95,7 +95,7 @@ Los avisos automáticos se agrupan por teléfono: si hay varios anticipos pendie
 5. **Procesamiento del trabajo.** En `incoming`, el agente normaliza el teléfono a dígitos y descarta mensajes sin ID, bloqueados o no permitidos, con timestamp no numérico, más antiguos de 24 horas o más de 60 segundos en el futuro. También ignora IDs ya vistos en la cola y en memoria. (`server/api.mjs`: `incoming`, `seenMessages`.)
 6. **Baja, alta y límite de tasa antes de clasificar.** El texto se normaliza (minúsculas y sin tildes) y se evalúa en este orden: **stop**, **baja**, **darme de baja** o **no quiero mensajes** persisten la baja; **alta** la revierte. Después se aplica el límite por número (`WA_RATE_LIMIT_MAX` por `WA_RATE_LIMIT_WINDOW_MS`): al superarlo no se llama a OpenAI ni a Graph y se envía un único aviso por ventana. (`server/api.mjs`: `incoming`, `rateCheck`, `commandText`; `server/store.mjs`: `setOptOut`.)
 7. **Alta estructurada, reservas del teléfono, referencias y número sin reserva.** Antes de buscar reservas del teléfono, si `WA_RESERVATION_MODE` lo permite y el texto empieza con `RESERVA`, el agente valida el mensaje y crea el pedido; el detalle está en [Alta por mensaje estructurado](#alta-por-mensaje-estructurado). Después, el agente busca pedidos del teléfono sin exigir consentimiento para responder. Si el teléfono no tiene reservas, o si el texto menciona una referencia `EST-XXXXXXXX` ajena, responde como número sin reserva: mensaje fijo de cobranza y botón **Hablar con alguien**, sin revelar datos. Si tiene reservas propias y recibe un botón con referencia ajena, esa referencia se ignora y se muestran sus propias reservas. (`server/api.mjs`: `incoming`, `registerReservation`, `replyWithoutReservation`; `server/interactive.mjs`: `noReservationMessage`.)
-8. **Pedido de reserva y `staff`.** Un pedido de reserva se deriva al personal: con reserva existente abre la incidencia **Ayuda del personal** y responde el texto fijo de alcance; sin reserva recibe el aviso de número sin reserva. El botón `staff` (sin referencia) crea o incrementa una consulta sin reserva y responde la confirmación, sin chocar con `accion:REF`. (`server/interactive.mjs`: `reservationRequest`, `parseAction`, `reservationHelpMessage`; `server/api.mjs`: `incoming`, `replyWithoutReservation`.)
+8. **Nuevo pedido y `staff`.** Una solicitud de reserva recibe el formato `RESERVA`; los datos de un texto libre no crean un pedido. La estructura completa se valida con catálogo y disponibilidad antes del alta. El botón `staff` (sin referencia) deriva la consulta sin chocar con `accion:REF`. (`server/interactive.mjs`: `reservationRequest`, `reservationInstructionsMessage`, `parseAction`; `server/api.mjs`: `incoming`, `registerReservation`.)
 9. **Referencia `EST-XXXXXXXX` e identificadores interactivos.** Si el texto contiene una referencia válida del teléfono, el agente selecciona esa reserva. Sin referencia, elige pedidos activos del teléfono (o, si no hay, los restantes); si hay varias reservas, envía una lista `sel:REF` para elegir. Los `button_reply` y `list_reply` se leen por `id`; la referencia del id se resuelve solo entre las reservas de ese teléfono. (`server/api.mjs`: `incoming`; `server/interactive.mjs`: `parseAction`.)
 10. **Cola y n8n.** El POST válido se guarda en el almacén. En modo `n8n`, el workflow llama `POST /api/internal/agent/inbox`; el servidor exige `Authorization: Bearer <N8N_AGENT_TOKEN>`, procesa hasta dos trabajos por ejecución y devuelve contadores `processed` y `failed`. (`server/api.mjs`: `route`, `processInbox`, `drainInbox`; `server/store.mjs`: `openStore`.)
 
@@ -133,8 +133,8 @@ El clasificador local de `server/intents.mjs` incluye atajos y ejemplos en espa�
 | **Alta** | Revierte la baja y responde `Listo, volverás a recibir los recordatorios de tus reservas.` |
 | Número sin reserva: **hola**, **ayuda** u otra consulta | Responde el aviso fijo de cobranza y el botón **Hablar con alguien**. No revela datos de reservas ajenas y no crea una consulta salvo que pida personal. Repite el aviso como máximo una vez cada 12 horas. |
 | Botón **Hablar con alguien** (`staff`) o intención **human** desde un número sin reserva | Crea o incrementa una consulta sin reserva visible en el panel y responde `Listo, avisé al personal. Te contactarán pronto.` |
-| Pedido de reserva en texto libre (**reservar**, **reserva nueva**, **disponibilidad**, **mesa para**, etc.) | El agente no negocia ni ofrece disponibilidad. Con una reserva existente abre la incidencia **Ayuda del personal** y responde `Por aquí solo gestiono los pagos de tu reserva. Para cambios o una reserva nueva, el personal te ayudará.` con el botón **Hablar con alguien**. Sin reserva, recibe el aviso de número sin reserva. |
-| Mensaje estructurado **RESERVA** | Si `WA_RESERVATION_MODE` es `staff` u `open` y el remitente está autorizado, valida los campos, crea el pedido y responde con el total, el anticipo, el vencimiento y el botón **Pagar {importe}**. No usa IA y no acepta importes escritos en el mensaje. |
+| Pedido de reserva (**reservar**, **hacer una reserva**, **crear una reserva**, etc.) | El agente envía la plantilla del mensaje estructurado. No consulta disponibilidad ni registra datos hasta recibir el mensaje completo iniciado por `RESERVA`. |
+| Mensaje estructurado **RESERVA** | Si `WA_RESERVATION_MODE` autoriza al remitente, valida los campos y disponibilidad. Sin cupo, no registra el pedido y pide volver a enviar otra fecha u hora. Con cupo, crea el pedido y envía el enlace de anticipo. El precio sale del catálogo; no acepta importes del cliente. |
 | Otra consulta | Muestra el menú de la reserva en lugar de pedir comandos de texto. |
 
 Las reglas de `classify` son intencionalmente limitadas; no se garantiza que cualquier paráfrasis se clasifique como se espera. Los comandos de texto anteriores siguen funcionando como respaldo.
@@ -143,7 +143,7 @@ Los números sin reserva se guardan en **Conexiones → Consultas sin reserva**:
 
 ### Alta por mensaje estructurado
 
-Con `WA_RESERVATION_MODE=staff` u `open`, un mensaje que empieza con la palabra `RESERVA` registra un pedido ya acordado. Es el mismo alta del formulario del panel: el pedido nace en `awaiting_deposit`, con el plazo del anticipo y la cola de alertas activa, y la respuesta incluye el enlace de pago. El bot no negocia disponibilidad ni modifica precios; solo registra lo que el mensaje declara.
+Al pedir una reserva, el cliente recibe el formato y lo envía en un mensaje separado. Con `WA_RESERVATION_MODE=staff` u `open` y remitente autorizado, un mensaje que empieza con `RESERVA` registra el pedido solo si pasa la validación de disponibilidad configurada. El pedido nace en `awaiting_deposit`, con el plazo del anticipo y la cola de alertas activa, y la respuesta incluye el enlace de pago. El bot no negocia precios ni acepta importes del mensaje. Si el horario no tiene cupo, no registra la reserva y el cliente puede volver a intentar indicando su propio horario preferido.
 
 ```text
 RESERVA
@@ -161,7 +161,7 @@ Consentimiento: si
 - **Productos:** catálogo fijo de 12 productos (`shared/samples.mjs`), formato `2x Producto`, cantidades de 1 a 100 y hasta 30 líneas. El precio sale siempre del catálogo; un importe escrito en el mensaje no se acepta.
 - **Tolerancia:** mayúsculas, tildes, espacios sobrantes y `:` opcional. No se toleran productos inexistentes, fechas ilegibles ni campos ambiguos.
 - **Consentimiento:** si el mensaje no trae `Telefono` o coincide con el remitente, el pagador es quien escribe y el consentimiento es implícito. Si trae el teléfono de un tercero, es un alta de operador: el pedido se crea con `consent: true` solo con `Consentimiento: si`; sin esa marca queda `consent: false` y el bot no inicia mensajes hacia el tercero. La respuesta con el enlace vuelve al operador.
-- **Duplicados y límites:** la clave teléfono + fecha + personas + productos evita duplicar un reenvío dentro de 10 minutos; se responde `Ya tengo esta reserva registrada: {ref}.`. Cada número admite hasta 3 pedidos abiertos en 30 días, además del límite de tasa.
+- **Duplicados y límites:** la clave teléfono + fecha + personas + productos evita duplicar un reenvío dentro de 10 minutos; se responde `Ya tengo esta reserva registrada: {ref}.`. El máximo de reservas abiertas por número en los últimos 30 días es configurable en **Conexiones → Agente y alertas** (inicia en 3), además del límite de tasa.
 - **Errores:** un mensaje incompleto no registra nada. El bot responde el campo que falta o el dato inválido y deja una consulta abierta en **Conexiones → Consultas sin reserva**.
 - **Origen:** el pedido guarda los eventos `Pedido recibido por WhatsApp` y `Origen: cliente` u `Origen: operador`. En el formulario, **Copiar plantilla de reserva** deja el mensaje listo para pegar desde el celular.
 
@@ -210,12 +210,13 @@ Dentro de la ventana, `sendWhatsApp` acepta un string (texto plano, como antes) 
 | Anticipo (`WA_TEMPLATE_DEPOSIT`) | Pagador, referencia, importe del anticipo | Índice 0: URL de pago con el identificador de intento. |
 | Pago rechazado (`WA_TEMPLATE_PAYMENT_REJECTED`) | Pagador, referencia, importe del anticipo | Índice 0: URL de reintento con el identificador del nuevo intento. |
 | Visita (`WA_TEMPLATE_VISIT`) | Pagador, referencia, fecha/hora de visita, saldo | Ninguno. |
-| Confirmación (`WA_TEMPLATE_CONFIRMATION`) | Pagador, referencia, fecha/hora de visita, saldo | Ninguno. |
-| Liquidación (`WA_TEMPLATE_SETTLEMENT`) | Pagador, referencia, importe total | Índice 0: URL de constancia con el token de la constancia. |
+| Confirmación (`WA_TEMPLATE_CONFIRMATION`) | Pagador, referencia, fecha/hora de visita, anticipo y resumen | Índice 0: comprobante de Mercado Pago; base URL `https://www.mercadopago.com.pe/ccap/file-viewer/receipt?flow=cow_payment_receipts&origin=feedback-screen&payment_id=` y el servidor añade el id de operación. |
+| Comprobante de saldo (`WA_TEMPLATE_BALANCE_RECEIPT`) | Pagador, referencia, “Saldo”, importe | Índice 0: comprobante de Mercado Pago con la misma base URL; el servidor añade el id de operación. |
+| Liquidación (`WA_TEMPLATE_SETTLEMENT`) | Pagador, referencia, importe total y detalle de pagos | Índice 0: constancia propia con base `https://TU-DOMINIO/comprobante/`; el servidor añade el token de constancia. |
 
-El idioma se toma de `WA_TEMPLATE_LANGUAGE` (predeterminado documentado en `.env.example`). Los nombres de plantilla deben ser los aprobados en Meta y su estructura/idioma deben coincidir con las variables anteriores.
+El idioma se toma de `WA_TEMPLATE_LANGUAGE` (predeterminado documentado en `.env.example`). Los nombres de plantilla deben ser los aprobados en Meta y su estructura/idioma deben coincidir con las variables anteriores. Las plantillas de comprobante de anticipo y saldo deben tener como base la URL de Mercado Pago indicada en la tabla. La liquidación conserva la constancia propia de PAYERS.
 
-**Caso particular:** al enviar una constancia de anticipo desde el botón de comprobante, el servidor no asigna `WA_TEMPLATE_SETTLEMENT` (esa plantilla se asigna a la liquidación). Dentro de la ventana de 24 horas ese envío usa `cta_url`; sin ventana, no tiene una plantilla configurada en el código y puede devolver 409. (`server/api.mjs`: rama `receipt` de la acción `message`; `server/providers.mjs`: `sendWhatsApp`.)
+Al verificarse el anticipo o el pago del saldo, PAYERS envía un mensaje con el enlace directo al comprobante de esa operación en Mercado Pago. Para mensajes iniciados fuera de la ventana de 24 horas, configura `WA_TEMPLATE_CONFIRMATION` y `WA_TEMPLATE_BALANCE_RECEIPT` con la base de Mercado Pago indicada en la tabla. Cuando se cierra la cobranza, `WA_TEMPLATE_SETTLEMENT` conserva el enlace a la liquidación propia de PAYERS; este enlace usa el token de constancia y abre `/comprobante/{token}`, incluso con el portal de clientes habilitado.
 
 ## 8. Seguridad
 
@@ -236,7 +237,7 @@ El idioma se toma de `WA_TEMPLATE_LANGUAGE` (predeterminado documentado en `.env
 4. **Túnel.** Desde una ventana de terminal ejecuta el túnel hacia el puerto de Node:
 
    ```powershell
-   cloudflared tunnel --url http://127.0.0.1:5173
+   powershell -ExecutionPolicy Bypass -File .\scripts\start-demo.ps1
    ```
 
    Mantén la ventana abierta y copia el origen HTTPS asignado. Configúralo en `PUBLIC_URL` sin una ruta.
@@ -254,7 +255,7 @@ El idioma se toma de `WA_TEMPLATE_LANGUAGE` (predeterminado documentado en `.env
 8. **n8n.** Importa `n8n/Establo-PAYERS.json`; en **API del restaurante** reemplaza el marcador por el origen HTTPS. Configura la credencial Header Auth para enviar el encabezado `Authorization` con `Bearer`, un espacio y el token interno que configuraste. Asígnala a los nodos correspondientes, configura `AGENT_ORCHESTRATION=n8n` y el mismo token en `.env`, y activa/publica el workflow.
 9. **Prueba.** Desde un número de prueba escribe **hola**. Si no tiene reservas, verás el aviso de cobranza y el botón **Hablar con alguien**; pulsa el botón y confirma que la consulta aparece en **Conexiones → Consultas sin reserva**. Si tiene una reserva, se mantiene el menú o la lista. Prueba también **stop**, **alta**, una referencia `EST-XXXXXXXX` válida y otra ajena. Confirma la recepción en el panel y la actividad de n8n. No uses datos de clientes reales para la demo.
 
-**Mercado Pago de prueba.** Con `PAYMENT_MODE=mercado_pago`, configura en la aplicación de Mercado Pago la URL de prueba `https://<TU_DOMINIO>/api/webhooks/mercado-pago` y activa el evento **Pagos**. `start-demo.ps1` muestra la URL vigente al iniciar. Como el túnel temporal cambia en cada ejecución, actualízala antes de probar pagos. PAYERS valida los webhooks, reconcilia preferencias pendientes periódicamente y vuelve a consultar el pago al recibir el retorno del checkout; si el pago queda sin conciliar, usa el número de operación en **Consultar pago**.
+**Mercado Pago de prueba.** Con `PAYMENT_MODE=mercado_pago`, configura una sola vez en la aplicación de Mercado Pago `https://<NGROK_DOMAIN>/api/webhooks/mercado-pago` y activa el evento **Pagos**. `start-demo.ps1` vuelve a mostrar la URL estable al iniciar. PAYERS valida los webhooks, reconcilia preferencias pendientes periódicamente y vuelve a consultar el pago al recibir el retorno del checkout; si el pago queda sin conciliar, usa el número de operación en **Consultar pago**.
 
 Para analizar imágenes y audios, configura también `OPENAI_API_KEY` en el servidor. Es opcional para texto.
 
@@ -300,11 +301,10 @@ También comprueba que `metadata.phone_number_id` coincida con `WA_PHONE_NUMBER_
 ## 12. Operación diaria
 
 - **Token temporal:** renueva el token desde Meta antes de que venza, actualiza `WA_ACCESS_TOKEN` solo en el entorno del servidor y reinicia Node. No lo incluyas en el workflow ni en tickets.
-- **Cambio de túnel:** cuando la dirección temporal cambie, actualiza `PUBLIC_URL`, el origen en el nodo **API del restaurante** de n8n y la URL callback en Meta; reinicia Node y vuelve a validar el webhook. Mantén el túnel y el servidor activos. (`n8n/Activacion.md`.)
-- **Cambio de túnel con Mercado Pago:** actualiza también la URL de prueba del webhook de pagos en la aplicación de Mercado Pago. El túnel temporal no recibe notificaciones en su dirección anterior.
+- **Túnel ngrok:** el dominio guardado en `NGROK_DOMAIN` conserva las URL de webhook entre arranques. Meta y Mercado Pago usan la URL pública de PAYERS; el workflow de n8n llama al panel por `http://127.0.0.1:5173` y PAYERS despierta n8n por loopback, así que n8n no necesita túnel.
 - **Rotación de `N8N_AGENT_TOKEN`:** genera un token nuevo de al menos 32 caracteres, actualízalo en `.env` y en la credencial Header Auth de n8n; reinicia Node y prueba el workflow. Durante el cambio, las llamadas con el token anterior dejarán de autenticarse.
 - **Rotación de Supabase:** crea/rota la credencial de servidor desde Supabase, actualiza `SUPABASE_SECRET_KEY` solo en el entorno del servidor y reinicia Node. El proyecto requiere URL y clave de servidor para el almacén remoto (`server/config.mjs`: `readConfig`; `README.md`). No la copies a n8n ni al navegador.
-- **Workflow:** confirma que esté activo y que use el origen HTTPS correcto. La URL de despertar puede reducir la espera, pero el workflow programado cada minuto es el disparador periódico.
+- **Workflow:** confirma que esté activo para habilitar el webhook de producción y las alertas programadas. Si la llamada local de despertar falla, el workflow programado cada minuto sigue siendo el respaldo.
 - **Consultas sin reserva:** revisa **Conexiones → Consultas sin reserva** y pulsa **Marcar atendida** cuando el personal ya contactó al número. Solo se mantiene una consulta abierta por teléfono; los mensajes nuevos incrementan el conteo.
 - **Bajas y bloqueos:** si un cliente pide no recibir mensajes, confirma que quedó dado de baja y no lo incluyas en envíos manuales sin sesión. Usa `WA_BLOCKED_PHONES` solo para números que deban ignorarse por completo. No publiques teléfonos ni textos de consultas.
 
@@ -315,13 +315,13 @@ También comprueba que `metadata.phone_number_id` coincida con `WA_PHONE_NUMBER_
 - El límite de tasa y el anti-eco de 12 horas viven en memoria: se reinician al reiniciar el proceso. La baja/alta y las consultas sin reserva sí se persisten.
 - El token temporal caduca y requiere renovación.
 - Sin plantillas aprobadas/configuradas no se pueden iniciar mensajes libres fuera de la ventana permitida.
-- El túnel temporal no garantiza una dirección fija ni disponibilidad continua.
+- El dominio fijo de ngrok conserva la dirección, pero el servicio gratuito puede limitar uso o disponibilidad según las condiciones vigentes de la cuenta.
 - La guía no cubre el alta de un número real, la verificación del negocio ni la publicación/revisión de la app para producción.
 - Las respuestas de pago son de demostración y las imágenes de comprobante no verifican ni confirman un pago.
 - Los mensajes interactivos solo viajan dentro de la ventana de 24 horas; fuera de ella se usan plantillas y el agente no puede iniciar un menú con botones.
 - Al tocar un botón con enlace (`cta_url`) no se pudo confirmar un evento interactivo entrante; el agente no depende de ese evento. El enlace abre la página de pago o constancia.
 - **Cambiar fecha** abre una incidencia; no implementa una lista de horarios ni modifica la reserva por chat.
-- El agente no negocia ni ofrece disponibilidad. Solo cobra reservas ya registradas y, si `WA_RESERVATION_MODE` está habilitado, registra un pedido ya acordado mediante el mensaje estructurado `RESERVA`. Un pedido de reserva en texto libre se deriva al personal con un texto fijo.
+- El agente no negocia fechas, personas ni precios en texto libre. Primero entrega el formato `RESERVA`; solo el segundo mensaje completo puede registrar un pedido, tras validar disponibilidad cuando está configurada.
 - El anti-eco de 12 horas aplica solo al aviso de número sin reserva; no bloquea **Hablar con alguien**, la intención `human`, **stop** ni **alta**.
 - El texto real y la aprobación de las plantillas de Meta no están verificados por este repositorio.
 - La suscripción de la WABA y las pantallas actuales de Meta son configuración externa; su estado no se puede verificar desde este repositorio.

@@ -10,9 +10,7 @@ Set-StrictMode -Version 2
 $script:ProjectRoot = Split-Path -Parent $PSScriptRoot
 $script:DemoDirectory = Join-Path $script:ProjectRoot '.demo'
 $script:PidsFile = Join-Path $script:DemoDirectory 'pids.json'
-$script:EnvironmentBackup = Join-Path $script:DemoDirectory 'env.backup'
 $script:StartedProcesses = New-Object 'System.Collections.Generic.List[object]'
-$script:EnvironmentWasUpdated = $false
 $script:RestartMode = $false
 $script:RestartServerProcess = $null
 
@@ -58,97 +56,89 @@ function Get-DemoEnvironment {
   return $values
 }
 
-function Update-DemoEnvironment {
-  param(
-    [Parameter(Mandatory = $true)][string]$EnvPath,
-    [Parameter(Mandatory = $true)][string]$BackupPath,
-    [Parameter(Mandatory = $true)][string]$PublicUrl,
-    [Parameter(Mandatory = $true)][AllowEmptyString()][string]$WakeUrl
-  )
-
-  $directory = Split-Path -Parent $BackupPath
-  if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
-    [void](New-Item -ItemType Directory -Path $directory -Force)
+function Get-NgrokDomain {
+  param([Parameter(Mandatory = $true)][string]$Path)
+  foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+    if ($line -match '^\s*NGROK_DOMAIN\s*=\s*(.*?)\s*$') {
+      $domain = $matches[1].Trim('"').Trim("'").Trim().TrimEnd('/')
+      if ($domain -match '^https?://') { $domain = ([uri]$domain).Host }
+      if ($domain -match '^[a-zA-Z0-9.-]+$') { return $domain.ToLowerInvariant() }
+      throw 'NGROK_DOMAIN tiene un formato no válido. Usa solo el dominio asignado por ngrok.'
+    }
   }
-  Copy-Item -LiteralPath $EnvPath -Destination $BackupPath -Force
+  throw 'Falta NGROK_DOMAIN en .env. Obtén el dominio gratuito en el panel de ngrok, sección Domains, y agrégalo a .env.'
+}
 
-  $temporaryPath = Join-Path $directory ('.env-' + [guid]::NewGuid().ToString('N') + '.tmp')
-  try {
-    $text = [System.IO.File]::ReadAllText($EnvPath, [System.Text.Encoding]::UTF8)
-    $newline = [System.Environment]::NewLine
-    $firstLf = $text.IndexOf("`n", [System.StringComparison]::Ordinal)
-    if ($firstLf -ge 0 -and $firstLf -gt 0 -and $text[$firstLf - 1] -eq "`r") {
-      $newline = "`r`n"
-    } elseif ($firstLf -ge 0) {
-      $newline = "`n"
-    }
+function Get-NgrokHttpFlag {
+  param([Parameter(Mandatory = $true)][string]$NgrokPath)
+  $help = (& $NgrokPath http --help 2>&1 | Out-String)
+  # Busca en la lista de opciones, no en ejemplos o texto general de ayuda.
+  if ($help -match '(?m)^[ \t]*--url(?:[=\s])') { return 'url' }
+  if ($help -match '(?m)^[ \t]*--domain(?:[=\s])') { return 'domain' }
+  throw 'Esta versión de ngrok no documenta --url ni --domain en `ngrok http --help`; actualiza ngrok.'
+}
 
-    $hasTrailingNewline = $text.EndsWith($newline, [System.StringComparison]::Ordinal)
-    $lines = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($line in $text.Split([string[]]@($newline), [System.StringSplitOptions]::None)) {
-      [void]$lines.Add($line)
+function Wait-NgrokTunnel {
+  param(
+    [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
+    [Parameter(Mandatory = $true)][string]$ExpectedUrl,
+    [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+  )
+  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+  while ([DateTime]::UtcNow -lt $deadline) {
+    if ($Process.HasExited) {
+      $log = Read-SharedText -Path $Process.DemoStderrPath
+      if ($log -match 'ERR_NGROK_121') {
+        throw 'La versión instalada del agente ngrok ya no es aceptada por ngrok. Actualízala con `ngrok update` o `winget upgrade --id Ngrok.Ngrok --exact` y vuelve a iniciar.'
+      }
+      if ($log -match 'unknown flag:\s*--url|unknown flag:\s*--domain') {
+        throw 'La versión instalada de ngrok no acepta la opción elegida. Actualiza ngrok con `ngrok update` o `winget upgrade --id Ngrok.Ngrok --exact` y vuelve a iniciar.'
+      }
+      if ($log -match 'ERR_NGROK_108|already online|limit.*session') {
+        throw 'ngrok ya tiene otra sesión activa o se alcanzó el límite del plan gratuito. Cierra únicamente tu otra sesión de ngrok y vuelve a intentar.'
+      }
+      if ($log -match 'ERR_NGROK_(105|4018)|authtoken|authentication failed|invalid.*token') {
+        throw 'ngrok rechazó la autenticación. Configura un authtoken válido con `ngrok config add-authtoken` y vuelve a intentar.'
+      }
+      if ($log -match 'ERR_NGROK_3200|domain.*(not found|not.*account|not.*reserved)|endpoint.*not found|failed to start tunnel') {
+        throw 'ngrok no pudo reservar el dominio. Comprueba que NGROK_DOMAIN esté asignado a esta cuenta y disponible en Domains.'
+      }
+      throw 'ngrok terminó antes de activar el túnel. Revisa .demo/ngrok.err.log; el script no detuvo procesos ajenos.'
     }
-    if ($hasTrailingNewline -and $lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') {
-      $lines.RemoveAt($lines.Count - 1)
-    } elseif ($text.Length -eq 0 -and $lines.Count -eq 1) {
-      $lines.Clear()
-    }
-
-    $foundPublicUrl = $false
-    $foundWakeUrl = $false
-    for ($index = 0; $index -lt $lines.Count; $index++) {
-      if ($lines[$index] -match '^PUBLIC_URL=') {
-        $lines[$index] = 'PUBLIC_URL=' + $PublicUrl
-        $foundPublicUrl = $true
-      } elseif ($lines[$index] -match '^N8N_WAKE_URL=') {
-        $lines[$index] = 'N8N_WAKE_URL=' + $WakeUrl
-        $foundWakeUrl = $true
+    $result = Invoke-DemoHttp -Uri 'http://127.0.0.1:4040/api/tunnels' -Method GET -TimeoutSeconds 2
+    if ($result.StatusCode -eq 200 -and $result.Body) {
+      try {
+        $tunnels = ($result.Body | ConvertFrom-Json).tunnels
+        $match = @($tunnels | Where-Object {
+          $_.public_url -ceq $ExpectedUrl -and ([string]$_.config.addr -match '127\.0\.0\.1:5173$')
+        }) | Select-Object -First 1
+        if ($match) { return $ExpectedUrl }
+        if (@($tunnels | Where-Object { $_.public_url -like 'https://*' }).Count -gt 0) {
+          throw 'La API local de ngrok muestra un túnel distinto al dominio solicitado. Puede haber otra sesión activa; no se detuvo.'
+        }
+      } catch {
+        if ($_.Exception.Message -like 'La API local*') { throw }
       }
     }
-    if (-not $foundPublicUrl) { [void]$lines.Add('PUBLIC_URL=' + $PublicUrl) }
-    if (-not $foundWakeUrl) { [void]$lines.Add('N8N_WAKE_URL=' + $WakeUrl) }
-    if ($hasTrailingNewline) { [void]$lines.Add('') }
-
-    $updatedText = [string]::Join($newline, $lines.ToArray())
-    $encoding = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($temporaryPath, $updatedText, $encoding)
-    Move-Item -LiteralPath $temporaryPath -Destination $EnvPath -Force
-    return $newline
-  } catch {
-    if (Test-Path -LiteralPath $temporaryPath) {
-      Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
-    }
-    if (Test-Path -LiteralPath $BackupPath) {
-      Copy-Item -LiteralPath $BackupPath -Destination $EnvPath -Force -ErrorAction SilentlyContinue
-    }
-    throw
+    Start-Sleep -Seconds 1
   }
-}
-
-function Get-CloudflaredPath {
-  $command = Get-Command 'cloudflared' -ErrorAction SilentlyContinue
-  if ($command -and $command.CommandType -eq 'Application') {
-    return $command.Source
+  $log = Read-SharedText -Path $Process.DemoStderrPath
+  if ($log -match 'ERR_NGROK_121') {
+    throw 'La versión instalada del agente ngrok ya no es aceptada por ngrok. Actualízala con `ngrok update` o `winget upgrade --id Ngrok.Ngrok --exact` y vuelve a iniciar.'
   }
-  $programFilesX86 = [System.Environment]::GetFolderPath('ProgramFilesX86')
-  if ($programFilesX86) {
-    $fallback = Join-Path (Join-Path $programFilesX86 'cloudflared') 'cloudflared.exe'
-    if (Test-Path -LiteralPath $fallback -PathType Leaf) { return $fallback }
+  if ($log -match 'unknown flag:\s*--url|unknown flag:\s*--domain') {
+    throw 'La versión instalada de ngrok no acepta la opción elegida. Actualiza ngrok con `ngrok update` o `winget upgrade --id Ngrok.Ngrok --exact` y vuelve a iniciar.'
   }
-  return $null
-}
-
-function Get-WebhookPath {
-  $workflowPath = Join-Path $script:ProjectRoot 'n8n\Establo-PAYERS.json'
-  if (-not (Test-Path -LiteralPath $workflowPath -PathType Leaf)) {
-    throw 'No se encontró n8n\Establo-PAYERS.json para comprobar la ruta del webhook.'
+  if ($log -match 'ERR_NGROK_(105|4018)|authtoken|authentication failed|invalid.*token') {
+    throw 'ngrok rechazó la autenticación. Configura un authtoken válido con `ngrok config add-authtoken` y vuelve a intentar.'
   }
-  $workflow = Get-Content -LiteralPath $workflowPath -Raw | ConvertFrom-Json
-  $node = @($workflow.nodes | Where-Object { $_.name -eq 'Despertar por WhatsApp' }) | Select-Object -First 1
-  if (-not $node -or -not $node.parameters.path) {
-    throw 'No se encontró el nodo Despertar por WhatsApp o su path en el workflow.'
+  if ($log -match 'ERR_NGROK_108|already online|limit.*session') {
+    throw 'ngrok ya tiene otra sesión activa o se alcanzó el límite del plan gratuito. Cierra únicamente tu otra sesión de ngrok y vuelve a intentar.'
   }
-  return ([string]$node.parameters.path).Trim('/')
+  if ($log -match 'ERR_NGROK_3200|domain.*(not found|not.*account|not.*reserved)|endpoint.*not found') {
+    throw 'ngrok no pudo reservar el dominio. Comprueba que NGROK_DOMAIN esté asignado a esta cuenta y disponible en Domains.'
+  }
+  throw 'ngrok no publicó el dominio esperado en http://127.0.0.1:4040/api/tunnels dentro del tiempo límite. Revisa .demo/ngrok.err.log, el authtoken y el dominio de la cuenta.'
 }
 
 function Get-ProcessIdentity {
@@ -225,6 +215,12 @@ function Stop-DemoProcessEntry {
   } else {
     Write-Warning ('Se omitió el PID {0}: no tiene identidad de proceso verificable.' -f $processId)
     return
+  }
+  if (($Entry.processName -eq 'cloudflared') -or ($Entry.name -match 'cloudflared')) {
+    if ($process.ProcessName -ne 'cloudflared') {
+      Write-Warning ('Entrada antigua de cloudflared PID {0}: el proceso ya no se llama cloudflared; no se detuvo.' -f $processId)
+      return
+    }
   }
   Write-Host ('Deteniendo proceso registrado PID {0} y sus hijos...' -f $processId)
   $null = & $TaskkillPath /PID $processId /T /F 2>&1
@@ -396,38 +392,6 @@ function Wait-DemoHttp {
   throw ('{0} no respondió en {1} segundos: {2}' -f $ServiceName, $TimeoutSeconds, $Uri)
 }
 
-function Wait-DemoTunnel {
-  param(
-    [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
-    [Parameter(Mandatory = $true)][string]$StderrPath,
-    [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
-    [Parameter(Mandatory = $true)][string]$TunnelName
-  )
-
-  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-  $pattern = 'https://([a-z0-9-]+)\.trycloudflare\.com'
-  while ([DateTime]::UtcNow -lt $deadline) {
-    if ($Process.HasExited) {
-      throw ('cloudflared terminó antes de publicar la dirección del {0}.' -f $TunnelName)
-    }
-    try {
-      $logText = Read-SharedText -Path $StderrPath
-      foreach ($match in [System.Text.RegularExpressions.Regex]::Matches($logText, $pattern)) {
-        if ($match.Groups[1].Value -ne 'api') {
-          $url = $match.Value
-          Write-Host ('OK: {0} disponible en {1}.' -f $TunnelName, $url)
-          return $url
-        }
-      }
-    } catch [System.IO.IOException] {
-      Start-Sleep -Seconds 1
-      continue
-    }
-    Start-Sleep -Seconds 1
-  }
-  throw ('No apareció una dirección quick tunnel válida para {0} en {1} segundos.' -f $TunnelName, $TimeoutSeconds)
-}
-
 function Write-DemoCheck {
   param(
     [Parameter(Mandatory = $true)][bool]$Passed,
@@ -440,45 +404,10 @@ function Write-DemoCheck {
   }
 }
 
-function Test-DemoTunnel {
-  param(
-    [Parameter(Mandatory = $true)][string]$Uri,
-    [Parameter(Mandatory = $true)][ValidateSet('GET', 'POST')][string]$Method,
-    [Parameter(Mandatory = $true)][string]$Label,
-    [int[]]$ExpectedStatusCodes,
-    [string]$ExpectedBodyPattern,
-    [int]$TimeoutSeconds = 90,
-    [switch]$ExplainNotPublished
-  )
-
-  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-  $lastResponse = [pscustomobject]@{ StatusCode = 0; Body = '' }
-  while ([DateTime]::UtcNow -lt $deadline) {
-    $remainingSeconds = ($deadline - [DateTime]::UtcNow).TotalSeconds
-    $requestTimeout = [Math]::Max(1, [Math]::Min(5, [Math]::Ceiling($remainingSeconds)))
-    $lastResponse = Invoke-DemoHttp -Uri $Uri -Method $Method -TimeoutSeconds $requestTimeout
-    $statusAccepted = $ExpectedStatusCodes -contains $lastResponse.StatusCode
-    $bodyAccepted = (-not $ExpectedBodyPattern) -or ($lastResponse.Body -match $ExpectedBodyPattern)
-    if ($statusAccepted -and $bodyAccepted) {
-      Write-DemoCheck -Passed $true -Label ('{0} (HTTP {1}).' -f $Label, $lastResponse.StatusCode)
-      return
-    }
-    $remainingSeconds = ($deadline - [DateTime]::UtcNow).TotalSeconds
-    if ($remainingSeconds -gt 0) {
-      Start-Sleep -Seconds ([Math]::Min(2, [Math]::Ceiling($remainingSeconds)))
-    }
-  }
-
-  if ($ExplainNotPublished -and $lastResponse.StatusCode -eq 404) {
-    Write-Host 'FALLÓ: el túnel de n8n responde 404. Publica/activa el workflow y confirma su URL Production.'
-  } else {
-    Write-DemoCheck -Passed $false `
-      -Label ('{0} tras {1} s (último HTTP {2}).' -f $Label, $TimeoutSeconds, $lastResponse.StatusCode)
-  }
-}
-
-$environmentUpdated = $false
 $n8nReused = $false
+$previousPublicUrl = $env:PUBLIC_URL
+$previousWakeUrl = $env:N8N_WAKE_URL
+$previousWebhookUrl = $env:WEBHOOK_URL
 try {
   Set-Location -LiteralPath $script:ProjectRoot
   $envPath = Join-Path $script:ProjectRoot '.env'
@@ -501,7 +430,21 @@ try {
   if (-not $npmCommand -or $npmCommand.CommandType -ne 'Application') {
     throw 'No se encontró npm.cmd en PATH. Repara la instalación de Node.js y vuelve a intentarlo.'
   }
+  $ngrokCommand = $null
+  if (-not $RestartServer) {
+    $ngrokCommand = Get-Command 'ngrok' -ErrorAction SilentlyContinue
+    if (-not $ngrokCommand -or $ngrokCommand.CommandType -ne 'Application') {
+      throw 'No se encontró ngrok. Instálalo con: winget install ngrok.ngrok'
+    }
+  }
   $environment = Get-DemoEnvironment -Path $envPath
+  $ngrokDomain = Get-NgrokDomain -Path $envPath
+  $panelUrl = 'https://' + $ngrokDomain
+  $configuredPublicUrl = [string]$environment['PUBLIC_URL']
+  if ($configuredPublicUrl.TrimEnd('/') -and $configuredPublicUrl.TrimEnd('/') -cne $panelUrl) {
+    Write-Warning 'PUBLIC_URL en .env difiere del dominio ngrok; PAYERS usará el dominio fijo solo en este proceso.'
+  }
+  $wakeUrl = 'http://127.0.0.1:5678/webhook/establo-payers-despertar'
   $orchestration = 'server'
   if ($environment.ContainsKey('AGENT_ORCHESTRATION') -and $environment['AGENT_ORCHESTRATION']) {
     $orchestration = [string]$environment['AGENT_ORCHESTRATION']
@@ -531,12 +474,9 @@ try {
   }
   if ($n8nPort -eq $n8nBrokerPort) { throw 'N8N_PORT y N8N_RUNNERS_BROKER_PORT deben ser distintos.' }
   $n8nCommand = $null
-  $cloudflaredPath = $null
+  $ngrokFlag = $null
   if (-not $RestartServer) {
-    $cloudflaredPath = Get-CloudflaredPath
-    if (-not $cloudflaredPath) {
-      throw 'No se encontró cloudflared en PATH ni en Program Files (x86)\cloudflared.'
-    }
+    $ngrokFlag = Get-NgrokHttpFlag -NgrokPath $ngrokCommand.Source
   }
   if ($orchestration -eq 'n8n' -and -not $RestartServer) {
     $n8nCommand = Get-Command 'n8n.cmd' -ErrorAction SilentlyContinue
@@ -547,26 +487,19 @@ try {
       throw 'AGENT_ORCHESTRATION=n8n, pero no se encontró el comando n8n en PATH.'
     }
   }
-  $webhookPath = $null
-  if (-not $RestartServer) { $webhookPath = Get-WebhookPath }
-
   if ($RestartServer) {
     Write-Host 'Validación inicial: OK (.env, package.json, node y npm.cmd).'
   } else {
-    Write-Host 'Validación inicial: OK (.env, package.json, node, npm.cmd y cloudflared).'
+    Write-Host 'Validación inicial: OK (.env, package.json, node, npm.cmd y ngrok).'
   }
   Write-Host ('Orquestación configurada: {0}.' -f $orchestration)
-  if ($orchestration -eq 'n8n' -and -not $RestartServer) {
-    Write-Host ('Ruta del webhook leída del workflow: /webhook/{0}' -f $webhookPath)
-  }
 
   if ($DryRun) {
     Write-Host ''
     Write-Host 'MODO DRY RUN: no se iniciará ni detendrá ningún proceso y no se modificará .env.'
     if ($RestartServer) {
-      Write-Host 'MODO REINICIO: detendría únicamente el PID servidor PAYERS en .demo/pids.json; conservaría n8n y ambos túneles.'
-      Write-Host 'Reiniciaría npm.cmd start, actualizaría solo el registro de su PID y repetiría comprobaciones con hasta 90 s por túnel.'
-      Write-Host 'No modificaría PUBLIC_URL ni N8N_WAKE_URL.'
+      Write-Host 'MODO REINICIO: detendría solo el servidor PAYERS identificado en el puerto 5173 y conservaría n8n y ngrok.'
+      Write-Host 'Reiniciaría el servidor usando las URL del dominio fijo solo en el proceso; no modificaría .env.'
       return
     }
     if (Test-Path -LiteralPath $script:PidsFile -PathType Leaf) {
@@ -574,33 +507,36 @@ try {
     } else {
       Write-Host '1. No hay procesos previos registrados para detener.'
     }
-    if (-not $NoBuild -and -not (Test-Path -LiteralPath $distIndex -PathType Leaf)) {
-      Write-Host '2. Ejecutaría npm.cmd run build.'
-    } elseif ($NoBuild) {
+    if ($NoBuild) {
       Write-Host '2. Omitiría la compilación por -NoBuild.'
     } else {
-      Write-Host '2. Omitiría la compilación porque dist/index.html ya existe.'
+      Write-Host '2. Ejecutaría npm.cmd run build para actualizar la interfaz en cada arranque.'
     }
     if ($orchestration -eq 'n8n') {
       Write-Host ('3. Reutilizaría n8n si ya responde y tiene registrado el webhook en {0}; si no, lo iniciaría.' -f $n8nOrigin)
     } else {
       Write-Host '3. Omitiría n8n porque AGENT_ORCHESTRATION=server.'
     }
-    Write-Host '4. Iniciaría cloudflared hacia http://127.0.0.1:5173 y leería su stderr (60 s).'
-    if ($orchestration -eq 'n8n') {
-      Write-Host ('5. Iniciaría el segundo túnel hacia {0}.' -f $n8nOrigin)
-    } else {
-      Write-Host '5. Omitiría el segundo túnel y dejaría N8N_WAKE_URL vacía.'
-    }
-    Write-Host '6. Guardaría una copia en .demo/env.backup y actualizaría solo PUBLIC_URL y N8N_WAKE_URL.'
-    Write-Host '7. Iniciaría npm.cmd start y esperaría http://127.0.0.1:5173 (60 s).'
-    Write-Host '8. Probaría el webhook Meta con token inválido, el webhook n8n sin autorización y el token WA sin imprimirlo.'
-    Write-Host '9. Mostraría la URL del panel y las instrucciones para actualizar Meta.'
+    Write-Host '4. Iniciaría un solo ngrok para 127.0.0.1:5173 y esperaría su API local en 127.0.0.1:4040.'
+    Write-Host '5. Iniciaría/reutilizaría n8n local cuando AGENT_ORCHESTRATION=n8n y revisaría /healthz.'
+    Write-Host '6. Iniciaría PAYERS con PUBLIC_URL fijo y N8N_WAKE_URL local, sin modificar .env.'
+    Write-Host '7. Comprobaría PAYERS localmente y el dominio propio con ngrok-skip-browser-warning.'
+    Write-Host '8. Mostraría las URL estables para registrar una sola vez en Meta y Mercado Pago.'
     return
   }
 
   if (-not (Test-Path -LiteralPath $script:DemoDirectory -PathType Container)) {
     [void](New-Item -ItemType Directory -Path $script:DemoDirectory -Force)
+  }
+  if (-not $NoBuild) {
+    Write-Host 'Compilando la aplicación para publicar los cambios recientes...'
+    & $npmCommand.Source run build
+    if ($LASTEXITCODE -ne 0) { throw ('La compilación terminó con código {0}; no se reinició ningún servicio.' -f $LASTEXITCODE) }
+  } elseif (-not (Test-Path -LiteralPath $distIndex -PathType Leaf)) {
+    throw 'No existe dist/index.html. Quita -NoBuild o ejecuta npm.cmd run build.'
+  }
+  if (-not (Test-Path -LiteralPath $distIndex -PathType Leaf)) {
+    throw 'La compilación terminó sin generar dist/index.html.'
   }
   if ($RestartServer) {
     if (-not (Test-Path -LiteralPath $script:PidsFile -PathType Leaf)) {
@@ -609,19 +545,36 @@ try {
     $trackedData = Read-SharedText -Path $script:PidsFile | ConvertFrom-Json
     $trackedProcesses = @($trackedData.processes)
     $oldServer = @($trackedProcesses | Where-Object { $_.name -eq 'servidor PAYERS' }) | Select-Object -First 1
-    if (-not $oldServer) {
-      throw 'No se encontró el PID del servidor PAYERS en .demo/pids.json; no se modificó ningún proceso.'
-    }
     $taskkill = Get-Command 'taskkill.exe' -ErrorAction SilentlyContinue
     if (-not $taskkill) { throw 'No se encontró taskkill.exe para reiniciar solo el servidor registrado.' }
+    $serverToStop = $null
     $oldServerId = 0
-    if (-not [int]::TryParse([string]$oldServer.pid, [ref]$oldServerId) -or $oldServerId -le 0) {
-      throw 'El PID registrado para el servidor no es válido; no se modificó ningún proceso.'
+    if ($oldServer -and [int]::TryParse([string]$oldServer.pid, [ref]$oldServerId) -and $oldServerId -gt 0) {
+      $candidate = Get-Process -Id $oldServerId -ErrorAction SilentlyContinue
+      if ($candidate -and $oldServer.startTimeUtcTicks -and
+          [long]$candidate.StartTime.ToUniversalTime().Ticks -eq [long]$oldServer.startTimeUtcTicks) {
+        $serverToStop = $candidate
+      }
     }
-    $oldServerProcess = Get-Process -Id $oldServerId -ErrorAction SilentlyContinue
-    if (-not $oldServerProcess -or -not $oldServer.startTimeUtcTicks -or
-        [long]$oldServerProcess.StartTime.ToUniversalTime().Ticks -ne [long]$oldServer.startTimeUtcTicks) {
-      throw 'El PID registrado del servidor ya no identifica su proceso original; no se reinició ningún otro proceso.'
+    if (-not $serverToStop) {
+      $listenerId = Get-DemoListenerProcessId -Port 5173
+      if ($listenerId) {
+        $candidate = Get-Process -Id $listenerId -ErrorAction SilentlyContinue
+        $cimProcess = Get-CimInstance Win32_Process -Filter ('ProcessId = {0}' -f $listenerId) -ErrorAction SilentlyContinue
+        $commandLine = [string]$cimProcess.CommandLine
+        $normalizedRoot = $script:ProjectRoot.TrimEnd('\')
+        $belongsToProject = ($commandLine -and $commandLine.IndexOf($normalizedRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+          ($candidate -and $candidate.ProcessName -eq 'node' -and $commandLine -match 'server[\\/]start\.mjs')
+        if ($belongsToProject) {
+          $serverToStop = $candidate
+          $oldServer = Get-ProcessIdentity -Process $candidate -Name 'servidor PAYERS'
+          Write-Warning 'El PID guardado cambió; se identificó el servidor PAYERS por el proceso que escucha en 5173.'
+        } else {
+          throw ('El PID guardado no coincide y el proceso que escucha en 5173 no se pudo asociar a este proyecto (PID {0}); no se detuvo.' -f $listenerId)
+        }
+      } else {
+        throw 'El PID guardado no coincide y no hay un proceso escuchando en 5173; no se detuvo ningún otro proceso.'
+      }
     }
     Stop-DemoProcessEntry -Entry $oldServer -TaskkillPath $taskkill.Source
     foreach ($entry in $trackedProcesses) {
@@ -630,50 +583,29 @@ try {
     $script:RestartMode = $true
     Save-DemoPids
 
+    $env:PUBLIC_URL = $panelUrl
+    $env:N8N_WAKE_URL = $wakeUrl
     $serverProcess = Start-DemoProcess -Name 'servidor PAYERS' -Executable $npmCommand.Source `
       -Arguments @('start') -StdoutPath (Join-Path $script:DemoDirectory 'server.out.log') `
       -StderrPath (Join-Path $script:DemoDirectory 'server.err.log')
+    $env:PUBLIC_URL = $previousPublicUrl
+    $env:N8N_WAKE_URL = $previousWakeUrl
     Wait-DemoHttp -Uri 'http://127.0.0.1:5173/' -TimeoutSeconds 60 -ServiceName 'Servidor del panel reiniciado'
     Register-DemoListenerProcess -Launcher $serverProcess -Port 5173 -Name 'servidor PAYERS'
 
-    $panelUrl = [string]$environment['PUBLIC_URL']
-    if (-not $panelUrl) { throw 'PUBLIC_URL no está configurada en .env; no se puede repetir la verificación del túnel Meta.' }
-    $panelUrl = $panelUrl.TrimEnd('/')
-    $metaWebhookUrl = $panelUrl + '/api/webhooks/whatsapp'
-    $metaVerificationUrl = $metaWebhookUrl + '?hub.mode=subscribe&hub.verify_token=invalido&hub.challenge=1'
-    Test-DemoTunnel -Uri $metaVerificationUrl -Method GET -Label 'El túnel del panel llega al webhook Meta (token de prueba inválido)' `
-      -ExpectedStatusCodes @(403) -ExpectedBodyPattern 'Verificaci.n inv.lida' -TimeoutSeconds 90
-
-    if ($orchestration -eq 'n8n') {
-      $wakeUrl = [string]$environment['N8N_WAKE_URL']
-      if (-not $wakeUrl) { throw 'AGENT_ORCHESTRATION=n8n, pero N8N_WAKE_URL está vacía; no se puede verificar el túnel existente.' }
-      Test-DemoTunnel -Uri $wakeUrl -Method POST -Label 'El túnel de n8n exige autorización sin cabecera' `
-        -ExpectedStatusCodes @(401, 403) -TimeoutSeconds 90 -ExplainNotPublished
-    }
-
-    $graphVersion = [string]$environment['WA_GRAPH_VERSION']
-    $phoneNumberId = [string]$environment['WA_PHONE_NUMBER_ID']
-    $accessToken = [string]$environment['WA_ACCESS_TOKEN']
-    if ($graphVersion -and $phoneNumberId -and $accessToken) {
-      $graphUrl = 'https://graph.facebook.com/{0}/{1}' -f $graphVersion, [uri]::EscapeDataString($phoneNumberId)
-      $graphCheck = Invoke-DemoHttp -Uri $graphUrl -Method GET -Headers @{ Authorization = 'Bearer ' + $accessToken }
-      $graphErrorCode = $null
-      if ($graphCheck.Body) {
-        try {
-          $graphBody = $graphCheck.Body | ConvertFrom-Json
-          if ($graphBody.error -and $graphBody.error.code) { $graphErrorCode = [int]$graphBody.error.code }
-        } catch { $graphErrorCode = $null }
-      }
-      if ($graphErrorCode -eq 190) {
-        Write-Host 'FALLÓ: El WA_ACCESS_TOKEN venció: genera uno nuevo en Meta (Paso 1: Pruébalo → Generar nuevo token), pégalo en el .env y reinicia el servidor'
-      } else {
-        Write-DemoCheck -Passed ($graphCheck.StatusCode -ge 200 -and $graphCheck.StatusCode -lt 300) `
-          -Label 'Validación del token de WhatsApp (no se muestra el token).'
-      }
+    $publicHealth = Invoke-DemoHttp -Uri $panelUrl -Method GET `
+      -Headers @{ 'ngrok-skip-browser-warning' = 'true' } -TimeoutSeconds 8
+    Write-DemoCheck -Passed ($publicHealth.StatusCode -ge 200 -and $publicHealth.StatusCode -lt 400) `
+      -Label 'El dominio propio de ngrok llega a PAYERS (se omite el aviso del navegador).'
+    $n8nHealth = Invoke-DemoHttp -Uri 'http://127.0.0.1:5678/healthz' -Method GET -TimeoutSeconds 5
+    if ($n8nHealth.StatusCode -eq 200) {
+      Write-DemoCheck -Passed $true -Label 'n8n responde en http://127.0.0.1:5678/healthz.'
     } else {
-      Write-DemoCheck -Passed $false -Label 'No se pudo validar el token: faltan variables WA requeridas en .env.'
+      Write-Warning 'n8n no respondió en http://127.0.0.1:5678/healthz; comprueba que esté activo para las alertas.'
     }
-    Write-Host 'Reinicio completado. n8n, los túneles y las URLs de .env quedaron intactos.'
+    Write-Host ('Meta WhatsApp: {0}/api/webhooks/whatsapp' -f $panelUrl)
+    Write-Host ('Mercado Pago:  {0}/api/webhooks/mercado-pago' -f $panelUrl)
+    Write-Host 'Reinicio completado. n8n y ngrok quedaron intactos; .env no se modificó.'
     Write-Host ('Logs del servidor: {0} y {1}' -f $serverProcess.DemoStdoutPath, $serverProcess.DemoStderrPath)
     return
   }
@@ -689,14 +621,8 @@ try {
     throw ('El puerto 5173 ya está ocupado por PID {0}; no se iniciaron n8n ni los túneles. Detén el servidor anterior o libera ese puerto.' -f $existingPanelListener)
   }
 
-  if (-not $NoBuild -and -not (Test-Path -LiteralPath $distIndex -PathType Leaf)) {
-    Write-Host 'Compilando la aplicación con npm.cmd run build...'
-    & $npmCommand.Source run build
-    if ($LASTEXITCODE -ne 0) { throw ('La compilación terminó con código {0}.' -f $LASTEXITCODE) }
-  } elseif ($NoBuild) {
+  if ($NoBuild) {
     Write-Host 'Se omite la compilación por -NoBuild.'
-  } else {
-    Write-Host 'dist/index.html ya existe; se omite la compilación.'
   }
   if (-not (Test-Path -LiteralPath $distIndex -PathType Leaf)) {
     throw 'No existe dist/index.html. Quita -NoBuild o ejecuta npm.cmd run build.'
@@ -705,158 +631,98 @@ try {
   if ($orchestration -eq 'n8n') {
     $existingN8nListener = Get-DemoListenerProcessId -Port $n8nPort
     if ($existingN8nListener) {
-      $n8nHealth = Invoke-DemoHttp -Uri ($n8nOrigin + '/healthz') -Method GET -TimeoutSeconds 5
-      if ($n8nHealth.StatusCode -ne 200) {
-        throw ('El puerto {0} ya está ocupado por PID {1}, pero n8n no responde en /healthz (HTTP {2}).' -f $n8nPort, $existingN8nListener, $n8nHealth.StatusCode)
-      }
-      $n8nWebhookCheck = Invoke-DemoHttp -Uri ($n8nOrigin + '/webhook/' + $webhookPath) `
-        -Method POST -TimeoutSeconds 5
-      if (@(401, 403) -notcontains $n8nWebhookCheck.StatusCode) {
-        throw ('n8n responde en el puerto {0}, pero el webhook /webhook/{1} no está registrado (HTTP {2}). Activa el workflow en esa instancia.' -f $n8nPort, $webhookPath, $n8nWebhookCheck.StatusCode)
-      }
       $n8nReused = $true
-      Write-Host ('Reutilizando n8n existente (PID {0}); webhook registrado y protegido.' -f $existingN8nListener)
+      Write-Host ('Reutilizando n8n existente en el puerto local {0} (PID {1}).' -f $n8nPort, $existingN8nListener)
     } else {
       $env:N8N_PORT = [string]$n8nPort
       $env:N8N_RUNNERS_BROKER_PORT = [string]$n8nBrokerPort
+      $env:WEBHOOK_URL = $n8nOrigin + '/'
       $n8nProcess = Start-DemoProcess -Name 'n8n' -Executable $n8nCommand.Source `
         -Arguments @('start') -StdoutPath (Join-Path $script:DemoDirectory 'n8n.out.log') `
         -StderrPath (Join-Path $script:DemoDirectory 'n8n.err.log')
+      $env:WEBHOOK_URL = $previousWebhookUrl
       Wait-DemoHttp -Uri ($n8nOrigin + '/healthz') -TimeoutSeconds 90 -ServiceName 'n8n'
     }
   }
 
-  $panelTunnel = Start-DemoProcess -Name 'cloudflared túnel del panel' -Executable $cloudflaredPath `
-    -Arguments @('tunnel', '--url', 'http://127.0.0.1:5173') `
-    -StdoutPath (Join-Path $script:DemoDirectory 'panel-tunnel.out.log') `
-    -StderrPath (Join-Path $script:DemoDirectory 'panel-tunnel.err.log')
-  $panelUrl = Wait-DemoTunnel -Process $panelTunnel `
-    -StderrPath $panelTunnel.DemoStderrPath `
-    -TimeoutSeconds 60 -TunnelName 'Túnel del panel'
-
-  $wakeUrl = ''
-  $n8nTunnelUrl = ''
-  if ($orchestration -eq 'n8n') {
-    $n8nTunnel = Start-DemoProcess -Name 'cloudflared túnel de n8n' -Executable $cloudflaredPath `
-      -Arguments @('tunnel', '--url', $n8nOrigin) `
-      -StdoutPath (Join-Path $script:DemoDirectory 'n8n-tunnel.out.log') `
-      -StderrPath (Join-Path $script:DemoDirectory 'n8n-tunnel.err.log')
-    $n8nTunnelUrl = Wait-DemoTunnel -Process $n8nTunnel `
-      -StderrPath $n8nTunnel.DemoStderrPath `
-      -TimeoutSeconds 60 -TunnelName 'Túnel de n8n'
-    $wakeUrl = $n8nTunnelUrl + '/webhook/' + $webhookPath
+  $activeTunnels = Invoke-DemoHttp -Uri 'http://127.0.0.1:4040/api/tunnels' -Method GET -TimeoutSeconds 2
+  if ($activeTunnels.StatusCode -eq 200 -and $activeTunnels.Body) {
+    try {
+      if (@(($activeTunnels.Body | ConvertFrom-Json).tunnels).Count -gt 0) {
+        throw 'Ya existe una sesión de ngrok expuesta en la API local de 127.0.0.1:4040. Cierra esa sesión manualmente o conserva el túnel existente; PAYERS no la terminará.'
+      }
+    } catch {
+      if ($_.Exception.Message -like 'Ya existe una sesión*') { throw }
+    }
   }
+  $domainFlag = if ($ngrokFlag -eq 'url') { '--url=' + $panelUrl } else { '--domain=' + $ngrokDomain }
+  $ngrokProcess = Start-DemoProcess -Name 'ngrok túnel PAYERS' -Executable $ngrokCommand.Source `
+    -Arguments @('http', $domainFlag, '127.0.0.1:5173') `
+    -StdoutPath (Join-Path $script:DemoDirectory 'ngrok.out.log') `
+    -StderrPath (Join-Path $script:DemoDirectory 'ngrok.err.log')
+  [void](Wait-NgrokTunnel -Process $ngrokProcess -ExpectedUrl $panelUrl -TimeoutSeconds 60)
+  Write-Host ('OK: túnel ngrok fijo activo en {0}.' -f $panelUrl)
 
-  [void](Update-DemoEnvironment -EnvPath $envPath -BackupPath $script:EnvironmentBackup `
-    -PublicUrl $panelUrl -WakeUrl $wakeUrl)
-  $environmentUpdated = $true
-  $script:EnvironmentWasUpdated = $true
-  Write-Host 'Se actualizó .env (solo PUBLIC_URL y N8N_WAKE_URL); los valores no se mostrarán.'
-
+  $env:PUBLIC_URL = $panelUrl
+  $env:N8N_WAKE_URL = $wakeUrl
   $serverProcess = Start-DemoProcess -Name 'servidor PAYERS' -Executable $npmCommand.Source `
     -Arguments @('start') -StdoutPath (Join-Path $script:DemoDirectory 'server.out.log') `
     -StderrPath (Join-Path $script:DemoDirectory 'server.err.log')
+  $env:PUBLIC_URL = $previousPublicUrl
+  $env:N8N_WAKE_URL = $previousWakeUrl
   Wait-DemoHttp -Uri 'http://127.0.0.1:5173/' -TimeoutSeconds 60 -ServiceName 'Servidor del panel'
   Register-DemoListenerProcess -Launcher $serverProcess -Port 5173 -Name 'servidor PAYERS'
 
-  $metaWebhookUrl = $panelUrl + '/api/webhooks/whatsapp'
-  $metaVerificationUrl = $metaWebhookUrl + '?hub.mode=subscribe&hub.verify_token=invalido&hub.challenge=1'
-  Test-DemoTunnel -Uri $metaVerificationUrl -Method GET `
-    -Label 'El túnel del panel llega al webhook Meta (token de prueba inválido)' `
-    -ExpectedStatusCodes @(403) -ExpectedBodyPattern 'Verificaci.n inv.lida' -TimeoutSeconds 90
-
-  if ($orchestration -eq 'n8n') {
-    $n8nWebhookUrl = $n8nTunnelUrl + '/webhook/' + $webhookPath
-    Test-DemoTunnel -Uri $n8nWebhookUrl -Method POST `
-      -Label 'El túnel de n8n exige autorización sin cabecera' `
-      -ExpectedStatusCodes @(401, 403) -TimeoutSeconds 90 -ExplainNotPublished
-  }
-
-  $environment = Get-DemoEnvironment -Path $envPath
-  $graphVersion = [string]$environment['WA_GRAPH_VERSION']
-  $phoneNumberId = [string]$environment['WA_PHONE_NUMBER_ID']
-  $accessToken = [string]$environment['WA_ACCESS_TOKEN']
-  if ($graphVersion -and $phoneNumberId -and $accessToken) {
-    $graphUrl = 'https://graph.facebook.com/{0}/{1}' -f $graphVersion, [uri]::EscapeDataString($phoneNumberId)
-    $graphCheck = Invoke-DemoHttp -Uri $graphUrl -Method GET `
-      -Headers @{ Authorization = 'Bearer ' + $accessToken }
-    $graphErrorCode = $null
-    if ($graphCheck.Body) {
-      try {
-        $graphBody = $graphCheck.Body | ConvertFrom-Json
-        if ($graphBody.error -and $graphBody.error.code) { $graphErrorCode = [int]$graphBody.error.code }
-      } catch {
-        $graphErrorCode = $null
-      }
-    }
-    if ($graphErrorCode -eq 190) {
-      Write-Host 'FALLÓ: El WA_ACCESS_TOKEN venció: genera uno nuevo en Meta (Paso 1: Pruébalo → Generar nuevo token), pégalo en el .env y reinicia el servidor'
-    } else {
-      $graphPassed = ($graphCheck.StatusCode -ge 200 -and $graphCheck.StatusCode -lt 300)
-      if ($graphPassed) {
-        Write-DemoCheck -Passed $true -Label 'Meta aceptó el token de WhatsApp (no se muestra el token).'
-      } else {
-        Write-DemoCheck -Passed $false -Label ('Meta no validó el token de WhatsApp (HTTP {0}; no se muestra la respuesta ni el token).' -f $graphCheck.StatusCode)
-      }
-    }
-  } else {
-    Write-DemoCheck -Passed $false -Label 'No se pudo validar el token: faltan WA_GRAPH_VERSION, WA_PHONE_NUMBER_ID o WA_ACCESS_TOKEN en .env.'
-  }
-
   [void]$script:StartedProcesses.ToArray()
   Save-DemoPids
-  $clipboardMessage = 'URL de devolución de llamada: ' + $metaWebhookUrl
-  try {
-    Set-Clipboard -Value $clipboardMessage
-    $clipboardStatus = 'La URL de devolución de llamada se copió al portapapeles.'
-  } catch {
-    $clipboardStatus = 'No se pudo usar el portapapeles; copia la URL que aparece abajo.'
+  $metaWebhookUrl = $panelUrl + '/api/webhooks/whatsapp'
+  $mercadoPagoWebhookUrl = $panelUrl + '/api/webhooks/mercado-pago'
+  $publicHealth = Invoke-DemoHttp -Uri $panelUrl -Method GET `
+    -Headers @{ 'ngrok-skip-browser-warning' = 'true' } -TimeoutSeconds 10
+  Write-DemoCheck -Passed ($publicHealth.StatusCode -ge 200 -and $publicHealth.StatusCode -lt 400) `
+    -Label 'El dominio público de ngrok llega al panel.'
+  $n8nHealth = Invoke-DemoHttp -Uri 'http://127.0.0.1:5678/healthz' -Method GET -TimeoutSeconds 5
+  if ($n8nHealth.StatusCode -eq 200) {
+    Write-DemoCheck -Passed $true -Label 'n8n responde en http://127.0.0.1:5678/healthz.'
+  } else {
+    Write-Warning 'n8n no respondió en http://127.0.0.1:5678/healthz. PAYERS y el túnel pueden funcionar, pero las alertas programadas requieren n8n activo.'
   }
 
   Write-Host ''
   Write-Host '============================================================'
-  Write-Host 'SIGUIENTE PASO MANUAL EN META'
+  Write-Host 'URLS ESTABLES PARA REGISTRAR UNA SOLA VEZ'
   Write-Host '============================================================'
   Write-Host 'Ruta: Casos de uso → Personalizar → Configuración → Webhook.'
-  Write-Host ('URL de devolución de llamada: {0}' -f $metaWebhookUrl)
-  Write-Host $clipboardStatus
+  Write-Host ('Meta WhatsApp: {0}' -f $metaWebhookUrl)
+  Write-Host ('Mercado Pago:  {0}' -f $mercadoPagoWebhookUrl)
   Write-Host 'Token de verificación: usa el valor de WA_VERIFY_TOKEN de tu .env (no se imprime aquí).'
   Write-Host 'Pulsa “Verificar y guardar” y comprueba que el campo “messages” siga en “Suscritos”.'
   Write-Host 'Si no actualizas la URL en Meta, los mensajes de WhatsApp no llegarán.'
-  if ($environment['PAYMENT_MODE'] -eq 'mercado_pago') {
-    Write-Host ''
-    Write-Host 'WEBHOOK DE PAGOS DE MERCADO PAGO (MODO DE PRUEBA)'
-    Write-Host ('URL: {0}/api/webhooks/mercado-pago' -f $panelUrl)
-    Write-Host 'En Tus integraciones → tu aplicación → Webhooks, actualiza la URL de prueba y deja activo el evento Pagos.'
-    Write-Host 'La URL temporal cambia en cada inicio; actualízala antes de probar pagos.'
-  }
+  Write-Host 'Estas direcciones no cambian entre arranques mientras conserves el dominio ngrok.'
+  Write-Host 'Los webhooks de Meta y Mercado Pago son llamadas servidor a servidor; el aviso de navegador no los afecta.'
   Write-Host ''
   Write-Host ('Panel: {0}' -f $panelUrl)
   Write-Host ('Logs del servidor: {0} y {1}' -f $serverProcess.DemoStdoutPath, $serverProcess.DemoStderrPath)
-  Write-Host ('Logs del túnel del panel: {0} y {1}' -f $panelTunnel.DemoStdoutPath, $panelTunnel.DemoStderrPath)
+  Write-Host ('Logs de ngrok: {0} y {1}' -f $ngrokProcess.DemoStdoutPath, $ngrokProcess.DemoStderrPath)
   if ($orchestration -eq 'n8n') {
-    Write-Host ('Webhook de activación de n8n: {0}' -f $wakeUrl)
+    Write-Host ('PAYERS despierta n8n localmente en {0}.' -f $wakeUrl)
     if ($n8nReused) {
       Write-Host 'n8n ya estaba activo y no se añadió a .demo/pids.json; detener la demo no apagará esa instancia.'
     } else {
       Write-Host ('Logs de n8n: {0} y {1}' -f $n8nProcess.DemoStdoutPath, $n8nProcess.DemoStderrPath)
     }
-    Write-Host ('Logs del túnel de n8n: {0} y {1}' -f $n8nTunnel.DemoStdoutPath, $n8nTunnel.DemoStderrPath)
   } else {
-    Write-Host 'Orquestación server: n8n y el túnel 2 no se iniciaron; N8N_WAKE_URL quedó vacía.'
+    Write-Host 'AGENT_ORCHESTRATION=server: PAYERS procesa mensajes sin n8n; no se creó túnel para n8n.'
   }
+  Write-Host 'Activa el workflow en n8n para que exista su ruta de producción y se ejecuten las alertas programadas.'
+  Write-Host 'La URL de ngrok muestra una página de aviso al abrirla en un navegador; los clientes pueden verla en el portal, links de pago/retornos y constancias.'
   Write-Host 'Los procesos iniciados quedaron registrados en .demo/pids.json.'
 } catch {
   $failureMessage = $_.Exception.Message
   Write-Error ('No se pudo iniciar la demo: {0}' -f $failureMessage) -ErrorAction Continue
   try {
-    if (-not $script:RestartMode -and $environmentUpdated -and (Test-Path -LiteralPath $script:EnvironmentBackup -PathType Leaf)) {
-      Copy-Item -LiteralPath $script:EnvironmentBackup `
-        -Destination (Join-Path $script:ProjectRoot '.env') -Force
-      Write-Host 'Se restauró .env desde la copia de seguridad.'
-    }
   } catch {
-    Write-Warning 'No se pudo restaurar .env automáticamente; revisa .demo/env.backup antes de volver a iniciar.'
+    Write-Warning 'No se pudo limpiar la configuración temporal del proceso.'
   }
   try {
     if ($script:RestartMode) {
@@ -877,7 +743,10 @@ try {
   } catch {
     Write-Warning ('No se pudieron detener todos los procesos iniciados: {0}' -f $_.Exception.Message)
   } finally {
-    if (-not $RestartServer -and (Test-Path -LiteralPath $script:PidsFile)) {
+    $env:PUBLIC_URL = $previousPublicUrl
+    $env:N8N_WAKE_URL = $previousWakeUrl
+    $env:WEBHOOK_URL = $previousWebhookUrl
+    if (-not $RestartServer -and $script:StartedProcesses.Count -gt 0 -and (Test-Path -LiteralPath $script:PidsFile)) {
       Remove-Item -LiteralPath $script:PidsFile -Force -ErrorAction SilentlyContinue
     }
   }

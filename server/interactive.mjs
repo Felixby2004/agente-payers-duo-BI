@@ -84,6 +84,7 @@ export function displayText(message) {
 export function parseAction(value) {
   const id = String(value ?? '').trim();
   if (id === 'menu') return { action: 'menu', ref: null };
+  if (id === 'orders' || id === 'book') return { action: id, ref: null };
   // Acción sin referencia para quien escribe sin una reserva registrada.
   if (id === 'staff') return { action: 'staff', ref: null };
   const reschedule = id.match(/^(rsd|rst|rsc):(EST-[A-F0-9]{8}):(.+)$/i);
@@ -98,7 +99,7 @@ export function parseAction(value) {
   const page = id.match(/^(rsm|rsh):(EST-[A-F0-9]{8}):(\d{4}-\d{2}-\d{2}|\d{1,4})(?::(\d{1,4}))?$/i);
   if (page) return { action: page[1].toLowerCase(), ref: page[2].toUpperCase(), value: page[3], offset: Number(page[4] || (page[1].toLowerCase() === 'rsm' ? page[3] : 0)) };
   const match = id.match(/^([a-z]+):(EST-[A-F0-9]{8})$/i);
-  if (!match || !['pay', 'payb', 'yape', 'plin', 'bal', 'rcp', 'chg', 'hum', 'sel', 'sela', 'selb', 'selc', 'rsx'].includes(match[1].toLowerCase())) return null;
+  if (!match || !['pay', 'payb', 'yape', 'plin', 'bal', 'rcp', 'chg', 'hum', 'sel', 'sela', 'selb', 'selc', 'rsx', 'ren', 'can', 'cnf', 'cx'].includes(match[1].toLowerCase())) return null;
   return { action: match[1].toLowerCase(), ref: match[2].toUpperCase() };
 }
 
@@ -125,8 +126,15 @@ export function rescheduleConfirmMessage(order, newVisitAt, now = new Date()) {
   const value = lima.getUTCFullYear() + '-' + String(lima.getUTCMonth() + 1).padStart(2, '0') + '-'
     + String(lima.getUTCDate()).padStart(2, '0') + 'T' + String(lima.getUTCHours()).padStart(2, '0') + ':'
     + String(lima.getUTCMinutes()).padStart(2, '0');
-  return buttonsMessage('¿Confirmas el cambio de fecha?\nReserva: *' + order.ref + '*\nActual: ' + current + '\nNueva: *' + next + '*',
+  const deadline = order.stage === 'awaiting_deposit'
+    ? '\nEl plazo del anticipo se mantiene o se acorta; nunca se extiende automáticamente.' : '';
+  return buttonsMessage('¿Confirmas el cambio de fecha?\nReserva: *' + order.ref + '*\nActual: ' + current + '\nNueva: *' + next + '*' + deadline,
     [button(`rsc:${order.ref}:${value}`, 'Confirmar'), button('rsx:' + order.ref, 'Cancelar')]);
+}
+
+export function cancelReservationConfirmMessage(order) {
+  return buttonsMessage('¿Confirmas cancelar la reserva *' + order.ref + '*? Esta acción no se puede deshacer.',
+    [button('cnf:' + order.ref, 'Confirmar'), button('cx:' + order.ref, 'Volver')]);
 }
 
 export const texts = Object.freeze({
@@ -143,11 +151,12 @@ export const texts = Object.freeze({
   reservationTotal: 'Total {total} · Anticipo {deposit}',
   reservationDeadline: 'Vence el anticipo el {date}.',
   reservationDuplicateDate: 'Ese número ya tiene una reserva para esa fecha y esas personas: {ref}.',
-  reservationLimit: 'Ese número ya tiene 3 reservas abiertas en los últimos 30 días. Pide al personal que revise el caso.',
+  reservationLimit: 'Ese número ya tiene {limit} reservas abiertas en los últimos 30 días. Pide al personal que revise el caso.',
   reservationMissingName: 'Falta el nombre del pagador. Envía el mensaje con Nombre: Nombre y apellidos.',
   reservationMissingDate: 'Falta la fecha de visita. Envía la reserva con Fecha y Hora en formato AAAA-MM-DD y HH:MM.',
   reservationInvalidDate: 'La fecha de visita no es válida. Usa Fecha: AAAA-MM-DD y Hora: HH:MM.',
-  reservationTooSoon: 'La visita debe ser futura y con al menos 2 horas de anticipo.',
+  reservationTooSoon: 'La visita debe ser futura y con al menos 2 horas de anticipación.',
+  reservationThirdParty: 'Las reservas se registran con el número desde el que escribes. Quita esas líneas y vuelve a enviar el bloque.',
   reservationPeopleRange: 'Indica entre 1 y 40 personas.',
   reservationMissingItems: 'Falta el detalle del pedido. Indica los productos con Items: 2x Producto, ...',
   reservationItemFormat: 'Cada producto debe tener el formato "2x Producto".',
@@ -159,9 +168,38 @@ export const texts = Object.freeze({
   reservationDuplicateField: 'El campo {field} aparece más de una vez. Déjalo una sola vez.',
   reservationUnknownProduct: 'No conozco el producto "{product}". Revisa la carta del restaurante.',
   reservationQuantityRange: 'La cantidad de "{product}" debe estar entre 1 y 100.',
+  reservationUnavailable: 'Por ahora no puedo registrar reservas directamente desde este WhatsApp. Ya avisé al personal para que te ayude.',
 });
 
 const staffButton = () => button('staff', 'Hablar con alguien');
+
+export function customerMainMenu() {
+  return buttonsMessage('¡Hola! 👋 Soy el asistente de El Establo. ¿Qué te gustaría hacer?', [
+    button('orders', 'Ver mis reservas'), button('book', 'Hacer una reserva'), staffButton(),
+  ]);
+}
+
+export function customerReservationsEmptyMessage() {
+  return buttonsMessage('Todavía no encuentro reservas asociadas a este número. Puedes solicitar una reserva o hablar con el personal.', [
+    button('book', 'Hacer una reserva'), staffButton(),
+  ]);
+}
+
+export function reservationInstructionsMessage() {
+  const body = '¡Claro! 📝 Copia solo el bloque desde RESERVA y reemplaza los textos entre corchetes.\n\n'
+    + 'RESERVA\nNombre: [nombre y apellido]\nFecha: [AAAA-MM-DD]\nHora: [HH:MM]\n'
+    + 'Personas: [1 a 40]\nItems: 2x Parrilla familiar\n\n'
+    + '📅 Indica una fecha futura y hora de Lima (con al menos 2 horas de anticipación).\n'
+    + '🍽️ Ajusta Items a los productos y cantidades que deseas; sepáralos por comas. El precio sale del catálogo.\n'
+    + 'La reserva se registra con el número desde el que escribes.\n'
+    + 'Si el horario tiene cupo, registro tu reserva y te envío el enlace del anticipo. Si no, no se registra y puedes volver a enviar el bloque con otra fecha u hora.';
+  return buttonsMessage(body, [button('orders', 'Ver mis reservas'), staffButton()]);
+}
+
+export function reservationListRequest(value) {
+  const plain = String(value || '').normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase().replace(/\s+/g, ' ').trim();
+  return /\b(mis reservas|mis pedidos|ver (?:mis )?(?:reservas|pedidos)|consultar (?:mis )?(?:reservas|pedidos)|revisar (?:mis )?(?:reservas|pedidos)|mostrar (?:mis )?(?:reservas|pedidos)|estado de (?:mi )?(?:reserva|pedido))\b/.test(plain);
+}
 
 export function noReservationMessage() {
   const message = buttonsMessage(texts.noReservation, [staffButton()]);
@@ -174,8 +212,8 @@ export function reservationHelpMessage() {
 
 const reservationChange = /\b(cambiar|reprogramar|mover|modificar|cancelar|anular|devolucion|reembolso)\b/;
 const reservationRequests = [
-  /\b(reservar|reserva nueva|nueva reserva|hacer (?:una |otra )?reserva|tomar (?:una |otra )?reserva|agendar (?:una |otra )?reserva)\b/,
-  /\b(quiero|quisiera|deseo|necesito|puedo|podemos|me gustaria|como (?:hago|puedo)|se puede)\b[^.!?]{0,60}\b(reservar|reserva nueva|hacer (?:una |otra )?reserva|tomar (?:una |otra )?reserva|agendar (?:una |otra )?reserva|una (?:nueva )?reserva|otra reserva)\b/,
+  /\b(reservar|reserva nueva|nueva reserva|hacer (?:una |otra )?reserva|crear (?:una |otra )?reserva|tomar (?:una |otra )?reserva|agendar (?:una |otra )?reserva)\b/,
+  /\b(quiero|quisiera|deseo|necesito|puedo|podemos|me gustaria|como (?:hago|puedo)|se puede)\b[^.!?]{0,60}\b(reservar|reserva nueva|hacer (?:una |otra )?reserva|crear (?:una |otra )?reserva|tomar (?:una |otra )?reserva|agendar (?:una |otra )?reserva|una (?:nueva )?reserva|otra reserva)\b/,
   /\b(disponibilidad|hay (?:mesa|mesas|cupo|cupos)|mesa para|mesas para|reservar (?:una )?mesa)\b/,
   /\b(hacer|tomar|agendar|apartar|sacar)\b[^.!?]{0,20}\b(reserva|mesa)\b/,
 ];
@@ -203,9 +241,8 @@ export const reservationErrors = Object.freeze({
 });
 
 const reservationLabels = Object.freeze([
-  ['nombre', 'name'], ['pagador', 'name'], ['telefono', 'phone'], ['fecha', 'date'], ['hora', 'time'],
+  ['nombre', 'name'], ['pagador', 'name'], ['fecha', 'date'], ['hora', 'time'],
   ['personas', 'guests'], ['items', 'items'], ['productos', 'items'], ['notas', 'notes'],
-  ['consentimiento', 'consent'], ['consent', 'consent'],
 ]);
 const catalog = new Map(menu.map(item => [productKey(item.name), item]));
 
@@ -215,6 +252,9 @@ export function parseReservation(value, now = new Date()) {
   if (!lines.length) return null;
   const keyword = fold(lines[0]).replace(/\s+/g, ' ').replace(/:$/, '').trim().toLowerCase();
   if (keyword !== 'reserva') return null;
+
+  if (lines.slice(1).some(line => /^\s*(?:telefono|consentimiento)\b\s*:/i.test(fold(line))))
+    return { ok: false, error: texts.reservationThirdParty };
 
   const fields = {};
   for (const line of lines.slice(1)) {
@@ -238,12 +278,6 @@ export function parseReservation(value, now = new Date()) {
   if (name.length < 2) return { ok: false, error: 'Escribe el nombre del pagador.' };
   if (!fields.date || !fields.time) return { ok: false, error: reservationErrors.date };
 
-  let phone;
-  if (fields.phone) {
-    phone = onlyDigits(fields.phone);
-    if (!/^[1-9]\d{7,14}$/.test(phone)) return { ok: false, error: reservationErrors.phone };
-  }
-
   const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(fields.date);
   const timeMatch = /^(\d{2}):(\d{2})$/.exec(fields.time);
   if (!dateMatch || !timeMatch) return { ok: false, error: reservationErrors.dateFormat };
@@ -256,7 +290,17 @@ export function parseReservation(value, now = new Date()) {
   }
   // Lima es UTC-5 todo el año: la hora escrita se interpreta como hora local.
   const visit = new Date(Date.UTC(year, month - 1, day, hour + 5, minute));
-  if (!(+visit >= +new Date(now) + 2 * 3600000)) return { ok: false, error: reservationErrors.future };
+  if (+visit <= +new Date(now)) return { ok: false, error: 'Esa fecha y hora ya pasó.' };
+  if (+visit < +new Date(now) + 2 * 3600000) {
+    const localNow = new Date(+new Date(now) - 5 * 3600000);
+    const localVisit = new Date(+visit - 5 * 3600000);
+    if (localNow.toISOString().slice(0, 10) === localVisit.toISOString().slice(0, 10)) {
+      const min = new Date(+new Date(now) + 2 * 3600000);
+      const minTime = new Intl.DateTimeFormat('es-PE', { timeZone: 'America/Lima', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(min);
+      return { ok: false, error: 'La visita debe tener al menos 2 horas de anticipación. La hora mínima permitida hoy es ' + minTime + '.' };
+    }
+    return { ok: false, error: reservationErrors.future };
+  }
 
   const guests = /^\d{1,2}$/.test(String(fields.guests || '').trim()) ? Number(fields.guests) : NaN;
   if (!Number.isInteger(guests) || guests < 1 || guests > 40) return { ok: false, error: reservationErrors.people };
@@ -283,17 +327,9 @@ export function parseReservation(value, now = new Date()) {
   const notes = String(fields.notes || '').trim();
   if (notes.length > 500) return { ok: false, error: reservationErrors.notes };
 
-  let consent = null;
-  if (fields.consent !== undefined && fields.consent !== '') {
-    const answer = fold(fields.consent).toLowerCase().trim();
-    if (answer === 'si') consent = true;
-    else if (answer === 'no') consent = false;
-    else return { ok: false, error: reservationErrors.consent };
-  }
-
   return { ok: true, value: {
-    name: name.slice(0, 100), phone, date: fields.date, time: fields.time, guests,
-    items, notes, consent, visitAt: visit.toISOString(),
+    name: name.slice(0, 100), date: fields.date, time: fields.time, guests,
+    items, notes, visitAt: visit.toISOString(),
   } };
 }
 
@@ -359,8 +395,12 @@ export function reservationMenu(order, now = new Date()) {
   const receipt = order.receipts?.at(-1);
   if (terminal(order)) {
     const terminalText = { closed: 'Reserva cerrada. Gracias por visitarnos, ' + order.payer + '. ¡Esperamos verte pronto!',
-      cancelled: 'Reserva cancelada', no_show: 'No asistió: la visita quedó marcada como inasistencia' };
+      cancelled: 'Esa reserva está cancelada. Si quieres hacer una nueva, escribe «quiero reservar».',
+      no_show: 'No asistió: la visita quedó marcada como inasistencia. Hablaré con el personal para que revise el caso.' };
     const text = emojis.farewell + ' *' + (terminalText[order.stage] || 'Reserva finalizada') + '*\nReferencia: *' + order.ref + '*';
+    if (order.stage === 'cancelled') return buttonsMessage(text,
+      [...(receipt ? [button('rcp:' + order.ref, 'Ver constancia')] : []), button('book', 'Nueva reserva'), button('hum:' + order.ref, 'Hablar con alguien')]);
+    if (order.stage === 'no_show') return buttonsMessage(text, [button('hum:' + order.ref, 'Hablar con alguien')]);
     return receipt ? buttonsMessage(text, [button('rcp:' + order.ref, 'Ver constancia')]) : text;
   }
   const date = friendlyDate(order.visitAt, now, true);
@@ -372,11 +412,11 @@ export function reservationMenu(order, now = new Date()) {
       + order.ref + '*\nEstamos actualizando el estado del pago. Si no cambia pronto, avísame para revisarlo.',
     [button('hum:' + order.ref, 'Hablar con alguien')]);
     const text = expired
-      ? emojis.attention + ' *Venció el plazo del anticipo*\nReserva: *' + order.ref + '*\nSi necesitas revisarlo, puedo avisar al personal.'
+      ? emojis.attention + ' *Venció el plazo del anticipo*\nReserva: *' + order.ref + '*\nPuedes pedir una renovación del plazo o cancelar la reserva.'
       : emojis.greeting + ' *Anticipo pendiente*\nReserva: *' + order.ref + '*\nVisita: ' + date + ' · ' + people
         + '\nImporte: *' + money(depositDue(order)) + '*';
     return buttonsMessage(text, expired
-      ? [button('hum:' + order.ref, 'Hablar con alguien')]
+      ? [button('ren:' + order.ref, 'Pedir nuevo plazo'), button('can:' + order.ref, 'Cancelar reserva'), button('hum:' + order.ref, 'Hablar con alguien')]
       : [button('pay:' + order.ref, 'Pagar anticipo'), button('chg:' + order.ref, 'Cambiar fecha'),
         button('hum:' + order.ref, 'Hablar con alguien')]);
   }
@@ -394,10 +434,10 @@ export function reservationMenu(order, now = new Date()) {
 }
 
 const sectionDefinitions = Object.freeze([
-  { key: 'deposit', title: 'Por pagar anticipo' },
-  { key: 'confirmed', title: 'Confirmadas' },
-  { key: 'attention', title: 'Requieren atención' },
-  { key: 'finished', title: 'Finalizadas' },
+  { key: 'deposit', title: '⏳ Anticipo pendiente' },
+  { key: 'confirmed', title: '✅ Confirmadas' },
+  { key: 'attention', title: '⚠️ Requieren atención' },
+  { key: 'finished', title: '🧾 Finalizadas' },
 ]);
 const blockingIncidents = new Set(['Pago por revisar', 'Reverso por revisar', 'Anticipo por resolver', 'Anticipo vencido']);
 
@@ -432,9 +472,8 @@ function descriptionOf(order, section, now) {
   } else {
     state = statusLabel(order, now);
   }
-  const base = state + ' · ' + personLabel(order.guests);
-  const full = base + ' · ' + order.ref;
-  return normalized(full).length <= limits.rowDescription ? full : clip(base, limits.rowDescription);
+  const full = '📅 ' + friendlyDate(order.visitAt, now) + ' · ' + state + ' · ' + personLabel(order.guests);
+  return clip(full, limits.rowDescription);
 }
 
 function statusLabel(order, now) {
@@ -445,7 +484,7 @@ function statusLabel(order, now) {
 }
 
 function rowOf(order, section, now, selector = 'sel') {
-  return { id: selector + ':' + order.ref, title: friendlyDate(order.visitAt, now),
+  return { id: selector + ':' + order.ref, title: order.ref,
     description: descriptionOf(order, section, now) };
 }
 
@@ -455,10 +494,10 @@ export function reservationList(orders, now = new Date(), selector = 'sel') {
   const buckets = new Map(sectionDefinitions.map(section => [section.key, []]));
   for (const order of all) buckets.get(sectionOf(order, now)).push(order);
   for (const rows of buckets.values()) rows.sort(visitSorter(now));
-  const body = '📋 Tienes ' + (activeCount === 1 ? '1 reserva activa' : activeCount + ' reservas activas') + '. '
+  const body = '📋 *Mis reservas* · ' + (activeCount === 1 ? '1 activa' : activeCount + ' activas') + '. '
     + (all.length > limits.rows
-      ? 'Mostrando las 10 más relevantes de ' + all.length + '. Si buscas otra, escríbeme su referencia.'
-      : 'Elige una para ver sus detalles y opciones.');
+      ? 'Elige una de las más relevantes o escribe la referencia de otra reserva.'
+      : 'Elige una reserva para ver sus detalles y opciones.');
   const sections = [];
   let remaining = limits.rows;
   for (const definition of sectionDefinitions) {
@@ -513,6 +552,12 @@ export function receiptCta(order, url, summary = '') {
   return ctaMessage(emojis.receipt + ' *Constancia interna de reserva*\nReferencia: *' + order.ref
     + '*' + (summary ? '\n' + summary : '')
     + '\nEs el resumen de El Establo. El comprobante oficial de Mercado Pago se consulta en la operación del pago.', 'Ver constancia', url);
+}
+
+export function paymentReceiptCta(order, receipt, url) {
+  const label = receipt.purpose === 'balance' ? 'Saldo' : 'Anticipo';
+  return ctaMessage(emojis.receipt + ' *Comprobante de Mercado Pago*\nReserva: *' + order.ref
+    + '*\n' + label + ': *' + money(receipt.amount) + '*', 'Ver comprobante', url);
 }
 
 export function confirmationCta(order, url, now = new Date(), additional = '') {

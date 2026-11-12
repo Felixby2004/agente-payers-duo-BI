@@ -6,16 +6,18 @@ El panel, la API y n8n comparten las reservas a través del servidor PAYERS. En 
 
 1. Ejecuta `001_payers.sql` y `002_payers_agent.sql` en el editor SQL del proyecto Supabase, en ese orden. Si la primera migración ya está aplicada, ejecuta la segunda.
 2. Completa los campos de servidor de `.env` tomando como referencia `.env.example`. Configura `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, una contraseña de administración de al menos 12 caracteres y un secreto de sesión de al menos 32 caracteres. Mantén las claves en el servidor.
-3. Dale una URL HTTPS pública a la aplicación. El servidor Node sirve tanto el panel como la API que necesita n8n. Para una demostración puedes mantenerlo en tu computadora y usar un túnel temporal. Para mantenerlo disponible con una URL fija, despliega el servidor Node en un alojamiento con HTTPS.
+3. Para la demo, `scripts/start-demo.ps1` expone PAYERS con el dominio fijo gratuito de ngrok. `NGROK_DOMAIN` debe contener el dominio de tu cuenta (sin `https://`); consulta o crea el dominio en el panel de ngrok, sección **Domains**. El script asigna `PUBLIC_URL` al proceso PAYERS sin modificar `.env`.
 4. Configura `AGENT_ORCHESTRATION=n8n` y un `N8N_AGENT_TOKEN` aleatorio de al menos 32 caracteres. Las llamadas de n8n usan este token. Las claves de Meta, Mercado Pago, OpenAI y Supabase quedan en el servidor.
 
-### Túnel HTTPS temporal para una demostración
+### Túnel HTTPS fijo de la demostración
 
-1. Detén el panel local si está corriendo con `npm run dev`. Instala `cloudflared` desde las [descargas oficiales de Cloudflare](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/).
-2. En una ventana nueva de PowerShell, ejecuta `cloudflared tunnel --url http://127.0.0.1:5173`. Si PowerShell aún no reconoce el comando y WinGet lo instaló en `C:\Program Files (x86)\cloudflared`, ejecuta `& 'C:\Program Files (x86)\cloudflared\cloudflared.exe' tunnel --url http://127.0.0.1:5173`. Si cambiaste `PORT`, usa ese puerto. Deja la ventana abierta y copia el origen `https://…trycloudflare.com` que aparezca.
-3. Pega ese origen en `PUBLIC_URL` de `.env` y en el nodo **API del restaurante** de n8n. Usa el origen sin `/api` ni otra ruta. `SUPABASE_URL` conserva la dirección del proyecto de base de datos.
-4. En otra ventana de PowerShell, desde la carpeta `el-establo-payers`, ejecuta `npm.cmd ci` si faltan dependencias, luego `npm.cmd run build` y `npm.cmd start`. Abre la URL del túnel y verifica que el panel pida la contraseña de administración.
-5. Configura Meta con ese origen más `/api/webhooks/whatsapp` y Mercado Pago con ese origen más `/api/webhooks/mercado-pago`. Mantén abiertas las dos ventanas durante la prueba. Si el túnel cambia de dirección, actualiza `PUBLIC_URL`, n8n y los dos webhooks. [Guía oficial de túneles temporales](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
+1. Instala ngrok con `winget install ngrok.ngrok` y configura el authtoken de forma local con `ngrok config add-authtoken`. No guardes el authtoken en `.env`, el repositorio ni los logs.
+2. En el panel de ngrok, sección **Domains**, copia el dominio fijo gratuito de tu cuenta y ponlo en `NGROK_DOMAIN` de `.env`, sin protocolo. Alinea `PUBLIC_URL` con ese origen HTTPS. El script advertirá si no coinciden y usará el dominio fijo solo para el proceso.
+3. Desde PowerShell, ejecuta `powershell -ExecutionPolicy Bypass -File .\scripts\start-demo.ps1`. El script levanta solo un túnel para PAYERS en `127.0.0.1:5173`; la inspección local de ngrok está en `http://127.0.0.1:4040`. Detén todo con `powershell -ExecutionPolicy Bypass -File .\scripts\stop-demo.ps1`.
+4. Registra una sola vez en Meta `https://<NGROK_DOMAIN>/api/webhooks/whatsapp` y en Mercado Pago `https://<NGROK_DOMAIN>/api/webhooks/mercado-pago`. Las URL permanecen iguales entre reinicios mientras uses ese dominio.
+5. La advertencia del navegador del plan gratuito puede aparecer al cliente antes del portal, los enlaces de pago y retorno de Mercado Pago o las constancias. Las llamadas webhook de servidor a servidor no muestran esa página. PAYERS añade `ngrok-skip-browser-warning` cuando necesita consultar su propio dominio público.
+
+n8n no lleva túnel: su workflow llama a PAYERS por `http://127.0.0.1:5173`; PAYERS despierta el webhook de producción por `http://127.0.0.1:5678/webhook/establo-payers-despertar`, enviando el token interno en `Authorization`. El inicio configura `WEBHOOK_URL` local cuando arranca n8n y no cambia `N8N_PORT` ni `N8N_RUNNERS_BROKER_PORT`. Al terminar, el script revisa `http://127.0.0.1:5678/healthz`. El workflow debe estar activo en n8n para que su URL de producción exista y para que corran las alertas cada minuto. La PC debe permanecer encendida y conectada para recibir webhooks.
 
 ## Portal y caja
 
@@ -26,11 +28,11 @@ El workflow programado procesa primero la cola y luego concilia los plazos y avi
 ## 2. Importar el workflow
 
 1. En n8n, importa [Establo-PAYERS.json](Establo-PAYERS.json) desde archivo.
-2. En **API del restaurante**, reemplaza `https://REEMPLAZAR.example` por el origen HTTPS del panel.
+2. En **API del restaurante**, configura `http://127.0.0.1:5173` cuando n8n y PAYERS corren en la misma PC. El túnel público queda reservado para las llamadas entrantes de Meta y Mercado Pago.
 3. Crea una credencial **Header Auth** con nombre **PAYERS Token interno**. El nombre del encabezado es `Authorization` y su valor es `Bearer <N8N_AGENT_TOKEN>`.
 4. Selecciona esa credencial en **Procesar mensajes y adjuntos**, **Evaluar alertas configuradas** y **Despertar por WhatsApp**.
 5. Ejecuta **Ejecutar prueba manual** y comprueba los conteos. Los nodos pueden devolver cero cuando no hay reservas o mensajes pendientes. Publica o activa el workflow para que el horario se ejecute cada minuto.
-6. Las respuestas a WhatsApp se procesan directamente en el servidor cuando Meta entrega cada mensaje; `N8N_WAKE_URL` no interviene en esa respuesta. Activa el workflow para conservar las alertas programadas y la revisión de respaldo de la cola, que corre cada minuto. La URL que se configura en Meta sigue siendo la de la API del restaurante.
+6. Meta entrega cada mensaje al servidor PAYERS, que guarda y procesa la cola directamente y también despierta el workflow mediante `N8N_WAKE_URL` local con la cabecera `Authorization`. Si el webhook de activación no responde, n8n conserva la ejecución programada cada minuto. Activa el workflow para que exista esa ruta de producción y se ejecuten las alertas programadas. La URL configurada en Meta sigue siendo la pública de PAYERS.
 
 [Importar workflows en n8n](https://docs.n8n.io/workflows/export-import/) · [Programar ejecuciones](https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.scheduletrigger/)
 

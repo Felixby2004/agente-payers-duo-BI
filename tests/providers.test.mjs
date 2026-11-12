@@ -5,6 +5,44 @@ import { once } from 'node:events';
 import { makeApi } from '../server/api.mjs';
 import { hmac } from '../server/providers.mjs';
 import { limaDateTime } from '../server/availability.mjs';
+import { providers } from '../server/providers.mjs';
+import { readConfig } from '../server/config.mjs';
+
+test('El rechazo de Meta conserva el motivo útil para la incidencia sin exponer tokens', async () => {
+  const previous = globalThis.fetch;
+  globalThis.fetch = async () => Response.json({ error: { message: 'Template is not approved for this account', code: 132000 } }, { status: 400 });
+  try {
+    const config = readConfig({ WHATSAPP_MODE: 'cloud', WA_GRAPH_VERSION: 'v25.0', WA_PHONE_NUMBER_ID: '456', WA_ACCESS_TOKEN: 'token-ficticio',
+      WA_VERIFY_TOKEN: 'verify-ficticio', WA_APP_SECRET: 'firma-ficticia', PUBLIC_URL: 'https://establo.test', ADMIN_PASSWORD: 'admin-de-demostracion',
+      SESSION_SECRET: 'secreto-ficticio-largo-para-pruebas', SUPABASE_URL: 'https://db.test.invalid', SUPABASE_SECRET_KEY: 'ficticio' });
+    const service = providers(config);
+    await assert.rejects(service.sendWhatsApp({ phone: '51911111111', consent: true, chat: [] }, 'mensaje', { session: true }),
+      error => error.message.includes('Meta rechazó el envío') && error.message.includes('132000')
+        && error.message.includes('Template is not approved') && !error.message.includes('token-ficticio'));
+  } finally { globalThis.fetch = previous; }
+});
+
+test('Las plantillas de comprobante reciben el id de Mercado Pago o el token interno según el tipo', async () => {
+  const previous = globalThis.fetch, requests = [];
+  globalThis.fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    return Response.json({ messages: [{ id: 'wamid.plantilla' }] });
+  };
+  try {
+    const config = readConfig({ WHATSAPP_MODE: 'cloud', WA_GRAPH_VERSION: 'v25.0', WA_PHONE_NUMBER_ID: '456',
+      WA_ACCESS_TOKEN: 'token-ficticio', WA_VERIFY_TOKEN: 'verify-ficticio', WA_APP_SECRET: 'firma-ficticia',
+      WA_TEMPLATE_CONFIRMATION: 'confirmacion', WA_TEMPLATE_BALANCE_RECEIPT: 'comprobante_saldo',
+      WA_TEMPLATE_SETTLEMENT: 'liquidacion', PUBLIC_URL: 'https://establo.test', ADMIN_PASSWORD: 'admin-de-demostracion',
+      SESSION_SECRET: 'secreto-ficticio-largo-para-pruebas', SUPABASE_URL: 'https://db.test.invalid', SUPABASE_SECRET_KEY: 'ficticio' });
+    const service = providers(config), order = { phone: '51911111111', consent: true, chat: [] };
+    for (const [template, suffix] of [['confirmation', '987'], ['balanceReceipt', '990'], ['settlement', 'token-de-constancia']]) {
+      await service.sendWhatsApp(order, 'comprobante', { template, receiptUrlSuffix: suffix,
+        templateValues: ['Pagador', 'EST-12345678', 'Importe', 'S/ 40'] });
+    }
+    assert.deepEqual(requests.map(body => body.template.name), ['confirmacion', 'comprobante_saldo', 'liquidacion']);
+    assert.deepEqual(requests.map(body => body.template.components[1].parameters[0].text), ['987', '990', 'token-de-constancia']);
+  } finally { globalThis.fetch = previous; }
+});
 
 test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desde Mercado Pago', async () => {
   const e = {
@@ -116,8 +154,9 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     const { data: [evidence] } = await call('orders', undefined, 200);
     assert.equal(evidence.stage, 'awaiting_deposit');
     assert.equal(evidence.payments.length, 0);
+    assert.equal(evidence.incidents.length > 0, true, 'la imagen solo debe generar una revisión');
     assert.match(evidence.incidents[0].detail, /987/);
-    assert.match(sent.at(-1).text.body, /en verificación/);
+    assert.match(sent.at(-1).text.body, /personal lo revisará/i);
 
     await receive({ ...message, id: 'wamid.audio', type: 'audio', text: undefined, audio: { id: '56' } });
     assert.equal((await drain()).processed, 1);
@@ -141,7 +180,8 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     assert.equal(sent.length, 4);
     assert.equal(sent.at(-1).interactive.type, 'cta_url');
     assert.match(sent.at(-1).interactive.body.text, /Anticipo verificado/);
-    assert.match(sent.at(-1).interactive.action.parameters.url, /\/comprobante\//);
+    assert.match(sent.at(-1).interactive.action.parameters.url, /^https:\/\/www\.mercadopago\.com\.pe\/ccap\/file-viewer\/receipt\?/);
+    assert.match(sent.at(-1).interactive.action.parameters.url, /payment_id=987/);
     assert.ok(verified.incidents.some(i => i.type === 'Solicitud de reprogramación'));
 
     const { data: returnOrder } = await call('orders', JSON.stringify({
@@ -189,7 +229,13 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
         'id:989;request-id:saldo-deposit-989;ts:123;'),
     });
     const { data: arrivedOrder } = await call(balancePrefix + 'arrive', JSON.stringify({ count: 1 }), 200);
-    const balancePaymentIntent = arrivedOrder.order.intents.find(item => item.purpose === 'balance');
+    assert.equal(arrivedOrder.order.intents.some(item => item.purpose === 'balance'), false);
+    const balanceRequest = { ...message, id: 'wamid.in-balance-request',
+      interactive: { type: 'button_reply', button_reply: { id: 'payb:' + balanceOrder.ref, title: 'Pagar saldo en línea' } } };
+    await receive(balanceRequest);
+    assert.equal((await drain()).processed, 1);
+    const balancePaymentIntent = (await call('orders', undefined, 200)).data
+      .find(item => item.id === balanceOrder.id).intents.find(item => item.purpose === 'balance');
     assert.ok(balancePaymentIntent);
     assert.equal(balancePaymentIntent.amount, 12900);
     assert.equal(preference.items[0].title, 'Saldo de pedido · ' + balanceOrder.ref);
@@ -198,7 +244,12 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     const beforeBalanceWebhook = sent.length;
     await call('webhooks/mercado-pago?data.id=990', JSON.stringify({ type: 'payment', data: { id: '990' } }), 200, balanceWebhook);
     await call('webhooks/mercado-pago?data.id=990', JSON.stringify({ type: 'payment', data: { id: '990' } }), 200, balanceWebhook);
-    assert.equal(sent.length, beforeBalanceWebhook + 1);
+    assert.equal(sent.length, beforeBalanceWebhook + 2);
+    assert.match(sent.at(-2).interactive.action.parameters.url, /^https:\/\/www\.mercadopago\.com\.pe\/ccap\/file-viewer\/receipt\?/);
+    assert.match(sent.at(-2).interactive.action.parameters.url, /payment_id=990/);
+    assert.match(sent.at(-2).interactive.body.text, /Comprobante de Mercado Pago/);
+    assert.match(sent.at(-1).interactive.action.parameters.url, /\/comprobante\//);
+    assert.doesNotMatch(sent.at(-1).interactive.action.parameters.url, /\/cliente(?:\/|$)/);
     const { data: afterBalance } = await call('orders', undefined, 200);
     const final = afterBalance.find(item => item.id === balanceOrder.id);
     assert.equal(final.stage, 'closed');
@@ -207,7 +258,6 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
     assert.ok(final.receipts.some(item => item.purpose === 'settlement'));
     assert.equal(Object.values(final.receiptDeliveries).filter(item => item.status === 'sent').length, 3);
     assert.doesNotMatch(sent.at(-1).interactive.body.text, /ccap\/file-viewer\/receipt/);
-    assert.match(sent.at(-1).interactive.body.text, /comprobante oficial.*Mercado Pago/i);
     assert.match(sent.at(-1).interactive.body.text, /Constancia interna de reserva/);
     const finalReceipt = final.receipts.find(item => item.purpose === 'settlement');
     const { data: publicFinal } = await call('receipt/' + finalReceipt.token, undefined, 200);
@@ -227,11 +277,12 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
       'id:992;request-id:shortcut-deposit-992;ts:123;') };
     await call('webhooks/mercado-pago?data.id=992', JSON.stringify({ type: 'payment', data: { id: '992' } }), 200, shortcutDepositNotice);
     const { data: shortcutArrived } = await call(shortcutPrefix + 'arrive', JSON.stringify({ count: 1 }), 200);
-    const autoLink = shortcutArrived.order.intents.find(item => item.purpose === 'balance');
-    const preferenceIdBeforeShortcut = preference.external_reference;
-    assert.equal(preferenceIdBeforeShortcut, autoLink.id);
+    assert.equal(shortcutArrived.order.intents.some(item => item.purpose === 'balance'), false);
     const beforeShortcut = sent.length;
     await receive({ ...shortcutSession, id: 'wamid.in-pay-shortcut', text: { body: 'pagar saldo' } }); await drain();
+    const autoLink = (await call('orders', undefined, 200)).data.find(item => item.id === shortcutOrder.id)
+      .intents.find(item => item.purpose === 'balance');
+    assert.ok(autoLink, 'el pedido del cliente debe crear el enlace después de la llegada');
     assert.equal(sent.length, beforeShortcut + 1);
     assert.match(sent.at(-1).interactive.action.parameters.url, new RegExp('/pago/' + autoLink.id + '$'));
     assert.equal(preference.external_reference, autoLink.id);
@@ -257,8 +308,13 @@ test('n8n procesa texto, imágenes y voz en WhatsApp y confirma el anticipo desd
       'id:995;request-id:race-deposit-995;ts:123;') };
     await call('webhooks/mercado-pago?data.id=995', JSON.stringify({ type: 'payment', data: { id: '995' } }), 200, raceDepositNotice);
     const raceArrival = await call(racePrefix + 'arrive', JSON.stringify({ count: 1 }), 200);
-    const raceIntent = raceArrival.data?.order?.intents?.find(item => item.purpose === 'balance')
-      || raceArrival.order.intents.find(item => item.purpose === 'balance');
+    assert.equal(raceArrival.data.order.intents.some(item => item.purpose === 'balance'), false);
+    await receive({ ...message, id: 'wamid.in-race-balance-request', from: '51977777777', text: undefined,
+      interactive: { type: 'button_reply', button_reply: { id: 'payb:' + raceOrder.ref, title: 'Pagar saldo en línea' } } });
+    assert.equal((await drain()).processed, 1);
+    const raceIntent = (await call('orders', undefined, 200)).data.find(item => item.id === raceOrder.id)
+      .intents.find(item => item.purpose === 'balance');
+    assert.ok(raceIntent);
     await call(racePrefix + 'counter', JSON.stringify({ channel: 'cash' }), 200);
     const lateNotice = { 'x-request-id': 'race-late-996', 'x-signature': 'ts=123,v1=' + hmac(e.MP_WEBHOOK_SECRET,
       'id:996;request-id:race-late-996;ts:123;') };

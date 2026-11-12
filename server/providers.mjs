@@ -150,7 +150,7 @@ export function providers(config) {
       const expected = hmac(e.MP_WEBHOOK_SECRET, 'id:' + id + ';request-id:' + requestId + ';ts:' + fields.ts + ';');
       return matches(expected, fields.v1) ? id : null;
     },
-    async sendWhatsApp(order, text, { template, intent, session: open, reply = false, templateValues, receiptToken } = {}) {
+    async sendWhatsApp(order, text, { template, intent, session: open, reply = false, templateValues, receiptUrlSuffix } = {}) {
       requireThat(config.waMode === 'cloud', 'Conecta WhatsApp Cloud API para enviar mensajes.', 409);
       // Responder a quien escribe no exige consentimiento; iniciar un mensaje sí.
       requireThat((reply || order.consent) && config.isPhoneAllowed(order.phone) && !config.isPhoneBlocked(order.phone),
@@ -161,7 +161,8 @@ export function providers(config) {
       if (session) return deliver(order.phone, text);
       const name = { deposit: e.WA_TEMPLATE_DEPOSIT, paymentRejected: e.WA_TEMPLATE_PAYMENT_REJECTED,
         visit: e.WA_TEMPLATE_VISIT, balance: e.WA_TEMPLATE_BALANCE, confirmation: e.WA_TEMPLATE_CONFIRMATION,
-        settlement: e.WA_TEMPLATE_SETTLEMENT, reschedule: e.WA_TEMPLATE_RESCHEDULE }[template];
+        balanceReceipt: e.WA_TEMPLATE_BALANCE_RECEIPT, settlement: e.WA_TEMPLATE_SETTLEMENT,
+        reschedule: e.WA_TEMPLATE_RESCHEDULE }[template];
       requireThat(name, 'Pide al pagador que escriba al número de WhatsApp o configura una plantilla aprobada.', 409);
       const values = templateValues || (['deposit', 'paymentRejected', 'balance'].includes(template) ? [order.payer, order.ref, money(intent.amount)]
         : template === 'reschedule' ? [order.payer, order.ref, visitText(order.visitAt), String(order.rescheduledTo || '')]
@@ -169,12 +170,17 @@ export function providers(config) {
           : [order.payer, order.ref, visitText(order.visitAt), money(balance(order))]);
       const components = [{ type: 'body', parameters: values.map(value => ({ type: 'text', text: value })) }];
       if (['deposit', 'paymentRejected', 'balance'].includes(template)) components.push({ type: 'button', sub_type: 'url', index: '0', parameters: [{ type: 'text', text: intent.id }] });
-      if (['settlement', 'confirmation'].includes(template)) components.push({ type: 'button', sub_type: 'url', index: '0',
-        parameters: [{ type: 'text', text: receiptToken || order.receipts.find(r => r.purpose === template)?.token
+      if (['settlement', 'confirmation', 'balanceReceipt'].includes(template)) components.push({ type: 'button', sub_type: 'url', index: '0',
+        parameters: [{ type: 'text', text: receiptUrlSuffix || order.receipts.find(r => r.purpose === template)?.token
           || order.receipts.at(-1)?.token }] });
       return submit(order.phone, { type: 'template', template: { name, language: { code: e.WA_TEMPLATE_LANGUAGE || 'es_PE' }, components } });
     },
-    async sendOtp(phone, code) {
+    async sendOtp(phone, code, { freeForm = false, session = false } = {}) {
+      if (freeForm) {
+        requireThat(config.waMode === 'cloud' && session && config.isPhoneAllowed(phone) && !config.isPhoneBlocked(phone),
+          'El envío del código aún no está disponible.', 409);
+        return deliver(phone, 'Tu código de acceso a El Establo es ' + code + '. Vence en 5 minutos. No lo compartas.');
+      }
       requireThat(config.waMode === 'cloud' && e.WA_TEMPLATE_OTP && config.isPhoneAllowed(phone)
         && !config.isPhoneBlocked(phone), 'El envío del código aún no está configurado.', 503);
       const parameters = [{ type: 'text', text: code }];

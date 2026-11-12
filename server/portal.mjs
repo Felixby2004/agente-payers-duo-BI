@@ -83,17 +83,25 @@ export function createPortal(config, store, provider, options = {}) {
     const phone = whatsappPhone(value);
     requireThat(/^[1-9]\d{7,14}$/.test(phone), 'Indica el número con su código de país.', 400);
     throttle('otp:' + (req.socket.remoteAddress || ''), 35, 10 * 60000);
-    requireThat(options.deliverOtp || (config.waMode === 'cloud' && config.env.WA_TEMPLATE_OTP),
-      'El acceso por WhatsApp todavía no está disponible.', 503);
     const id = randomUUID();
     const code = String(randomInt(0, 1000000)).padStart(6, '0');
-    const client = config.isPhoneAllowed(phone) && !config.isPhoneBlocked(phone)
-      ? await call('otp_start', { id, phone, digest: otpDigest(id, code) }) : null;
-    if (client?.id) {
-      try { await (options.deliverOtp || provider.sendOtp)(phone, code); }
-      catch { console.error('PAYERS: no se pudo entregar un código de acceso de WhatsApp.'); }
+    const canAttemptDelivery = options.deliverOtp || (config.waMode === 'cloud'
+      && (config.otpFreeForm || config.env.WA_TEMPLATE_OTP));
+    const message = "Si tu número tiene una reserva, recibirás un código por WhatsApp. Si no llega, escribe 'hola' al WhatsApp de El Establo y vuelve a solicitarlo.";
+    if (canAttemptDelivery) {
+      // No crear un reto enviable si las reglas de contacto no permiten entregarlo.
+      const session = config.otpFreeForm && config.waMode === 'cloud' ? await options.sessionOpen?.(phone) : false;
+      const allowed = config.isPhoneAllowed(phone) && !config.isPhoneBlocked(phone) && !(await options.isOptedOut?.(phone));
+      const client = allowed && (!config.otpFreeForm || session)
+        ? await call('otp_start', { id, phone, digest: otpDigest(id, code) }) : null;
+      if (client?.id) {
+        try {
+          if (options.deliverOtp) await options.deliverOtp(phone, code);
+          else await provider.sendOtp(phone, code, { freeForm: config.otpFreeForm, session });
+        } catch { /* No exponer la existencia del cliente ni el código. */ }
+      }
     }
-    return { id, message: 'Si el número está registrado, recibirás un código por WhatsApp.' };
+    return { id, message };
   }
 
   async function verify(req, res, body) {
@@ -124,12 +132,27 @@ export function createPortal(config, store, provider, options = {}) {
 
   async function customerOrders(client) {
     const orders = await store.phone(client.phone);
+    const mercadoPagoUrl = payment => payment?.channel === 'mercadopago' && /^MP-\d+$/.test(String(payment.ref || ''))
+      ? 'https://www.mercadopago.com.pe/ccap/file-viewer/receipt?' + new URLSearchParams({
+        flow: 'cow_payment_receipts', origin: 'feedback-screen', payment_id: payment.ref.slice(3) }) : null;
     return orders.map(order => ({
       id: order.id, ref: order.ref, visitAt: order.visitAt, stage: order.stage, guests: order.guests,
       total: order.total, deposit: deposited(order), balance: balance(order),
       attendance: order.attendance?.at ? 'confirmed' : order.attendance?.reportedAt ? 'pending' : null,
       items: order.items.map(({ name, quantity, price, discount }) => ({ name, quantity, price, discount })),
-      receipts: order.receipts.map(({ purpose, token, number, at, reversedAt }) => ({ purpose, token, number, at, reversedAt })),
+      receipts: order.receipts.map(receipt => {
+        const payments = receipt.purpose === 'settlement'
+          ? (receipt.paymentBreakdown || []).map(row => order.payments.find(item => item.ref === row.ref)).filter(Boolean)
+          : order.payments.filter(item => item.ref === receipt.paymentRef
+            || (receipt.intentId && item.intentId === receipt.intentId)
+            || (receipt.purpose === 'deposit' && (item.purpose || 'deposit') === 'deposit' && item.amount === receipt.amount));
+        const mercadoPagoReceipts = payments
+          .filter(payment => !order.payments.some(item => item.original === payment.ref && item.amount < 0))
+          .map(payment => ({ purpose: payment.purpose || 'deposit', paymentId: payment.ref.slice(3), url: mercadoPagoUrl(payment) }))
+          .filter(item => item.url);
+        return { purpose: receipt.purpose, token: receipt.token, number: receipt.number, at: receipt.at,
+          reversedAt: receipt.reversedAt, mercadoPagoReceipts };
+      }),
     }));
   }
   return { login, session, issue, verify, saveStaff, customerOrders, call, logout: res => cookie(res, null) };

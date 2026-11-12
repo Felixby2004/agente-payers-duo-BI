@@ -86,9 +86,11 @@ test('Portal OTP, caja y PDF operan con permisos separados y asistencia verifica
     assert.deepEqual(portal.data.orders.map(r => r.id), [order.id]);
     assert.equal((await call('orders', { cookie: customer })).status, 403);
     const otherOrder = (await call('orders', { cookie: admin })).data.find(r => r.id === other.id);
-    assert.equal((await call('receipt/' + otherOrder.receipts[0].token, { cookie: customer })).status, 404);
+    const publicReceipt = await call('receipt/' + otherOrder.receipts[0].token);
+    assert.equal(publicReceipt.status, 200, 'el token de constancia permite abrir el comprobante directo sin pasar por /cliente');
+    assert.equal(publicReceipt.data.token, otherOrder.receipts[0].token);
     assert.equal((await call('receipt/' + portal.data.orders[0].receipts[0].token, { cookie: customer })).status, 200);
-    assert.equal((await call('receipt/' + portal.data.orders[0].receipts[0].token)).status, 401);
+    assert.equal((await call('receipt/' + portal.data.orders[0].receipts[0].token)).status, 200);
 
     async function whatsapp(id, text) {
       const body = JSON.stringify({ entry: [{ changes: [{ value: { metadata: { phone_number_id: '456' },
@@ -108,7 +110,9 @@ test('Portal OTP, caja y PDF operan con permisos separados y asistencia verifica
     await whatsapp('receipt-1', 'Quiero ver mis comprobantes');
     assert.match(sends.at(-1).text.body, /https:\/\/establo.test\/cliente/);
 
-    const link = (await post(prefix + 'message', { type: 'balance' }, cashier)).data.order.intents.at(-1);
+    const manualResult = await post(prefix + 'message', { type: 'balance' }, cashier);
+    const link = manualResult.data.order.intents.find(i => i.purpose === 'balance');
+    assert.ok(link, 'el envío manual desde el panel debe emitir el enlace de saldo');
     const paid = (await post(prefix + 'counter', { channel: 'cash' }, cashier)).data.order;
     assert.equal(paid.payments.at(-1).amount, 20000);
     assert.equal(paid.payments.at(-1).staffId, newStaff.data.id);
@@ -152,11 +156,20 @@ test('El anticipo reutiliza el enlace vigente, limita nuevas emisiones y vence d
     }
     assert.equal((await post(endpoint, {})).status, 409);
     const stored = await store.get(order.id);
-    stored.data.deadline = new Date(Date.now()-1000).toISOString();
+    stored.data.deadline = new Date(Date.now()-23*3600000).toISOString();
     assert.equal(await store.save(stored.data, stored.version), true);
-    const tick = await call('internal/agent/alerts', { method: 'POST', headers: { authorization: 'Bearer ' + config.N8N_AGENT_TOKEN } });
+    const alerts = () => call('internal/agent/alerts', { method: 'POST', headers: { authorization: 'Bearer ' + config.N8N_AGENT_TOKEN } });
+    const tick = await alerts();
     assert.equal(tick.status, 200);
+    assert.equal((await store.get(order.id)).data.stage, 'awaiting_deposit', 'no cancelar antes de las 24 h de gracia');
+    const expired = await store.get(order.id);
+    expired.data.deadline = new Date(Date.now()-25*3600000).toISOString();
+    assert.equal(await store.save(expired.data, expired.version), true);
+    assert.equal((await alerts()).status, 200);
     assert.equal((await store.get(order.id)).data.stage, 'cancelled');
+    assert.equal((await alerts()).status, 200);
+    assert.equal((await store.get(order.id)).data.events.filter(event => event.title === 'Cancelada por falta de anticipo').length, 1,
+      'un segundo ciclo no duplica la cancelación');
   } finally { await api.close(); }
 });
 

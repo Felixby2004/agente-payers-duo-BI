@@ -1,6 +1,22 @@
 import { useEffect, useState } from 'react';
+import { ArrowLeft, Ban, CalendarDays, CheckCircle2, CircleDollarSign, Clock3, ExternalLink, FileCheck2, LogOut, ReceiptText, Users, Wallet, XCircle } from 'lucide-react';
 import { api } from './client.mjs';
 import { limaDay, money, stageLabels, visitText } from '../shared/orders.mjs';
+
+const monthKey = value => {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en', { timeZone: 'America/Lima', year: 'numeric', month: '2-digit' })
+    .formatToParts(new Date(value)).map(part => [part.type, part.value]));
+  return parts.year + '-' + parts.month;
+};
+const reservationStatus = stage => ({ awaiting_deposit: 'Anticipo pendiente', confirmed: 'Confirmada', arrived: 'Llegó',
+  paid: 'Cobrada', closed: 'Finalizada', cancelled: 'Cancelada', no_show: 'No asistió' }[stage] || stageLabels[stage] || 'En revisión');
+const reservationGroupOrder = ['awaiting_deposit', 'confirmed', 'arrived', 'paid', 'closed', 'cancelled', 'no_show'];
+const reservationIcons = { awaiting_deposit: Clock3, confirmed: CalendarDays, arrived: Users, paid: CircleDollarSign,
+  closed: CheckCircle2, cancelled: Ban, no_show: XCircle };
+function ReservationIcon({ stage, size = 16 }) {
+  const Icon = reservationIcons[stage] || CalendarDays;
+  return <Icon size={size} aria-hidden="true" />;
+}
 
 export function CustomerPortal({ Brand }) {
   const [data, setData] = useState(null);
@@ -10,6 +26,9 @@ export function CustomerPortal({ Brand }) {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [selectedOrderId, setSelectedOrderId] = useState(null);
+  const [selectedMonth, setSelectedMonth] = useState('');
+  const otpMessage = "Si tu número tiene una reserva, recibirás un código por WhatsApp. Si no llega, escribe 'hola' al WhatsApp de El Establo y vuelve a solicitarlo.";
   const load = async () => {
     try { setData(await api('customer/orders')); }
     catch (error) { if (error.status !== 401) setError(error.message); }
@@ -25,42 +44,100 @@ export function CustomerPortal({ Brand }) {
         await api('customer/verify', { id: request.id, code });
         await load();
       } else setRequest(await api('customer/otp', { phone }));
-    } catch (error) { setError(error.message); }
+    } catch (error) {
+      if (!request) setRequest({ message: otpMessage });
+      else setError(error.message);
+    }
     finally { setBusy(false); }
   }
 
   return <main className="public-shell"><section className={'public-card ' + (data ? 'customer-card' : 'login')}>
     <Brand />
-    <div className="public-head"><span className="eyebrow">PORTAL DEL CLIENTE</span><h1>{data ? 'Hola, ' + data.name : 'Verifica tu celular'}</h1></div>
+    <div className={'public-head' + (data ? ' customer-heading' : '')}>
+      <div><span className="eyebrow">PORTAL DEL CLIENTE</span><h1>{data ? 'Hola, ' + data.name : 'Verifica tu celular'}</h1></div>
+      {data && <button className="button outline customer-logout" aria-label="Cerrar sesión" title="Cerrar sesión" onClick={async () => {
+        try { await api('logout', {}); setData(null); setRequest(null); setCode(''); setSelectedOrderId(null); }
+        catch (error) { setError(error.message); }
+      }}><LogOut size={16} /><span>Cerrar sesión</span></button>}
+    </div>
     {loading && <p role="status">Cargando…</p>}
     {error && <p className="error" role="alert">{error}</p>}
     {!loading && !data && <form onSubmit={submit}>
-      {request ? <><p>{request.message}</p><label>Código de WhatsApp<input required inputMode="numeric" pattern="[0-9]{6}"
+      {request ? <><p>{otpMessage}</p><label>Código de WhatsApp<input required inputMode="numeric" pattern="[0-9]{6}"
         autoComplete="one-time-code" maxLength={6} value={code} onChange={event => setCode(event.target.value)} /></label></>
         : <label>Celular registrado<input type="tel" required autoComplete="tel" placeholder="+51 999 999 999"
           value={phone} onChange={event => setPhone(event.target.value)} /></label>}
       <button className="button primary full" disabled={busy}>{request ? 'Verificar código' : 'Enviar código por WhatsApp'}</button>
-      {request && <button type="button" className="text-button" disabled={busy} onClick={() => { setRequest(null); setCode(''); }}>Solicitar otro código</button>}
+      {request && <button type="button" className="text-button" disabled={busy} onClick={async () => {
+        setBusy(true); setError(''); setCode('');
+        try { setRequest(await api('customer/otp', { phone })); }
+        catch { setRequest({ message: otpMessage }); }
+        finally { setBusy(false); }
+      }}>Solicitar otro código</button>}
       <a className="text-button" href="/">Acceso de personal</a>
     </form>}
     {data && <>
-      <div className="button-row"><button className="button outline" onClick={async () => {
-        try { await api('logout', {}); setData(null); setRequest(null); setCode(''); } catch (error) { setError(error.message); }
-      }}>Cerrar sesión</button></div>
       {data.menuUrl && <details className="action-panel"><summary>Ver la carta</summary><img className="customer-menu" src={data.menuUrl} alt="Carta de Parrilladas El Establo" loading="lazy" referrerPolicy="no-referrer" /></details>}
-      <h2>Mis pedidos y reservas</h2>
-      {!data.orders.length && <p>Todavía no figuran pedidos vinculados con tu número.</p>}
-      {data.orders.map(order => <section className="action-panel" key={order.id}>
-        <h3>{order.ref} · {stageLabels[order.stage]}</h3>
-        <p>{visitText(order.visitAt)} · {order.guests} {order.guests === 1 ? 'persona' : 'personas'}</p>
-        {order.attendance === 'pending' && <p className="inline-note">Caja debe confirmar tu llegada.</p>}
-        <ul className="detail-list">{order.items.map((item, index) => <li key={index}><span>{item.quantity} × {item.name}</span>
-          <strong>{money(item.price * item.quantity - (item.discount || 0))}</strong></li>)}</ul>
-        <p>Total {money(order.total)} · Anticipo {money(order.deposit)} · Saldo {money(order.balance)}</p>
-        <div className="button-row">{order.receipts.map(receipt => <a className="button outline" key={receipt.token}
-          href={'/comprobante/' + receipt.token}>{receipt.purpose === 'deposit' ? 'Constancia de anticipo' : receipt.purpose === 'balance'
-            ? 'Constancia de saldo' : 'Liquidación'}{receipt.reversedAt ? ' (revertida)' : ''}</a>)}</div>
-      </section>)}
+      <h2>Mis reservas</h2>
+      {!data.orders.length && <p>Todavía no figuran reservas vinculadas con tu número.</p>}
+      {data.orders.length > 0 && (() => {
+        const sorted = [...data.orders].sort((a, b) => +new Date(b.visitAt) - +new Date(a.visitAt));
+        const months = [...new Map(sorted.map(order => {
+          const key = monthKey(order.visitAt);
+          const label = new Intl.DateTimeFormat('es-PE', { timeZone: 'America/Lima', month: 'long', year: 'numeric' }).format(new Date(order.visitAt));
+          return [key, { key, label }];
+        })).values()];
+        const month = selectedMonth && months.some(item => item.key === selectedMonth) ? selectedMonth : months[0]?.key;
+        const rows = sorted.filter(order => monthKey(order.visitAt) === month);
+        const groups = reservationGroupOrder.map(stage => ({ stage, label: reservationStatus(stage),
+          orders: rows.filter(order => order.stage === stage) })).filter(group => group.orders.length);
+        const selected = sorted.find(order => order.id === selectedOrderId);
+        return <>
+          {!selected && <>
+            <div className="button-row" aria-label="Filtrar reservas por mes">{months.map(item => <button key={item.key}
+              className={'button ' + (month === item.key ? 'primary' : 'outline')} aria-pressed={month === item.key}
+              onClick={() => setSelectedMonth(item.key)}>{item.label}</button>)}</div>
+            {groups.map(group => <section className="reservation-group" key={group.stage}>
+              <h3><ReservationIcon stage={group.stage} />{group.label} <span>{group.orders.length}</span></h3>
+              <div className="reservation-picker">{group.orders.map(order => <button className="button outline" key={order.id}
+                onClick={() => setSelectedOrderId(order.id)}><strong><CalendarDays size={15} />{visitText(order.visitAt)}</strong><span>{order.ref}</span>
+                <small className={'reservation-status status-' + order.stage}><ReservationIcon stage={order.stage} size={13} />{reservationStatus(order.stage)}</small></button>)}</div>
+            </section>)}
+          </>}
+          {selected && <section className="action-panel customer-order-detail">
+            <button className="text-button customer-back" onClick={() => setSelectedOrderId(null)}><ArrowLeft size={16} /> Volver a mis reservas</button>
+            <div className="customer-detail-heading">
+              <span className="customer-detail-mark"><ReservationIcon stage={selected.stage} size={21} /></span>
+              <div><small>DETALLE DE RESERVA</small><h3>{selected.ref}</h3></div>
+              <span className={'reservation-status status-' + selected.stage}><ReservationIcon stage={selected.stage} size={14} />{reservationStatus(selected.stage)}</span>
+            </div>
+            <div className="customer-visit-summary"><span><CalendarDays size={16} />{visitText(selected.visitAt)}</span>
+              <span><Users size={16} />{selected.guests} {selected.guests === 1 ? 'persona' : 'personas'}</span></div>
+            {selected.attendance === 'pending' && <p className="inline-note customer-arrival-note"><Clock3 size={15} />Caja debe confirmar tu llegada.</p>}
+            <h4 className="customer-section-title">Detalle del pedido</h4>
+            <ul className="detail-list">{selected.items.map((item, index) => <li key={index}><span>{item.quantity} × {item.name}</span>
+              <strong>{money(item.price * item.quantity - (item.discount || 0))}</strong></li>)}</ul>
+            <div className="customer-order-totals"><div><small>Total</small><strong>{money(selected.total)}</strong></div>
+              <div><small>Anticipo</small><strong><Wallet size={14} />{money(selected.deposit)}</strong></div>
+              <div><small>Saldo</small><strong>{money(selected.balance)}</strong></div></div>
+            {selected.receipts.length > 0 && <section className="customer-receipts">
+              <h4><ReceiptText size={17} />Comprobantes</h4>
+              {selected.receipts.map(receipt => {
+                const kind = receipt.purpose === 'deposit' ? 'anticipo' : receipt.purpose === 'balance' ? 'saldo' : 'liquidación';
+                return <div className="customer-receipt" key={receipt.token}>
+                  <div><strong><FileCheck2 size={15} />{receipt.purpose === 'settlement' ? 'Liquidación de El Establo' : 'Constancia interna de ' + kind}</strong>
+                    <small>{receipt.number || 'Documento de demostración'}{receipt.reversedAt ? ' · Revertida' : ''}</small></div>
+                  <div className="button-row receipt-actions">
+                    <a className="button outline" href={'/comprobante/' + receipt.token}><ReceiptText size={15} />Ver constancia interna</a>
+                    {(receipt.mercadoPagoReceipts || []).map(item => <a className="button outline" key={item.paymentId}
+                      href={item.url} target="_blank" rel="noopener noreferrer"><ExternalLink size={15} />Comprobante Mercado Pago · {item.purpose === 'balance' ? 'Saldo' : 'Anticipo'}</a>)}
+                  </div>
+                </div>;
+              })}
+            </section>}
+          </section>}
+        </>;
+      })()}
     </>}
   </section></main>;
 }
